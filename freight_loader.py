@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QPushButton, QLabel, QSpinBox,
     QLineEdit, QGroupBox, QSplitter, QScrollArea, QMessageBox,
     QHeaderView, QCheckBox, QSizePolicy, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QAbstractItemView, QFrame
+    QFileDialog, QFormLayout, QAbstractItemView, QFrame, QComboBox
 )
 from PyQt6.QtCore import Qt, QRectF, QPointF
 from PyQt6.QtGui import (
@@ -68,6 +68,7 @@ class FreightPiece:
     weight_lbs: float
     pcs: int = 0
     notes: str = ""
+    placement: str = "auto"
 
 @dataclass
 class ShipmentInfo:
@@ -84,6 +85,7 @@ class PalletSlot:
     col: int                     # 0 = Position A / Left, 1 = Position B / Right
     piece: Optional[FreightPiece]
     row_start_in: float          # inches from nose to front of this row
+    is_center: bool = False
 
 @dataclass
 class LoadPlan:
@@ -104,24 +106,34 @@ def plan_load(pieces: list, override: bool = False, excluded_ids: list = None) -
     if not pieces:
         return LoadPlan([], {}, [], 0.0, override, excluded_ids or [])
 
-    n = len(pieces)
-    sorted_p = sorted(pieces, key=lambda p: p.weight_lbs, reverse=True)
+    # Separate center and auto pieces
+    center_pieces = [p for p in pieces if p.placement == "center"]
+    auto_pieces   = [p for p in pieces if p.placement != "center"]
 
-    # Build pairs: heaviest with lightest
-    pairs = []
+    # Center pieces form their own row unit: (piece, None, True)
+    center_units = [(p, None, True) for p in center_pieces]
+
+    # Auto pieces are paired heaviest+lightest: (a, b, False)
+    n = len(auto_pieces)
+    sorted_p = sorted(auto_pieces, key=lambda p: p.weight_lbs, reverse=True)
+    auto_units = []
     lo, hi = 0, n - 1
     while lo <= hi:
         a = sorted_p[lo]
         b = sorted_p[hi] if lo != hi else None
-        pairs.append((a, b))
+        auto_units.append((a, b, False))
         lo += 1
         hi -= 1
 
-    # Sort pairs by total weight descending (heaviest pair first)
-    pairs.sort(key=lambda p: p[0].weight_lbs + (p[1].weight_lbs if p[1] else 0), reverse=True)
+    # Combine all units, sort by total weight descending (heaviest unit first)
+    all_units = center_units + auto_units
+    all_units.sort(
+        key=lambda u: u[0].weight_lbs + (u[1].weight_lbs if u[1] else 0),
+        reverse=True
+    )
 
-    # Center-heavy row placement: heaviest pair → middle row, then alternate toward nose/tail
-    n_rows = len(pairs)
+    # Center-heavy row placement: heaviest unit → middle row, then alternate toward nose/tail
+    n_rows = len(all_units)
     mid = n_rows // 2
     order = [mid]
     lo_i, hi_i = mid - 1, mid + 1
@@ -134,22 +146,31 @@ def plan_load(pieces: list, override: bool = False, excluded_ids: list = None) -
             lo_i -= 1
 
     row_assignments = [None] * n_rows
-    for dest, pair in zip(order, pairs):
-        row_assignments[dest] = pair
+    for dest, unit in zip(order, all_units):
+        row_assignments[dest] = unit
 
     # Build slots (nose to tail) with cumulative row depths
     slots = []
     cursor = 0.0
-    for row_idx, pair in enumerate(row_assignments):
-        a_piece, b_piece = pair
+    for row_idx, unit in enumerate(row_assignments):
+        a_piece, b_piece, is_center = unit
         row_depth = max(a_piece.length_in, b_piece.length_in if b_piece else 0)
-        # Alternate which side gets the heavier piece so lateral weight stays balanced
-        if row_idx % 2 == 0:
-            left_piece, right_piece = a_piece, b_piece
+        if is_center:
+            # Both col=0 and col=1 point to the same piece, both marked is_center=True
+            slots.append(PalletSlot(row=row_idx, col=0, piece=a_piece,
+                                    row_start_in=cursor, is_center=True))
+            slots.append(PalletSlot(row=row_idx, col=1, piece=a_piece,
+                                    row_start_in=cursor, is_center=True))
         else:
-            left_piece, right_piece = b_piece, a_piece
-        slots.append(PalletSlot(row=row_idx, col=0, piece=left_piece,  row_start_in=cursor))
-        slots.append(PalletSlot(row=row_idx, col=1, piece=right_piece, row_start_in=cursor))
+            # Alternate which side gets the heavier piece so lateral weight stays balanced
+            if row_idx % 2 == 0:
+                left_piece, right_piece = a_piece, b_piece
+            else:
+                left_piece, right_piece = b_piece, a_piece
+            slots.append(PalletSlot(row=row_idx, col=0, piece=left_piece,
+                                    row_start_in=cursor, is_center=False))
+            slots.append(PalletSlot(row=row_idx, col=1, piece=right_piece,
+                                    row_start_in=cursor, is_center=False))
         cursor += row_depth
 
     axle_weights, violations = _calc_axle_weights(slots, override)
@@ -167,6 +188,8 @@ def _calc_axle_weights(slots: list, override: bool) -> tuple:
     moment = 0.0
 
     for slot in slots:
+        if slot.is_center and slot.col == 1:
+            continue  # center piece already counted via col=0
         if slot.piece is None:
             continue
         center = slot.row_start_in + slot.piece.length_in / 2.0
@@ -246,6 +269,7 @@ def save_plan_json(pieces: list, info: ShipmentInfo, limits: dict,
                 "weight_lbs":  p.weight_lbs,
                 "pcs":         p.pcs,
                 "notes":       p.notes,
+                "placement":   p.placement,
             }
             for p in pieces
         ],
@@ -276,6 +300,7 @@ def load_plan_json(path: str):
             weight_lbs=p['weight_lbs'],
             pcs=p.get('pcs', 0),
             notes=p.get('notes', ''),
+            placement=p.get('placement', 'auto'),
         )
         for p in data['freight']
     ]
@@ -387,9 +412,18 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
         for c in range(2):
             slot = slot_map.get((r, c))
             x = LM + c * col_w
-            cell = QRectF(x + 2, y + 2, col_w - 4, row_h - 4)
+
+            # Center pieces: skip col=1 (already drawn by col=0)
+            if slot and slot.is_center and c == 1:
+                continue
 
             if slot and slot.piece:
+                if slot.is_center:
+                    # Span both columns
+                    cell = QRectF(x + 2, y + 2, col_w * 2 - 4, row_h - 4)
+                else:
+                    cell = QRectF(x + 2, y + 2, col_w - 4, row_h - 4)
+
                 painter.setBrush(QBrush(TEAL_LIGHT))
                 painter.setPen(QPen(TEAL_DARK, 1.5))
                 painter.drawRoundedRect(cell, 5, 5)
@@ -409,6 +443,7 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
                                  Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
                                  f"{slot.piece.weight_lbs:,.0f} lb")
             else:
+                cell = QRectF(x + 2, y + 2, col_w - 4, row_h - 4)
                 painter.setBrush(QBrush(VOID_BG))
                 pen = QPen(GRAY_LINE, 1, Qt.PenStyle.DashLine)
                 painter.setPen(pen)
@@ -694,8 +729,15 @@ class TrailerView(QWidget):
                 slot = slot_map.get((r, c))
                 x = grid_x + c * col_w
                 if slot and slot.piece:
+                    # Center pieces: skip col=1 (already drawn by col=0)
+                    if slot.col == 1 and slot.is_center:
+                        continue
                     ph = (slot.piece.length_in / trailer_len) * grid_h
-                    cell = QRectF(x + 1, y_px + 1, col_w - 2, ph - 2)
+                    if slot.is_center:
+                        # Span both columns
+                        cell = QRectF(x + 1, y_px + 1, col_w * 2 - 2, ph - 2)
+                    else:
+                        cell = QRectF(x + 1, y_px + 1, col_w - 2, ph - 2)
                     color = QColor(COLORS[(slot.piece.piece_id - 1) % len(COLORS)])
                     painter.setBrush(QBrush(color))
                     painter.setPen(QPen(QColor("#222"), 0.5))
@@ -703,12 +745,17 @@ class TrailerView(QWidget):
 
                     painter.setFont(font_big)
                     painter.setPen(Qt.GlobalColor.white)
-                    painter.drawText(cell.adjusted(2, 2, -2, -cell.height() // 2),
-                                     Qt.AlignmentFlag.AlignCenter, slot.piece.crate_label)
-                    painter.setFont(font_small)
-                    painter.drawText(cell.adjusted(2, cell.height() // 2, -2, -2),
-                                     Qt.AlignmentFlag.AlignCenter,
-                                     f"{slot.piece.weight_lbs:,.0f} lb")
+                    if slot.is_center:
+                        painter.drawText(cell.adjusted(2, 2, -2, -2),
+                                         Qt.AlignmentFlag.AlignCenter,
+                                         f"CENTER\n{slot.piece.crate_label}\n{slot.piece.weight_lbs:,.0f} lb")
+                    else:
+                        painter.drawText(cell.adjusted(2, 2, -2, -cell.height() // 2),
+                                         Qt.AlignmentFlag.AlignCenter, slot.piece.crate_label)
+                        painter.setFont(font_small)
+                        painter.drawText(cell.adjusted(2, cell.height() // 2, -2, -2),
+                                         Qt.AlignmentFlag.AlignCenter,
+                                         f"{slot.piece.weight_lbs:,.0f} lb")
                 else:
                     cell = QRectF(x + 1, y_px + 1, col_w - 2, row_h - 2)
                     painter.setBrush(QBrush(QColor("#e8e8e8")))
@@ -914,9 +961,9 @@ class FreightLoaderApp(QMainWindow):
         grp_freight = QGroupBox("Freight Pieces")
         gl = QVBoxLayout(grp_freight)
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
-            ["Crate #", "Label", "Part #", 'L"', 'W"', 'H"', "Weight (lbs)", "PCS"])
+            ["Crate #", "Label", "Part #", 'L"', 'W"', 'H"', "Weight (lbs)", "PCS", "Pos."])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -1047,10 +1094,12 @@ class FreightLoaderApp(QMainWindow):
                 height=p.height_in,
                 weight=p.weight_lbs,
                 pcs=p.pcs,
+                placement=p.placement,
             )
 
     def _add_row(self, crate_id=None, label="", part_num="",
-                 length=48.0, width=48.0, height=48.0, weight=1000.0, pcs=0):
+                 length=48.0, width=48.0, height=48.0, weight=1000.0, pcs=0,
+                 placement="auto"):
         r = self.table.rowCount()
         self.table.insertRow(r)
 
@@ -1068,6 +1117,12 @@ class FreightLoaderApp(QMainWindow):
             if col == 0:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table.setItem(r, col, item)
+
+        # Col 8: Pos. placement combo box
+        combo = QComboBox()
+        combo.addItems(["Auto", "Center"])
+        combo.setCurrentIndex(1 if placement == "center" else 0)
+        self.table.setCellWidget(r, 8, combo)
 
     def _remove_row(self):
         rows = sorted(set(i.row() for i in self.table.selectedItems()), reverse=True)
@@ -1094,7 +1149,10 @@ class FreightLoaderApp(QMainWindow):
                 weight   = float(self.table.item(r, 6).text())
                 pcs_item = self.table.item(r, 7)
                 pcs      = int(pcs_item.text()) if pcs_item and pcs_item.text().strip() else 0
-                pieces.append(FreightPiece(crate_id, label, part, l_in, w_in, h_in, weight, pcs))
+                combo    = self.table.cellWidget(r, 8)
+                placement = "center" if combo and combo.currentText() == "Center" else "auto"
+                pieces.append(FreightPiece(crate_id, label, part, l_in, w_in, h_in, weight, pcs,
+                                           placement=placement))
             except (ValueError, AttributeError) as e:
                 QMessageBox.warning(self, "Input Error", f"Row {r+1}: {e}")
                 return []
@@ -1146,8 +1204,10 @@ class FreightLoaderApp(QMainWindow):
                       f"<td align='right'>{fg:,} lbs</td><td></td></tr>")
 
         # Side weights
-        left_w  = sum(s.piece.weight_lbs for s in plan.slots if s.piece and s.col == 0)
-        right_w = sum(s.piece.weight_lbs for s in plan.slots if s.piece and s.col == 1)
+        left_w  = sum((s.piece.weight_lbs / 2 if s.is_center else s.piece.weight_lbs)
+                       for s in plan.slots if s.piece and s.col == 0)
+        right_w = sum((s.piece.weight_lbs / 2 if s.is_center else s.piece.weight_lbs)
+                       for s in plan.slots if s.piece and s.col == 1)
         diff    = abs(left_w - right_w)
         heavier = "Left" if left_w > right_w else "Right"
         diff_color = "#c0392b" if diff > 2000 else "#e67e22" if diff > 500 else "#27ae60"
