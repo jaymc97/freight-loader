@@ -972,6 +972,8 @@ class FreightLoaderApp(QMainWindow):
             ["Crate #", "Label", "Part #", 'L"', 'W"', 'H"', "Weight (lbs)", "PCS", "Pos."])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for col, w in [(0,58),(3,46),(4,46),(5,46),(6,88),(7,50),(8,72)]:
+            self.table.setColumnWidth(col, w)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         gl.addWidget(self.table)
 
@@ -1124,10 +1126,11 @@ class FreightLoaderApp(QMainWindow):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table.setItem(r, col, item)
 
-        # Col 8: Pos. placement combo box
+        # Col 8: Pos. placement combo box — changing it auto-recalculates
         combo = QComboBox()
         combo.addItems(["Auto", "Center"])
         combo.setCurrentIndex(1 if placement == "center" else 0)
+        combo.currentIndexChanged.connect(lambda: self._calculate(silent=True))
         self.table.setCellWidget(r, 8, combo)
 
     def _remove_row(self):
@@ -1164,7 +1167,7 @@ class FreightLoaderApp(QMainWindow):
                 return []
         return pieces
 
-    def _calculate(self):
+    def _calculate(self, silent: bool = False):
         pieces = self._read_pieces()
         if not pieces:
             return
@@ -1176,7 +1179,7 @@ class FreightLoaderApp(QMainWindow):
         override = self.chk_override.isChecked()
         plan = plan_load(pieces, override=override, excluded_ids=self._excluded_ids)
 
-        if plan.violations and not override:
+        if plan.violations and not override and not silent:
             msg = "Weight violations detected:\n\n" + "\n".join(plan.violations)
             msg += "\n\nCheck 'Allow override' to proceed anyway, or adjust the load."
             QMessageBox.warning(self, "Weight Violations", msg)
