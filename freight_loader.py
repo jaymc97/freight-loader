@@ -344,8 +344,14 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
 
     font = QFont("Arial", 10)
     painter.setFont(font)
-    total_w = sum(s.piece.weight_lbs for s in plan.slots if s.piece)
-    n_crates = sum(1 for s in plan.slots if s.piece)
+    # Deduplicate center pieces (two slots share one piece)
+    seen = set()
+    total_w, n_crates = 0, 0
+    for s in plan.slots:
+        if s.piece and s.piece.piece_id not in seen:
+            seen.add(s.piece.piece_id)
+            total_w += s.piece.weight_lbs
+            n_crates += 1
     excl = (f"Crates {', '.join(str(x) for x in plan.excluded_ids)} excluded  |  "
             if plan.excluded_ids else "")
     sub = (f"{info.customer or info.shipment_name}  |  {TRAILER['name']}  |  "
