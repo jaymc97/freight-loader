@@ -174,14 +174,14 @@ def _calc_axle_weights(slots: list, override: bool) -> tuple:
     steer_weight = TRAILER["steer_tare"] - round(pin_weight * 0.05)
     steer_weight = max(steer_weight, TRAILER["steer_tare"] - 2500)
     drive_weight  = TRAILER["drive_tare"] + round(pin_weight * 1.05)
-    gross = steer_weight + drive_weight + round(trailer_rxn)
+    truck_gross = steer_weight + drive_weight + round(trailer_rxn)
 
     aw = {
-        "steer":   round(steer_weight),
-        "drive":   round(drive_weight),
-        "trailer": round(trailer_rxn),
-        "gross":   gross,
-        "pin":     round(pin_weight),
+        "steer":        round(steer_weight),
+        "drive":        round(drive_weight),
+        "trailer":      round(trailer_rxn),
+        "freight_gross": round(total_cargo),
+        "pin":          round(pin_weight),
     }
 
     v = []
@@ -191,8 +191,8 @@ def _calc_axle_weights(slots: list, override: bool) -> tuple:
         v.append(f"DRIVE {aw['drive']:,} lb > {TRAILER['drive_limit']:,} lb limit")
     if aw["trailer"] > TRAILER["trailer_limit"]:
         v.append(f"TRAILER TANDEM {aw['trailer']:,} lb > {TRAILER['trailer_limit']:,} lb limit")
-    if aw["gross"]   > TRAILER["gross_limit"]:
-        v.append(f"GROSS {aw['gross']:,} lb > {TRAILER['gross_limit']:,} lb limit")
+    if truck_gross   > TRAILER["gross_limit"]:
+        v.append(f"GROSS {truck_gross:,} lb > {TRAILER['gross_limit']:,} lb limit")
 
     return aw, v
 
@@ -361,7 +361,7 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
                   f"Steer: {aw.get('steer', 0):,} lb  |  "
                   f"Drive: {aw.get('drive', 0):,} lb  |  "
                   f"Trailer: {aw.get('trailer', 0):,} lb  |  "
-                  f"Gross: {aw.get('gross', 0):,} lb")
+                  f"Freight Gross: {aw.get('freight_gross', 0):,} lb")
         painter.setPen(TEAL_DARK)
         painter.drawText(QRectF(LM, PH - M - 16, PW - LM - M, 16),
                          Qt.AlignmentFlag.AlignHCenter, aw_str)
@@ -840,7 +840,6 @@ class FreightLoaderApp(QMainWindow):
             ("steer",   "Steer",   12000),
             ("drive",   "Drive",   34000),
             ("trailer", "Trailer", 34000),
-            ("gross",   "Gross",   80000),
         ]:
             vb = QVBoxLayout()
             vb.addWidget(QLabel(label, alignment=Qt.AlignmentFlag.AlignCenter))
@@ -1005,7 +1004,6 @@ class FreightLoaderApp(QMainWindow):
         TRAILER["steer_limit"]   = self._limit_fields["steer"].value()
         TRAILER["drive_limit"]   = self._limit_fields["drive"].value()
         TRAILER["trailer_limit"] = self._limit_fields["trailer"].value()
-        TRAILER["gross_limit"]   = self._limit_fields["gross"].value()
 
         override = self.chk_override.isChecked()
         plan = plan_load(pieces, override=override, excluded_ids=self._excluded_ids)
@@ -1028,7 +1026,6 @@ class FreightLoaderApp(QMainWindow):
             ("steer",   "Steer",          "steer_limit"),
             ("drive",   "Drive",          "drive_limit"),
             ("trailer", "Trailer Tandem", "trailer_limit"),
-            ("gross",   "Gross (est.)",   "gross_limit"),
         ]:
             val   = aw.get(key, 0)
             limit = TRAILER[lim_key]
@@ -1039,6 +1036,10 @@ class FreightLoaderApp(QMainWindow):
                           f"<td align='right'><span style='color:{color}'>{val:,} lbs</span></td>"
                           f"<td align='right'>&nbsp;{pct:.0f}% of {limit:,}</td>"
                           f"</tr>")
+        # Freight gross — informational, no axle limit applies
+        fg = aw.get("freight_gross", 0)
+        rows_html += (f"<tr><td><b>Freight Gross:</b></td>"
+                      f"<td align='right'>{fg:,} lbs</td><td></td></tr>")
         self.lbl_summary.setText(f"<table>{rows_html}</table>")
 
         if plan.violations:

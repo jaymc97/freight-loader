@@ -88,7 +88,7 @@ print("Estimated Axle Weights:")
 print(f"  Steer:          {aw.get('steer', 0):>8,} lbs  (limit 12,000)")
 print(f"  Drive:          {aw.get('drive', 0):>8,} lbs  (limit 34,000)")
 print(f"  Trailer Tandem: {aw.get('trailer', 0):>8,} lbs  (limit 34,000)")
-print(f"  Gross (est.):   {aw.get('gross', 0):>8,} lbs  (limit 80,000)")
+print(f"  Freight Gross:  {aw.get('freight_gross', 0):>8,} lbs")
 
 if plan.violations:
     print("\n⚠  VIOLATIONS:")
