@@ -1005,6 +1005,112 @@ class ImportDialog(QDialog):
         self.accept()
 
 
+# ── Freight Pop-Out Window ────────────────────────────────────────────────────
+class FreightPopout(QDialog):
+    """Resizable, non-modal window showing all freight pieces with include/exclude toggles."""
+
+    def __init__(self, pieces, excluded_ids, on_change, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Freight Pieces — Full View")
+        self.setWindowFlags(Qt.WindowType.Window |
+                            Qt.WindowType.WindowMinMaxButtonsHint |
+                            Qt.WindowType.WindowCloseButtonHint)
+        self.resize(980, 520)
+        self._on_change = on_change
+        self._blocking  = False
+
+        layout = QVBoxLayout(self)
+
+        lbl = QLabel("Check = include in load plan.  Uncheck = exclude.  Changes apply immediately.")
+        lbl.setStyleSheet("color:#555; font-size:11px; padding:2px 0;")
+        layout.addWidget(lbl)
+
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(
+            ["✓ Include", "Crate #", "Label", "Part #", 'L"', 'W"', 'H"',
+             "Weight (lbs)", "PCS", "Notes"])
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+        for col, w in [(0, 80), (1, 62), (4, 46), (5, 46), (6, 46), (7, 100), (8, 50)]:
+            self.table.setColumnWidth(col, w)
+        layout.addWidget(self.table)
+
+        btn_row = QHBoxLayout()
+        btn_all  = QPushButton("Select All")
+        btn_none = QPushButton("Select None")
+        btn_all.clicked.connect(lambda: self._set_all(True))
+        btn_none.clicked.connect(lambda: self._set_all(False))
+        btn_row.addWidget(btn_all)
+        btn_row.addWidget(btn_none)
+        btn_row.addStretch()
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.close)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        self.refresh(pieces, excluded_ids)
+
+    def refresh(self, pieces, excluded_ids):
+        self._blocking = True
+        self.table.setRowCount(0)
+        for p in pieces:
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+
+            chk = QCheckBox()
+            chk.setChecked(p.piece_id not in excluded_ids)
+            chk.stateChanged.connect(self._emit_change)
+            chk_widget = QWidget()
+            chk_lay = QHBoxLayout(chk_widget)
+            chk_lay.addWidget(chk)
+            chk_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            chk_lay.setContentsMargins(0, 0, 0, 0)
+            self.table.setCellWidget(r, 0, chk_widget)
+
+            for col, val in enumerate([
+                p.piece_id, p.crate_label, p.part_number,
+                f"{p.length_in:.0f}", f"{p.width_in:.0f}", f"{p.height_in:.0f}",
+                f"{p.weight_lbs:,.0f}", str(p.pcs), p.notes or ""
+            ], start=1):
+                item = QTableWidgetItem(str(val))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(r, col, item)
+
+        self.table.resizeRowsToContents()
+        self._blocking = False
+
+    def _emit_change(self):
+        if not self._blocking:
+            self._on_change(self._get_excluded())
+
+    def _get_excluded(self):
+        excluded = []
+        for r in range(self.table.rowCount()):
+            chk_w = self.table.cellWidget(r, 0)
+            chk = chk_w.findChild(QCheckBox)
+            if chk and not chk.isChecked():
+                item = self.table.item(r, 1)
+                if item:
+                    try:
+                        excluded.append(int(item.text()))
+                    except ValueError:
+                        pass
+        return excluded
+
+    def _set_all(self, checked: bool):
+        self._blocking = True
+        for r in range(self.table.rowCount()):
+            chk_w = self.table.cellWidget(r, 0)
+            chk = chk_w.findChild(QCheckBox)
+            if chk:
+                chk.setChecked(checked)
+        self._blocking = False
+        self._emit_change()
+
+
 # ── Main Window ───────────────────────────────────────────────────────────────
 class FreightLoaderApp(QMainWindow):
     def __init__(self):
@@ -1014,7 +1120,8 @@ class FreightLoaderApp(QMainWindow):
         self._next_id = 1
         self._plan: Optional[LoadPlan] = None
         self._excluded_ids: list = []
-        self._current_file: Optional[str] = None   # path of the open .json plan
+        self._current_file: Optional[str] = None
+        self._popout: Optional[FreightPopout] = None
         self._build_ui()
 
     def _build_ui(self):
@@ -1087,7 +1194,10 @@ class FreightLoaderApp(QMainWindow):
         btn_del.clicked.connect(self._remove_row)
         btn_clear  = QPushButton("Clear All")
         btn_clear.clicked.connect(self._clear_table)
-        for b in [btn_import, btn_add, btn_del, btn_clear]:
+        btn_popout = QPushButton("↗ Pop Out")
+        btn_popout.setToolTip("Open freight list in a larger window to manage include/exclude")
+        btn_popout.clicked.connect(self._open_popout)
+        for b in [btn_import, btn_add, btn_del, btn_clear, btn_popout]:
             btn_row.addWidget(b)
         gl.addLayout(btn_row)
         ll.addWidget(grp_freight)
@@ -1183,6 +1293,23 @@ class FreightLoaderApp(QMainWindow):
     def _on_plan_changed_by_drag(self):
         if self._plan:
             self._update_summary(self._plan)
+
+    def _open_popout(self):
+        pieces = self._read_pieces()
+        if not pieces:
+            return
+        if self._popout and self._popout.isVisible():
+            self._popout.refresh(pieces, self._excluded_ids)
+            self._popout.raise_()
+            self._popout.activateWindow()
+            return
+        self._popout = FreightPopout(pieces, self._excluded_ids,
+                                     self._apply_exclusions, parent=self)
+        self._popout.show()
+
+    def _apply_exclusions(self, excluded_ids: list):
+        self._excluded_ids = excluded_ids
+        self._calculate(silent=True)
 
     # ── Actions ──────────────────────────────────────────────────────────────
     def _get_shipment_info(self) -> ShipmentInfo:
