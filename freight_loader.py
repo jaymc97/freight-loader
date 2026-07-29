@@ -1,206 +1,513 @@
+"""
+Freight Loader — 53' Dry Van Load Planning Tool
+Imports Excel packing lists, calculates balanced load plans, exports floor plan PDF and crate labels.
+"""
+
 import sys
 import math
-from dataclasses import dataclass, field
+import datetime
+from dataclasses import dataclass
 from typing import Optional
+
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel, QSpinBox,
-    QDoubleSpinBox, QLineEdit, QGroupBox, QSplitter, QScrollArea,
-    QMessageBox, QHeaderView, QCheckBox, QFrame, QSizePolicy,
-    QDialog, QDialogButtonBox, QTextEdit, QFileDialog
+    QLineEdit, QGroupBox, QSplitter, QScrollArea, QMessageBox,
+    QHeaderView, QCheckBox, QSizePolicy, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QAbstractItemView, QFrame
 )
-from PyQt6.QtCore import Qt, QRectF, QPointF, QSizeF
+from PyQt6.QtCore import Qt, QRectF, QPointF
 from PyQt6.QtGui import (
-    QPainter, QColor, QPen, QBrush, QFont, QPageLayout, QPageSize,
-    QPdfWriter
+    QPainter, QColor, QPen, QBrush, QFont, QPageLayout, QPageSize, QPdfWriter
 )
 
+# ── Colors ───────────────────────────────────────────────────────────────────
+TEAL_DARK  = QColor("#2a7d6e")
+TEAL_MED   = QColor("#3dab96")
+TEAL_LIGHT = QColor("#cdeae5")
+TAN        = QColor("#c0a070")
+GRAY_LINE  = QColor("#b0b0b0")
+VOID_BG    = QColor("#f8f8f8")
 
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class FreightPiece:
-    piece_id: int
-    description: str
-    length_in: float   # inches
-    width_in: float
-    height_in: float
-    weight_lbs: float
-
-@dataclass
-class PalletSlot:
-    """One slot in the trailer grid (row=distance from nose, col=0 left/1 right)."""
-    row: int           # 0 = nose
-    col: int           # 0 = left, 1 = right
-    piece: Optional[FreightPiece] = None
-    row_depth_in: float = 0.0   # cumulative depth from nose to start of this row
-
-@dataclass
-class LoadPlan:
-    slots: list[PalletSlot]
-    axle_weights: dict          # steer, drive, trailer
-    violations: list[str]
-    override: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Trailer constants — 53' dry van
-# ---------------------------------------------------------------------------
-
+# ── 53' Dry Van specs ────────────────────────────────────────────────────────
 TRAILER = {
     "name": "53' Dry Van",
-    "interior_length_in": 636,   # 53 ft
-    "interior_width_in": 98,     # ~98" usable
+    "interior_length_in": 636,
+    "interior_width_in":  98,
     "interior_height_in": 110,
-    # Axle positions measured from nose of trailer (kingpin ~= 0 ref)
-    # These are approximate industry-standard numbers
-    "kingpin_from_nose_in": 0,
-    # Distance from kingpin to center of drive axles (~18" back of cab + ~~)
-    # Typical: kingpin to tandem center = ~~36"
-    # For weight calc we model the trailer as a beam on two supports:
-    #   front support = drive axles at ~36" behind kingpin relative to trailer
-    #   rear support  = trailer axles at rear
-    # We convert everything to distance from nose of trailer.
-    "drive_axle_from_nose_in": 36,    # kingpin area — drives bear weight here
-    "trailer_axle_from_nose_in": 600, # ~50 ft from nose, at rear of 53'
-    # Legal axle weight limits (lbs)
+    "tandem_from_nose_in": 492,   # trailer tandem center (~41 ft from kingpin)
+    "steer_tare":  11000,
+    "drive_tare":   9000,
     "steer_limit": 12000,
     "drive_limit": 34000,
     "trailer_limit": 34000,
-    "gross_limit": 80000,
-    "tractor_steer_to_drive_in": 228,  # ~19 ft between steer and drive on tractor
+    "gross_limit":  80000,
 }
 
-COLS = 2        # pallet positions wide
-SLOT_WIDTH_IN = TRAILER["interior_width_in"] / COLS   # ~49"
+
+# ── Data model ────────────────────────────────────────────────────────────────
+@dataclass
+class FreightPiece:
+    piece_id: int
+    crate_label: str     # "Crate 9"
+    part_number: str
+    length_in: float
+    width_in: float
+    height_in: float
+    weight_lbs: float
+    pcs: int = 0
+    notes: str = ""
+
+@dataclass
+class ShipmentInfo:
+    customer: str = ""
+    shipment_name: str = ""
+    trailer_num: str = ""
+    bol_num: str = ""
+    date: str = ""
+    notes: str = ""
+
+@dataclass
+class PalletSlot:
+    row: int
+    col: int                     # 0 = Position A / Left, 1 = Position B / Right
+    piece: Optional[FreightPiece]
+    row_start_in: float          # inches from nose to front of this row
+
+@dataclass
+class LoadPlan:
+    slots: list
+    axle_weights: dict
+    violations: list
+    total_length_used_in: float
+    override: bool = False
+    excluded_ids: list = None
 
 
-# ---------------------------------------------------------------------------
-# Loading algorithm
-# ---------------------------------------------------------------------------
-
-def plan_load(pieces: list[FreightPiece], override: bool = False) -> LoadPlan:
+# ── Algorithm ─────────────────────────────────────────────────────────────────
+def plan_load(pieces: list, override: bool = False, excluded_ids: list = None) -> LoadPlan:
     """
-    Greedy best-fit: place pieces nose-to-tail, 2 wide per row.
-    Heavier pieces go toward the drive axles (optimal DOT balance).
-    Returns a LoadPlan with slot assignments and axle weight calculations.
+    Pair pieces heaviest+lightest for balanced rows, then order rows center-heavy
+    so the heaviest rows sit near mid-trailer (best for drive/trailer axle balance).
     """
     if not pieces:
-        return LoadPlan(slots=[], axle_weights={}, violations=[], override=override)
+        return LoadPlan([], {}, [], 0.0, override, excluded_ids or [])
 
-    # Sort: heaviest first so they land closest to drives
-    sorted_pieces = sorted(pieces, key=lambda p: p.weight_lbs, reverse=True)
+    n = len(pieces)
+    sorted_p = sorted(pieces, key=lambda p: p.weight_lbs, reverse=True)
 
-    slots: list[PalletSlot] = []
-    cursor_depth = 0.0   # how far from nose we've consumed
-    row = 0
-    i = 0
+    # Build pairs: heaviest with lightest
+    pairs = []
+    lo, hi = 0, n - 1
+    while lo <= hi:
+        a = sorted_p[lo]
+        b = sorted_p[hi] if lo != hi else None
+        pairs.append((a, b))
+        lo += 1
+        hi -= 1
 
-    while i < len(sorted_pieces):
-        # Grab up to 2 pieces for this row
-        row_pieces = sorted_pieces[i:i + COLS]
-        i += COLS
+    # Sort pairs by total weight descending (heaviest pair first)
+    pairs.sort(key=lambda p: p[0].weight_lbs + (p[1].weight_lbs if p[1] else 0), reverse=True)
 
-        # Row depth = max length of pieces in this row
-        row_depth = max(p.length_in for p in row_pieces)
+    # Center-heavy row placement: heaviest pair → middle row, then alternate toward nose/tail
+    n_rows = len(pairs)
+    mid = n_rows // 2
+    order = [mid]
+    lo_i, hi_i = mid - 1, mid + 1
+    while lo_i >= 0 or hi_i < n_rows:
+        if hi_i < n_rows:
+            order.append(hi_i)
+            hi_i += 1
+        if lo_i >= 0:
+            order.append(lo_i)
+            lo_i -= 1
 
-        if cursor_depth + row_depth > TRAILER["interior_length_in"]:
-            # Doesn't fit — still assign (will flag as violation)
-            pass
+    row_assignments = [None] * n_rows
+    for dest, pair in zip(order, pairs):
+        row_assignments[dest] = pair
 
-        for col, piece in enumerate(row_pieces):
-            slot = PalletSlot(
-                row=row,
-                col=col,
-                piece=piece,
-                row_depth_in=cursor_depth,
-            )
-            slots.append(slot)
+    # Build slots (nose to tail) with cumulative row depths
+    slots = []
+    cursor = 0.0
+    for row_idx, pair in enumerate(row_assignments):
+        a_piece, b_piece = pair
+        row_depth = max(a_piece.length_in, b_piece.length_in if b_piece else 0)
+        slots.append(PalletSlot(row=row_idx, col=0, piece=a_piece, row_start_in=cursor))
+        slots.append(PalletSlot(row=row_idx, col=1, piece=b_piece, row_start_in=cursor))
+        cursor += row_depth
 
-        cursor_depth += row_depth
-        row += 1
-
-    axle_weights, violations = _calc_axle_weights(slots, pieces, override)
-
-    return LoadPlan(slots=slots, axle_weights=axle_weights,
-                    violations=violations, override=override)
+    axle_weights, violations = _calc_axle_weights(slots, override)
+    return LoadPlan(slots, axle_weights, violations, cursor, override, excluded_ids or [])
 
 
-def _calc_axle_weights(slots, all_pieces, override):
+def _calc_axle_weights(slots: list, override: bool) -> tuple:
     """
-    Simple beam model: trailer supported at drive axles and trailer axles.
-    Steer axle weight = (gross - drive_reaction) * steer_fraction (simplified).
-
-    We calculate the reaction force at each support using lever/moment equations.
+    Beam model: trailer kingpin (nose=0) and trailer tandem as two supports.
+    Trailer tandem reaction = Σ(weight × center_from_nose) / tandem_position.
+    Pin weight goes to tractor 5th wheel → split between drive and steer axles.
     """
-    D = TRAILER["drive_axle_from_nose_in"]      # drive support position
-    T = TRAILER["trailer_axle_from_nose_in"]    # trailer support position
-    span = T - D  # distance between supports
+    tandem_pos = TRAILER["tandem_from_nose_in"]
+    total_cargo = 0.0
+    moment = 0.0
 
-    total_weight = sum(p.weight_lbs for p in all_pieces)
-
-    # Moments about drive axle to find trailer axle reaction
-    moment_about_drive = 0.0
     for slot in slots:
         if slot.piece is None:
             continue
-        # Center of piece longitudinally
-        piece_center = slot.row_depth_in + slot.piece.length_in / 2
-        arm = piece_center - D   # + = toward tail, - = toward nose/steer
-        moment_about_drive += slot.piece.weight_lbs * arm
+        center = slot.row_start_in + slot.piece.length_in / 2.0
+        total_cargo += slot.piece.weight_lbs
+        moment += slot.piece.weight_lbs * center
 
-    # Trailer axle reaction (upward)
-    trailer_reaction = moment_about_drive / span if span > 0 else 0
-    trailer_reaction = max(0, trailer_reaction)
+    if total_cargo == 0:
+        return {}, []
 
-    drive_reaction = total_weight - trailer_reaction
+    trailer_rxn = moment / tandem_pos
+    pin_weight  = total_cargo - trailer_rxn
 
-    # Steer axle takes a portion of drive reaction based on tractor geometry
-    # Simplified: steer ~ 10-12% of gross for a typical loaded truck
-    steer_to_drive = TRAILER["tractor_steer_to_drive_in"]
-    # Moment of tractor weight is already embedded; use industry rule of thumb
-    # steer = (drive_reaction) * (bogie_rear / wheelbase) — approx
-    steer_frac = 0.12  # ~12% of gross on steers is typical
-    steer_weight = total_weight * steer_frac
-    drive_reaction = drive_reaction - steer_weight  # net on drives
+    # 5th wheel is behind drives (overhang); adds slightly more than pin to drives,
+    # reduces steer. Approximate: drives get 1.05× pin, steer loses ~0.05× pin.
+    steer_weight = TRAILER["steer_tare"] - round(pin_weight * 0.05)
+    steer_weight = max(steer_weight, TRAILER["steer_tare"] - 2500)
+    drive_weight  = TRAILER["drive_tare"] + round(pin_weight * 1.05)
+    gross = steer_weight + drive_weight + round(trailer_rxn)
 
-    axle_weights = {
-        "steer": round(steer_weight),
-        "drive": round(drive_reaction),
-        "trailer": round(trailer_reaction),
-        "gross": round(total_weight + 20000),   # +20k tractor tare estimate
+    aw = {
+        "steer":   round(steer_weight),
+        "drive":   round(drive_weight),
+        "trailer": round(trailer_rxn),
+        "gross":   gross,
+        "pin":     round(pin_weight),
     }
 
-    violations = []
-    if axle_weights["steer"] > TRAILER["steer_limit"]:
-        violations.append(f"STEER axle: {axle_weights['steer']:,} lbs exceeds {TRAILER['steer_limit']:,} lb limit")
-    if axle_weights["drive"] > TRAILER["drive_limit"]:
-        violations.append(f"DRIVE axles: {axle_weights['drive']:,} lbs exceeds {TRAILER['drive_limit']:,} lb limit")
-    if axle_weights["trailer"] > TRAILER["trailer_limit"]:
-        violations.append(f"TRAILER axles: {axle_weights['trailer']:,} lbs exceeds {TRAILER['trailer_limit']:,} lb limit")
-    if axle_weights["gross"] > TRAILER["gross_limit"]:
-        violations.append(f"GROSS weight: {axle_weights['gross']:,} lbs exceeds {TRAILER['gross_limit']:,} lb limit")
+    v = []
+    if aw["steer"]   > TRAILER["steer_limit"]:
+        v.append(f"STEER {aw['steer']:,} lb > {TRAILER['steer_limit']:,} lb limit")
+    if aw["drive"]   > TRAILER["drive_limit"]:
+        v.append(f"DRIVE {aw['drive']:,} lb > {TRAILER['drive_limit']:,} lb limit")
+    if aw["trailer"] > TRAILER["trailer_limit"]:
+        v.append(f"TRAILER TANDEM {aw['trailer']:,} lb > {TRAILER['trailer_limit']:,} lb limit")
+    if aw["gross"]   > TRAILER["gross_limit"]:
+        v.append(f"GROSS {aw['gross']:,} lb > {TRAILER['gross_limit']:,} lb limit")
 
-    return axle_weights, violations
+    return aw, v
 
 
-# ---------------------------------------------------------------------------
-# Trailer visualization widget
-# ---------------------------------------------------------------------------
+# ── PDF helpers ───────────────────────────────────────────────────────────────
+def _pdf_writer(path: str):
+    w = QPdfWriter(path)
+    w.setPageSize(QPageSize(QPageSize.PageSizeId.Letter))
+    w.setPageOrientation(QPageLayout.Orientation.Portrait)
+    w.setResolution(150)
+    return w
 
+
+# ── PDF: Load Plan Floor Plan ─────────────────────────────────────────────────
+def export_load_plan_pdf(plan: LoadPlan, info: ShipmentInfo, path: str):
+    writer = _pdf_writer(path)
+    painter = QPainter(writer)
+    PW = writer.width()
+    PH = writer.height()
+    _draw_floor_plan(painter, PW, PH, plan, info)
+    painter.end()
+
+
+def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
+                     plan: LoadPlan, info: ShipmentInfo):
+    M = 72       # margin ~0.48"
+    LM = M + 50  # extra left for row labels
+
+    # ── Title ──────────────────────────────────────────────────────────
+    painter.setPen(QColor("#111"))
+    font = QFont("Arial", 20, QFont.Weight.Bold)
+    painter.setFont(font)
+    painter.drawText(QRectF(LM, M, PW - LM - M, 48),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                     "Trailer Loading Floor Plan")
+
+    font = QFont("Arial", 10)
+    painter.setFont(font)
+    total_w = sum(s.piece.weight_lbs for s in plan.slots if s.piece)
+    n_crates = sum(1 for s in plan.slots if s.piece)
+    excl = (f"Crates {', '.join(str(x) for x in plan.excluded_ids)} excluded  |  "
+            if plan.excluded_ids else "")
+    sub = (f"{info.customer or info.shipment_name}  |  {TRAILER['name']}  |  "
+           f"{excl}Total: {total_w:,.0f} lb / {n_crates} crates")
+    painter.drawText(QRectF(LM, M + 50, PW - LM - M, 26),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, sub)
+
+    detail_parts = []
+    if info.date:        detail_parts.append(f"Date: {info.date}")
+    if info.trailer_num: detail_parts.append(f"Trailer: {info.trailer_num}")
+    if info.bol_num:     detail_parts.append(f"BOL: {info.bol_num}")
+    if detail_parts:
+        painter.drawText(QRectF(LM, M + 76, PW - LM - M, 22),
+                         Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                         "  |  ".join(detail_parts))
+
+    # ── Column headers ──────────────────────────────────────────────────
+    col_w = (PW - LM - M) / 2
+    hdr_y = M + 108
+
+    font = QFont("Arial", 12, QFont.Weight.Bold)
+    painter.setFont(font)
+    painter.setPen(QColor("#222"))
+    painter.drawText(QRectF(LM, hdr_y, PW - LM - M, 28),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                     "NOSE  (load first)")
+
+    hdr_y += 30
+    font = QFont("Arial", 11, QFont.Weight.Bold)
+    painter.setFont(font)
+    painter.setPen(TEAL_DARK)
+    painter.drawText(QRectF(LM, hdr_y, col_w, 24),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                     "Position A")
+    painter.drawText(QRectF(LM + col_w, hdr_y, col_w, 24),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                     "Position B")
+
+    # ── Grid ────────────────────────────────────────────────────────────
+    grid_top = hdr_y + 28
+    rows = sorted(set(s.row for s in plan.slots))
+    n_rows = len(rows)
+
+    TAIL_RESERVE = 100   # space for tail label + notes at bottom
+    grid_h = PH - M - TAIL_RESERVE - grid_top
+    row_h = grid_h / n_rows if n_rows else 40
+
+    slot_map = {(s.row, s.col): s for s in plan.slots}
+
+    font_rlbl = QFont("Arial", 9, QFont.Weight.Bold)
+    font_big   = QFont("Arial", 11, QFont.Weight.Bold)
+    font_small = QFont("Arial", 9)
+
+    for r in rows:
+        y = grid_top + r * row_h
+
+        # Row label
+        painter.setFont(font_rlbl)
+        painter.setPen(QColor("#444"))
+        painter.drawText(QRectF(M, y, 46, row_h),
+                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                         f"R{r + 1}")
+
+        for c in range(2):
+            slot = slot_map.get((r, c))
+            x = LM + c * col_w
+            cell = QRectF(x + 2, y + 2, col_w - 4, row_h - 4)
+
+            if slot and slot.piece:
+                painter.setBrush(QBrush(TEAL_LIGHT))
+                painter.setPen(QPen(TEAL_DARK, 1.5))
+                painter.drawRoundedRect(cell, 5, 5)
+
+                top_half = QRectF(cell.x() + 4, cell.y() + 2,
+                                  cell.width() - 8, cell.height() * 0.55)
+                bot_half = QRectF(cell.x() + 4, cell.y() + cell.height() * 0.55,
+                                  cell.width() - 8, cell.height() * 0.42)
+
+                painter.setFont(font_big)
+                painter.setPen(TEAL_DARK)
+                painter.drawText(top_half,
+                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                                 slot.piece.crate_label)
+                painter.setFont(font_small)
+                painter.drawText(bot_half,
+                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                                 f"{slot.piece.weight_lbs:,.0f} lb")
+            else:
+                painter.setBrush(QBrush(VOID_BG))
+                pen = QPen(GRAY_LINE, 1, Qt.PenStyle.DashLine)
+                painter.setPen(pen)
+                painter.drawRoundedRect(cell, 5, 5)
+                painter.setFont(font_small)
+                painter.setPen(QColor("#999"))
+                painter.drawText(cell, Qt.AlignmentFlag.AlignCenter,
+                                 "Open\nBlock / void-fill")
+
+    # ── Tail label ─────────────────────────────────────────────────────
+    tail_y = PH - M - TAIL_RESERVE + 6
+    font = QFont("Arial", 12, QFont.Weight.Bold)
+    painter.setFont(font)
+    painter.setPen(QColor("#111"))
+    painter.drawText(QRectF(LM, tail_y, PW - LM - M, 28),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                     "TAIL  (rear doors, load last)")
+
+    # Clear space note
+    clear_in = TRAILER["interior_length_in"] - plan.total_length_used_in
+    clear_ft = clear_in / 12.0
+    font = QFont("Arial", 8)
+    painter.setFont(font)
+    painter.setPen(QColor("#555"))
+    painter.drawText(QRectF(LM, tail_y + 30, PW - LM - M, 20),
+                     Qt.AlignmentFlag.AlignHCenter,
+                     f"~{clear_ft:.1f} ft clear space behind row {n_rows} for load bars / void-fill")
+
+    note = ("Load strictly R1 to R13 in order.  "
+            "Weigh loaded trailer on a certified scale and adjust tandem slide as needed before transport.")
+    painter.drawText(QRectF(LM, tail_y + 50, PW - LM - M, 30),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap, note)
+
+    # Axle weight summary
+    aw = plan.axle_weights
+    if aw:
+        aw_str = (f"Est. Axle Weights  —  "
+                  f"Steer: {aw.get('steer', 0):,} lb  |  "
+                  f"Drive: {aw.get('drive', 0):,} lb  |  "
+                  f"Trailer: {aw.get('trailer', 0):,} lb  |  "
+                  f"Gross: {aw.get('gross', 0):,} lb")
+        painter.setPen(TEAL_DARK)
+        painter.drawText(QRectF(LM, PH - M - 16, PW - LM - M, 16),
+                         Qt.AlignmentFlag.AlignHCenter, aw_str)
+
+
+# ── PDF: Crate Labels ─────────────────────────────────────────────────────────
+def export_crate_labels_pdf(plan: LoadPlan, info: ShipmentInfo, path: str):
+    filled = sorted([s for s in plan.slots if s.piece], key=lambda s: (s.row, s.col))
+    if not filled:
+        return
+
+    writer = _pdf_writer(path)
+    painter = QPainter(writer)
+    PW = writer.width()
+    PH = writer.height()
+
+    for i, slot in enumerate(filled):
+        if i > 0:
+            writer.newPage()
+        _draw_crate_label(painter, PW, PH, slot, plan, info)
+
+    painter.end()
+
+
+def _draw_crate_label(painter: QPainter, PW: int, PH: int,
+                      slot: PalletSlot, plan: LoadPlan, info: ShipmentInfo):
+    PAD = 18    # outer border inset
+    INNER_X = PAD + 22
+    INNER_W = PW - 2 * (PAD + 22)
+
+    # Outer border (tan/gold)
+    painter.setPen(QPen(TAN, 1.5))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawRect(QRectF(PAD, PAD, PW - 2 * PAD, PH - 2 * PAD))
+
+    # ── Top band: shipment name ─────────────────────────────────────────
+    sep1_y = PH * 0.16
+
+    font = QFont("Arial", 11)
+    painter.setFont(font)
+    painter.setPen(QColor("#555"))
+    hdr = info.customer or info.shipment_name or "Freight Shipment"
+    if info.date:
+        hdr += f"   |   {info.date}"
+    painter.drawText(QRectF(INNER_X, PAD + 10, INNER_W, sep1_y - PAD - 14),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, hdr)
+
+    painter.setPen(QPen(GRAY_LINE, 1))
+    painter.drawLine(QPointF(INNER_X, sep1_y), QPointF(INNER_X + INNER_W, sep1_y))
+
+    # ── Teal main box ──────────────────────────────────────────────────
+    box_top = sep1_y + 18
+    box_h   = PH * 0.30
+    box_x   = INNER_X + 10
+    box_w   = INNER_W - 20
+    box     = QRectF(box_x, box_top, box_w, box_h)
+
+    painter.setBrush(QBrush(TEAL_LIGHT))
+    painter.setPen(QPen(TEAL_DARK, 2.5))
+    painter.drawRoundedRect(box, 16, 16)
+
+    # Crate number — very large
+    font = QFont("Arial", 54, QFont.Weight.Bold)
+    painter.setFont(font)
+    painter.setPen(TEAL_DARK)
+    painter.drawText(QRectF(box_x + 10, box_top + 16, box_w - 20, box_h * 0.58),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                     slot.piece.crate_label.upper())
+
+    # Position label
+    side_letter = "A" if slot.col == 0 else "B"
+    side_name   = "Left" if slot.col == 0 else "Right"
+    pos_str = f"Position {side_letter}  ({side_name})   ·   Row {slot.row + 1}"
+    font = QFont("Arial", 16)
+    painter.setFont(font)
+    painter.drawText(QRectF(box_x + 10, box_top + box_h * 0.62, box_w - 20, box_h * 0.34),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, pos_str)
+
+    # ── Middle separator ───────────────────────────────────────────────
+    sep2_y = box_top + box_h + 22
+    painter.setPen(QPen(GRAY_LINE, 1))
+    painter.drawLine(QPointF(INNER_X, sep2_y), QPointF(INNER_X + INNER_W, sep2_y))
+
+    # ── Detail section ─────────────────────────────────────────────────
+    detail_lines = []
+    if slot.piece.part_number:
+        detail_lines.append(("Part Number:", slot.piece.part_number))
+    detail_lines.append(("Dimensions:",
+                          f'{slot.piece.length_in:.0f}" × {slot.piece.width_in:.0f}" × {slot.piece.height_in:.0f}"  (L × W × H)'))
+    detail_lines.append(("Weight:", f"{slot.piece.weight_lbs:,.0f} lbs"))
+    if slot.piece.pcs:
+        detail_lines.append(("Pieces:", f"{slot.piece.pcs:,}"))
+    if slot.piece.notes:
+        detail_lines.append(("Notes:", slot.piece.notes))
+
+    LBL_W = 145
+    ROW_H = 40
+    det_y = sep2_y + 14
+    font_lbl = QFont("Arial", 11)
+    font_val = QFont("Arial", 13, QFont.Weight.Bold)
+
+    for label, val in detail_lines:
+        painter.setFont(font_lbl)
+        painter.setPen(QColor("#666"))
+        painter.drawText(QRectF(INNER_X + 20, det_y, LBL_W, ROW_H - 4),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
+        painter.setFont(font_val)
+        painter.setPen(QColor("#111"))
+        painter.drawText(QRectF(INNER_X + LBL_W + 10, det_y, INNER_W - LBL_W - 20, ROW_H - 4),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, val)
+        det_y += ROW_H
+
+    # ── Lower separator ────────────────────────────────────────────────
+    sep3_y = det_y + 10
+    painter.setPen(QPen(GRAY_LINE, 1))
+    painter.drawLine(QPointF(INNER_X, sep3_y), QPointF(INNER_X + INNER_W, sep3_y))
+
+    # ── Shipment footer ────────────────────────────────────────────────
+    footer_lines = []
+    if info.customer:        footer_lines.append(("Customer:", info.customer))
+    if info.shipment_name:   footer_lines.append(("Shipment:", info.shipment_name))
+    if info.bol_num:         footer_lines.append(("BOL #:", info.bol_num))
+    if info.trailer_num:     footer_lines.append(("Trailer #:", info.trailer_num))
+
+    fot_y = sep3_y + 14
+    font_lbl2 = QFont("Arial", 11)
+    font_val2 = QFont("Arial", 11)
+
+    for label, val in footer_lines:
+        painter.setFont(font_lbl2)
+        painter.setPen(QColor("#666"))
+        painter.drawText(QRectF(INNER_X + 20, fot_y, LBL_W, 30),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
+        painter.setFont(font_val2)
+        painter.setPen(QColor("#222"))
+        painter.drawText(QRectF(INNER_X + LBL_W + 10, fot_y, INNER_W - LBL_W - 20, 30),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, val)
+        fot_y += 32
+
+
+# ── Live Trailer View widget ──────────────────────────────────────────────────
 class TrailerView(QWidget):
-    """Draws the trailer top-down with pallet slots labeled."""
-
-    MARGIN = 30
-    NOSE_LABEL_H = 24
-    AXLE_LABEL_H = 18
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.plan: Optional[LoadPlan] = None
-        self.setMinimumSize(300, 400)
+        self.setMinimumSize(320, 480)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def set_plan(self, plan: LoadPlan):
@@ -210,289 +517,480 @@ class TrailerView(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self._draw(painter, self.rect())
+        self._draw(painter)
 
-    def _draw(self, painter: QPainter, rect):
-        if self.plan is None or not self.plan.slots:
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "No load plan calculated yet.")
+    def _draw(self, painter: QPainter):
+        if not self.plan or not self.plan.slots:
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             "No load plan — press Calculate.")
             return
 
         slots = self.plan.slots
-        # Determine total rows
-        max_row = max(s.row for s in slots)
-        num_rows = max_row + 1
+        rows  = sorted(set(s.row for s in slots))
+        n_rows = len(rows)
 
-        m = self.MARGIN
-        available_w = rect.width() - 2 * m
-        available_h = rect.height() - 2 * m - self.NOSE_LABEL_H
+        M = 28
+        NOSE_H = 22
+        ROW_LBL = 36
+        W = self.width()
+        H = self.height()
+        grid_x = M + ROW_LBL
+        grid_w = W - grid_x - M
+        grid_y = M + NOSE_H + 4
+        grid_h = H - grid_y - M - 20
+        col_w  = grid_w / 2
+        row_h  = grid_h / n_rows if n_rows else 40
 
-        col_w = available_w / COLS
-        row_h = available_h / num_rows
-
-        trailer_rect = QRectF(m, m + self.NOSE_LABEL_H, available_w, available_h)
+        trailer_rect = QRectF(grid_x, grid_y, grid_w, grid_h)
 
         # Trailer outline
-        painter.setPen(QPen(QColor("#333"), 3))
+        painter.setPen(QPen(QColor("#444"), 2))
         painter.setBrush(QBrush(QColor("#f5f5f0")))
         painter.drawRect(trailer_rect)
 
-        # NOSE label
-        font_label = QFont("Arial", 9, QFont.Weight.Bold)
-        painter.setFont(font_label)
+        # Nose label
+        font = QFont("Arial", 8, QFont.Weight.Bold)
+        painter.setFont(font)
         painter.setPen(QColor("#333"))
-        painter.drawText(QRectF(m, m, available_w, self.NOSE_LABEL_H),
-                         Qt.AlignmentFlag.AlignCenter, "◀  NOSE (FRONT)")
+        painter.drawText(QRectF(grid_x, M, grid_w, NOSE_H),
+                         Qt.AlignmentFlag.AlignCenter, "◀  NOSE")
 
-        # Draw axle lines
-        D = TRAILER["drive_axle_from_nose_in"]
-        T = TRAILER["trailer_axle_from_nose_in"]
+        # Axle lines
         trailer_len = TRAILER["interior_length_in"]
+        tandem_in   = TRAILER["tandem_from_nose_in"]
 
-        def depth_to_y(depth_in):
-            return trailer_rect.top() + (depth_in / trailer_len) * trailer_rect.height()
+        def depth_to_y(d):
+            return grid_y + (d / trailer_len) * grid_h
 
-        for axle_depth, label, color in [
-            (D, "Drive Axles", "#e67e00"),
-            (T, "Trailer Axles", "#c0392b"),
+        for depth, label, color in [
+            (36,        "Drive Axles",   "#e67e00"),
+            (tandem_in, "Trailer Axles", "#c0392b"),
         ]:
-            y = depth_to_y(axle_depth)
-            painter.setPen(QPen(QColor(color), 2, Qt.PenStyle.DashLine))
-            painter.drawLine(QPointF(m, y), QPointF(m + available_w, y))
+            ay = depth_to_y(depth)
+            painter.setPen(QPen(QColor(color), 1.5, Qt.PenStyle.DashLine))
+            painter.drawLine(QPointF(grid_x, ay), QPointF(grid_x + grid_w, ay))
             painter.setPen(QColor(color))
-            font_axle = QFont("Arial", 7)
-            painter.setFont(font_axle)
-            painter.drawText(QRectF(m + 2, y - 14, available_w - 4, 14),
+            font_ax = QFont("Arial", 6)
+            painter.setFont(font_ax)
+            painter.drawText(QRectF(grid_x + 2, ay - 12, grid_w - 4, 12),
                              Qt.AlignmentFlag.AlignRight, label)
 
-        # Draw pallet slots
-        colors = [
-            QColor("#4a90d9"), QColor("#e67e22"), QColor("#27ae60"),
-            QColor("#8e44ad"), QColor("#c0392b"), QColor("#16a085"),
-            QColor("#d35400"), QColor("#2980b9"), QColor("#7f8c8d"),
-            QColor("#f39c12"), QColor("#1abc9c"), QColor("#e74c3c"),
+        # Slot colors (cycle)
+        COLORS = [
+            "#4a90d9","#e67e22","#27ae60","#8e44ad","#c0392b","#16a085",
+            "#d35400","#2980b9","#7f8c8d","#f39c12","#1abc9c","#e74c3c",
         ]
 
-        font_slot = QFont("Arial", 8, QFont.Weight.Bold)
-        font_small = QFont("Arial", 6)
-
         slot_map = {(s.row, s.col): s for s in slots}
+        font_big   = QFont("Arial", 7, QFont.Weight.Bold)
+        font_small = QFont("Arial", 5)
+        font_rlbl  = QFont("Arial", 7, QFont.Weight.Bold)
 
-        drawn_rows = set()
-        for slot in slots:
-            r, c = slot.row, slot.col
-            x = trailer_rect.left() + c * col_w
-            y = depth_to_y(slot.row_depth_in)
+        for r in rows:
+            y = grid_y + r * row_h
+            slot_a = slot_map.get((r, 0))
+            row_depth_in = (slot_a.row_start_in if slot_a else 0)
+            piece_a = slot_a.piece if slot_a else None
+            actual_row_h = ((piece_a.length_in / trailer_len) * grid_h) if piece_a else row_h
 
-            if slot.piece:
-                row_h_actual = (slot.piece.length_in / trailer_len) * trailer_rect.height()
-            else:
-                row_h_actual = row_h
+            # Row label
+            painter.setFont(font_rlbl)
+            painter.setPen(QColor("#444"))
+            painter.drawText(QRectF(M, y, ROW_LBL - 2, actual_row_h),
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                             f"R{r+1}")
 
-            cell = QRectF(x + 1, y + 1, col_w - 2, row_h_actual - 2)
+            y_px = grid_y + (row_depth_in / trailer_len) * grid_h
 
-            color = colors[(slot.piece.piece_id - 1) % len(colors)] if slot.piece else QColor("#ccc")
-            painter.setBrush(QBrush(color))
-            painter.setPen(QPen(QColor("#222"), 1))
-            painter.drawRect(cell)
+            for c in range(2):
+                slot = slot_map.get((r, c))
+                x = grid_x + c * col_w
+                if slot and slot.piece:
+                    ph = (slot.piece.length_in / trailer_len) * grid_h
+                    cell = QRectF(x + 1, y_px + 1, col_w - 2, ph - 2)
+                    color = QColor(COLORS[(slot.piece.piece_id - 1) % len(COLORS)])
+                    painter.setBrush(QBrush(color))
+                    painter.setPen(QPen(QColor("#222"), 0.5))
+                    painter.drawRect(cell)
 
-            if slot.piece:
-                pos_num = r * COLS + c + 1
-                painter.setFont(font_slot)
-                painter.setPen(Qt.GlobalColor.white)
-                # Position number (large)
-                painter.drawText(cell, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter,
-                                 f"#{pos_num}")
-                painter.setFont(font_small)
-                desc = slot.piece.description[:10] if slot.piece.description else ""
-                weight_str = f"{slot.piece.weight_lbs:,.0f} lbs"
-                painter.drawText(cell, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter,
-                                 f"[{slot.piece.piece_id}]\n{desc}\n{weight_str}")
+                    painter.setFont(font_big)
+                    painter.setPen(Qt.GlobalColor.white)
+                    painter.drawText(cell.adjusted(2, 2, -2, -cell.height() // 2),
+                                     Qt.AlignmentFlag.AlignCenter, slot.piece.crate_label)
+                    painter.setFont(font_small)
+                    painter.drawText(cell.adjusted(2, cell.height() // 2, -2, -2),
+                                     Qt.AlignmentFlag.AlignCenter,
+                                     f"{slot.piece.weight_lbs:,.0f} lb")
+                else:
+                    cell = QRectF(x + 1, y_px + 1, col_w - 2, row_h - 2)
+                    painter.setBrush(QBrush(QColor("#e8e8e8")))
+                    painter.setPen(QPen(QColor("#bbb"), 0.5, Qt.PenStyle.DashLine))
+                    painter.drawRect(cell)
 
-        # Column headers (L / R)
+        # Column labels at bottom
+        font = QFont("Arial", 7)
+        painter.setFont(font)
         painter.setPen(QColor("#555"))
-        font_hdr = QFont("Arial", 8)
-        painter.setFont(font_hdr)
-        for c, label in enumerate(["LEFT", "RIGHT"]):
-            x = trailer_rect.left() + c * col_w
-            painter.drawText(QRectF(x, trailer_rect.bottom() + 2, col_w, 16),
-                             Qt.AlignmentFlag.AlignCenter, label)
-
-        painter.end()
+        for c, lbl in enumerate(["Position A (Left)", "Position B (Right)"]):
+            painter.drawText(QRectF(grid_x + c * col_w, H - 20, col_w, 18),
+                             Qt.AlignmentFlag.AlignCenter, lbl)
 
 
-# ---------------------------------------------------------------------------
-# Main window
-# ---------------------------------------------------------------------------
+# ── Excel Import Dialog ───────────────────────────────────────────────────────
+class ImportDialog(QDialog):
+    """Preview packing list from Excel, check/uncheck rows to include/exclude."""
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Packing List from Excel")
+        self.setMinimumSize(820, 520)
+        self.pieces: list[FreightPiece] = []
+        self.excluded_ids: list[int] = []
+
+        layout = QVBoxLayout(self)
+
+        # File picker
+        file_row = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("Select Excel packing list (.xlsx)…")
+        self.path_edit.setReadOnly(True)
+        btn_browse = QPushButton("Browse…")
+        btn_browse.clicked.connect(self._browse)
+        file_row.addWidget(self.path_edit)
+        file_row.addWidget(btn_browse)
+        layout.addLayout(file_row)
+
+        lbl = QLabel("Check rows to include. Uncheck to exclude from the load plan.")
+        lbl.setStyleSheet("color:#555; font-size:11px;")
+        layout.addWidget(lbl)
+
+        # Preview table
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels(
+            ["✓ Include", "Crate #", "Part Number", "L\"", "W\"", "H\"", "Weight (lbs)", "PCS", "Notes"])
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.table)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Packing List", "", "Excel Files (*.xlsx *.xls)")
+        if path:
+            self.path_edit.setText(path)
+            self._load(path)
+
+    def _load(self, path: str):
+        if not HAS_OPENPYXL:
+            QMessageBox.critical(self, "Missing Library",
+                                 "openpyxl is required for Excel import.\n"
+                                 "Run: pip3 install openpyxl")
+            return
+        try:
+            wb = openpyxl.load_workbook(path, data_only=True)
+            ws = wb.active
+            self.table.setRowCount(0)
+            self._raw_rows = []
+
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row[0] is None:
+                    continue
+                try:
+                    crate_id = int(row[0])
+                except (TypeError, ValueError):
+                    continue
+
+                part   = str(row[1] or "")
+                l_in   = float(row[3] or 0)
+                w_in   = float(row[4] or 0)
+                h_in   = float(row[5] or 0)
+                weight = float(row[6] or 0)
+                pcs    = int(row[7] or 0)
+                notes  = str(row[9] or "")
+
+                self._raw_rows.append((crate_id, part, l_in, w_in, h_in, weight, pcs, notes))
+
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+
+                chk = QCheckBox()
+                chk.setChecked(True)
+                chk_widget = QWidget()
+                chk_layout = QHBoxLayout(chk_widget)
+                chk_layout.addWidget(chk)
+                chk_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                chk_layout.setContentsMargins(0, 0, 0, 0)
+                self.table.setCellWidget(r, 0, chk_widget)
+
+                for col, val in enumerate([crate_id, part, l_in, w_in, h_in,
+                                           f"{weight:,.0f}", pcs, notes], start=1):
+                    item = QTableWidgetItem(str(val))
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    self.table.setItem(r, col, item)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", str(e))
+
+    def _accept(self):
+        self.pieces = []
+        self.excluded_ids = []
+
+        for r, raw in enumerate(self._raw_rows):
+            crate_id, part, l_in, w_in, h_in, weight, pcs, notes = raw
+            chk_widget = self.table.cellWidget(r, 0)
+            chk = chk_widget.findChild(QCheckBox)
+            if chk and chk.isChecked():
+                self.pieces.append(FreightPiece(
+                    piece_id=crate_id,
+                    crate_label=f"Crate {crate_id}",
+                    part_number=part,
+                    length_in=l_in,
+                    width_in=w_in,
+                    height_in=h_in,
+                    weight_lbs=weight,
+                    pcs=pcs,
+                    notes=notes,
+                ))
+            else:
+                self.excluded_ids.append(crate_id)
+
+        self.accept()
+
+
+# ── Main Window ───────────────────────────────────────────────────────────────
 class FreightLoaderApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Freight Loader — 53' Dry Van")
-        self.setMinimumSize(1100, 720)
+        self.setMinimumSize(1150, 760)
         self._next_id = 1
         self._plan: Optional[LoadPlan] = None
+        self._excluded_ids: list = []
         self._build_ui()
 
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
-        main_layout.setSpacing(8)
+        root = QHBoxLayout(central)
+        root.setSpacing(6)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(splitter)
+        root.addWidget(splitter)
 
-        # ---- LEFT PANEL ----
+        # ══ LEFT PANEL ══════════════════════════════════════════════════
         left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setSpacing(6)
+        ll = QVBoxLayout(left)
+        ll.setSpacing(6)
 
-        # Freight entry table
+        # ── Shipment Info ──────────────────────────────────────────────
+        grp_info = QGroupBox("Shipment Info")
+        info_form = QFormLayout(grp_info)
+        info_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+
+        self.f_customer      = QLineEdit(); self.f_customer.setPlaceholderText("Customer name")
+        self.f_shipment_name = QLineEdit(); self.f_shipment_name.setPlaceholderText("Shipment / load name")
+        self.f_trailer_num   = QLineEdit(); self.f_trailer_num.setPlaceholderText("Optional")
+        self.f_bol           = QLineEdit(); self.f_bol.setPlaceholderText("Optional")
+        self.f_date          = QLineEdit(datetime.date.today().strftime("%Y-%m-%d"))
+
+        info_form.addRow("Customer:",      self.f_customer)
+        info_form.addRow("Shipment Name:", self.f_shipment_name)
+        info_form.addRow("Trailer #:",     self.f_trailer_num)
+        info_form.addRow("BOL #:",         self.f_bol)
+        info_form.addRow("Date:",          self.f_date)
+        ll.addWidget(grp_info)
+
+        # ── Freight table ──────────────────────────────────────────────
         grp_freight = QGroupBox("Freight Pieces")
-        grp_layout = QVBoxLayout(grp_freight)
+        gl = QVBoxLayout(grp_freight)
 
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["#", "Description", "Length (in)", "Width (in)", "Height (in)", "Weight (lbs)"])
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["Crate #", "Label", "Part #", 'L"', 'W"', 'H"', "Weight (lbs)"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        grp_layout.addWidget(self.table)
+        gl.addWidget(self.table)
 
         btn_row = QHBoxLayout()
-        self.btn_add = QPushButton("+ Add Piece")
-        self.btn_add.clicked.connect(self._add_row)
-        self.btn_del = QPushButton("Remove Selected")
-        self.btn_del.clicked.connect(self._remove_row)
-        btn_row.addWidget(self.btn_add)
-        btn_row.addWidget(self.btn_del)
-        btn_row.addStretch()
-        grp_layout.addLayout(btn_row)
-        left_layout.addWidget(grp_freight)
+        btn_import = QPushButton("Import from Excel…")
+        btn_import.clicked.connect(self._import_excel)
+        btn_add    = QPushButton("+ Add Row")
+        btn_add.clicked.connect(self._add_row)
+        btn_del    = QPushButton("Remove Selected")
+        btn_del.clicked.connect(self._remove_row)
+        btn_clear  = QPushButton("Clear All")
+        btn_clear.clicked.connect(self._clear_table)
+        for b in [btn_import, btn_add, btn_del, btn_clear]:
+            btn_row.addWidget(b)
+        gl.addLayout(btn_row)
+        ll.addWidget(grp_freight)
 
-        # Weight limits group
-        grp_limits = QGroupBox("Axle Weight Limits (lbs)")
-        limits_layout = QHBoxLayout(grp_limits)
-
+        # ── Axle limits ────────────────────────────────────────────────
+        grp_limits = QGroupBox("DOT Axle Weight Limits (lbs)")
+        lim_row = QHBoxLayout(grp_limits)
         self._limit_fields = {}
         for key, label, default in [
-            ("steer", "Steer", 12000),
-            ("drive", "Drives", 34000),
+            ("steer",   "Steer",   12000),
+            ("drive",   "Drive",   34000),
             ("trailer", "Trailer", 34000),
-            ("gross", "Gross", 80000),
+            ("gross",   "Gross",   80000),
         ]:
             vb = QVBoxLayout()
-            lbl = QLabel(label)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            vb.addWidget(QLabel(label, alignment=Qt.AlignmentFlag.AlignCenter))
             spin = QSpinBox()
             spin.setRange(1000, 200000)
             spin.setValue(default)
             spin.setSingleStep(500)
             spin.setGroupSeparatorShown(True)
             self._limit_fields[key] = spin
-            vb.addWidget(lbl)
             vb.addWidget(spin)
-            limits_layout.addLayout(vb)
+            lim_row.addLayout(vb)
+        self.chk_override = QCheckBox("Allow override")
+        lim_row.addWidget(self.chk_override)
+        ll.addWidget(grp_limits)
 
-        self.chk_override = QCheckBox("Allow override (ignore violations)")
-        limits_layout.addWidget(self.chk_override)
-        left_layout.addWidget(grp_limits)
+        # ── Calculate ─────────────────────────────────────────────────
+        btn_calc = QPushButton("⚡  Calculate Load Plan")
+        btn_calc.setFixedHeight(44)
+        font = btn_calc.font(); font.setPointSize(13); font.setBold(True)
+        btn_calc.setFont(font)
+        btn_calc.clicked.connect(self._calculate)
+        ll.addWidget(btn_calc)
 
-        # Calculate button
-        self.btn_calc = QPushButton("Calculate Load Plan")
-        self.btn_calc.setFixedHeight(42)
-        font_btn = self.btn_calc.font()
-        font_btn.setPointSize(13)
-        font_btn.setBold(True)
-        self.btn_calc.setFont(font_btn)
-        self.btn_calc.clicked.connect(self._calculate)
-        left_layout.addWidget(self.btn_calc)
+        # ── Summary / violations ───────────────────────────────────────
+        grp_sum = QGroupBox("Axle Weight Summary")
+        sl = QVBoxLayout(grp_sum)
+        self.lbl_summary = QLabel("—")
+        self.lbl_summary.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_summary.setWordWrap(True)
+        sl.addWidget(self.lbl_summary)
+        ll.addWidget(grp_sum)
 
-        # Axle weight summary
-        grp_summary = QGroupBox("Axle Weight Summary")
-        summary_layout = QVBoxLayout(grp_summary)
-        self.summary_label = QLabel("—")
-        self.summary_label.setWordWrap(True)
-        self.summary_label.setTextFormat(Qt.TextFormat.RichText)
-        summary_layout.addWidget(self.summary_label)
-        left_layout.addWidget(grp_summary)
-
-        # Violations / status
         grp_status = QGroupBox("Status / Violations")
-        status_layout = QVBoxLayout(grp_status)
-        self.status_label = QLabel("No plan calculated.")
-        self.status_label.setWordWrap(True)
-        self.status_label.setTextFormat(Qt.TextFormat.RichText)
-        status_layout.addWidget(self.status_label)
-        left_layout.addWidget(grp_status)
+        stl = QVBoxLayout(grp_status)
+        self.lbl_status = QLabel("No plan calculated.")
+        self.lbl_status.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_status.setWordWrap(True)
+        stl.addWidget(self.lbl_status)
+        ll.addWidget(grp_status)
 
-        # Print button
-        self.btn_print = QPushButton("Print / Save PDF")
-        self.btn_print.clicked.connect(self._print_plan)
-        self.btn_print.setEnabled(False)
-        left_layout.addWidget(self.btn_print)
+        # ── Export buttons ─────────────────────────────────────────────
+        exp_row = QHBoxLayout()
+        self.btn_plan_pdf  = QPushButton("Export Floor Plan PDF")
+        self.btn_label_pdf = QPushButton("Export Crate Labels PDF")
+        for b in [self.btn_plan_pdf, self.btn_label_pdf]:
+            b.setEnabled(False)
+            exp_row.addWidget(b)
+        self.btn_plan_pdf.clicked.connect(self._export_floor_plan)
+        self.btn_label_pdf.clicked.connect(self._export_labels)
+        ll.addLayout(exp_row)
 
         splitter.addWidget(left)
 
-        # ---- RIGHT PANEL — trailer view ----
+        # ══ RIGHT PANEL — trailer view ════════════════════════════════
         right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        view_label = QLabel("Trailer Load View (Top-Down, Nose at Top)")
-        view_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        view_label.setStyleSheet("font-weight: bold; font-size: 11px;")
-        right_layout.addWidget(view_label)
-
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        lbl_view = QLabel("Trailer View — Top-Down (Nose at Top)")
+        lbl_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_view.setStyleSheet("font-weight:bold; font-size:11px;")
+        rl.addWidget(lbl_view)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         self.trailer_view = TrailerView()
         self.trailer_view.setMinimumHeight(600)
         scroll.setWidget(self.trailer_view)
-        right_layout.addWidget(scroll)
-
+        rl.addWidget(scroll)
         splitter.addWidget(right)
-        splitter.setSizes([480, 580])
+        splitter.setSizes([500, 610])
 
-        # Seed with a couple of example rows
-        self._add_row(description="Pallet 1", length=48, width=48, height=60, weight=1800)
-        self._add_row(description="Pallet 2", length=48, width=48, height=60, weight=2200)
+    # ── Actions ──────────────────────────────────────────────────────────────
+    def _get_shipment_info(self) -> ShipmentInfo:
+        return ShipmentInfo(
+            customer=self.f_customer.text().strip(),
+            shipment_name=self.f_shipment_name.text().strip(),
+            trailer_num=self.f_trailer_num.text().strip(),
+            bol_num=self.f_bol.text().strip(),
+            date=self.f_date.text().strip(),
+        )
 
-    def _add_row(self, description="", length=48.0, width=48.0, height=48.0, weight=1000.0):
-        row = self.table.rowCount()
-        self.table.insertRow(row)
+    def _import_excel(self):
+        dlg = ImportDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.pieces:
+            self._load_pieces(dlg.pieces)
+            self._excluded_ids = dlg.excluded_ids
+            if dlg.excluded_ids:
+                self.lbl_status.setText(
+                    f"Imported {len(dlg.pieces)} crates. "
+                    f"Excluded: {', '.join('Crate ' + str(i) for i in dlg.excluded_ids)}")
 
-        id_item = QTableWidgetItem(str(self._next_id))
-        id_item.setFlags(id_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        id_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.table.setItem(row, 0, id_item)
+    def _load_pieces(self, pieces: list):
+        self.table.setRowCount(0)
+        self._next_id = 1
+        for p in pieces:
+            self._add_row(
+                crate_id=p.piece_id,
+                label=p.crate_label,
+                part_num=p.part_number,
+                length=p.length_in,
+                width=p.width_in,
+                height=p.height_in,
+                weight=p.weight_lbs,
+            )
 
-        self.table.setItem(row, 1, QTableWidgetItem(description))
+    def _add_row(self, crate_id=None, label="", part_num="",
+                 length=48.0, width=48.0, height=48.0, weight=1000.0):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
 
-        for col, val in enumerate([length, width, height, weight], start=2):
+        if crate_id is None:
+            crate_id = self._next_id
+        if not label:
+            label = f"Crate {crate_id}"
+
+        self._next_id = max(self._next_id, crate_id) + 1
+
+        for col, val in enumerate([crate_id, label, part_num,
+                                    length, width, height, weight]):
             item = QTableWidgetItem(str(val))
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, col, item)
-
-        self._next_id += 1
+            if col == 0:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(r, col, item)
 
     def _remove_row(self):
         rows = sorted(set(i.row() for i in self.table.selectedItems()), reverse=True)
         for r in rows:
             self.table.removeRow(r)
 
-    def _read_pieces(self) -> list[FreightPiece]:
+    def _clear_table(self):
+        if QMessageBox.question(self, "Clear All", "Remove all freight rows?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                                ) == QMessageBox.StandardButton.Yes:
+            self.table.setRowCount(0)
+            self._next_id = 1
+
+    def _read_pieces(self) -> list:
         pieces = []
-        for row in range(self.table.rowCount()):
+        for r in range(self.table.rowCount()):
             try:
-                pid = int(self.table.item(row, 0).text())
-                desc = self.table.item(row, 1).text() if self.table.item(row, 1) else ""
-                length = float(self.table.item(row, 2).text())
-                width = float(self.table.item(row, 3).text())
-                height = float(self.table.item(row, 4).text())
-                weight = float(self.table.item(row, 5).text())
-                pieces.append(FreightPiece(pid, desc, length, width, height, weight))
+                crate_id = int(self.table.item(r, 0).text())
+                label    = self.table.item(r, 1).text() if self.table.item(r, 1) else f"Crate {crate_id}"
+                part     = self.table.item(r, 2).text() if self.table.item(r, 2) else ""
+                l_in     = float(self.table.item(r, 3).text())
+                w_in     = float(self.table.item(r, 4).text())
+                h_in     = float(self.table.item(r, 5).text())
+                weight   = float(self.table.item(r, 6).text())
+                pieces.append(FreightPiece(crate_id, label, part, l_in, w_in, h_in, weight))
             except (ValueError, AttributeError) as e:
-                QMessageBox.warning(self, "Input Error", f"Row {row+1} has invalid data: {e}")
+                QMessageBox.warning(self, "Input Error", f"Row {r+1}: {e}")
                 return []
         return pieces
 
@@ -501,166 +999,74 @@ class FreightLoaderApp(QMainWindow):
         if not pieces:
             return
 
-        # Apply user-edited limits to TRAILER dict
-        TRAILER["steer_limit"] = self._limit_fields["steer"].value()
-        TRAILER["drive_limit"] = self._limit_fields["drive"].value()
+        TRAILER["steer_limit"]   = self._limit_fields["steer"].value()
+        TRAILER["drive_limit"]   = self._limit_fields["drive"].value()
         TRAILER["trailer_limit"] = self._limit_fields["trailer"].value()
-        TRAILER["gross_limit"] = self._limit_fields["gross"].value()
+        TRAILER["gross_limit"]   = self._limit_fields["gross"].value()
 
         override = self.chk_override.isChecked()
-        plan = plan_load(pieces, override=override)
+        plan = plan_load(pieces, override=override, excluded_ids=self._excluded_ids)
 
         if plan.violations and not override:
             msg = "Weight violations detected:\n\n" + "\n".join(plan.violations)
-            msg += "\n\nCheck 'Allow override' to proceed anyway."
+            msg += "\n\nCheck 'Allow override' to proceed anyway, or adjust the load."
             QMessageBox.warning(self, "Weight Violations", msg)
-            # Still show the plan but flag it
-            self._plan = plan
-            self.trailer_view.set_plan(plan)
-            self._update_summary(plan)
-            self.btn_print.setEnabled(True)
-            return
 
         self._plan = plan
         self.trailer_view.set_plan(plan)
         self._update_summary(plan)
-        self.btn_print.setEnabled(True)
+        self.btn_plan_pdf.setEnabled(True)
+        self.btn_label_pdf.setEnabled(True)
 
     def _update_summary(self, plan: LoadPlan):
         aw = plan.axle_weights
-        rows = []
-        for key, label, limit_key in [
-            ("steer",   "Steer",   "steer_limit"),
-            ("drive",   "Drive",   "drive_limit"),
-            ("trailer", "Trailer", "trailer_limit"),
-            ("gross",   "Gross",   "gross_limit"),
+        rows_html = ""
+        for key, label, lim_key in [
+            ("steer",   "Steer",          "steer_limit"),
+            ("drive",   "Drive",          "drive_limit"),
+            ("trailer", "Trailer Tandem", "trailer_limit"),
+            ("gross",   "Gross (est.)",   "gross_limit"),
         ]:
-            val = aw.get(key, 0)
-            limit = TRAILER[limit_key]
-            pct = (val / limit * 100) if limit else 0
+            val   = aw.get(key, 0)
+            limit = TRAILER[lim_key]
+            pct   = val / limit * 100 if limit else 0
             color = "#c0392b" if val > limit else "#27ae60"
-            rows.append(
-                f"<tr>"
-                f"<td><b>{label}:</b></td>"
-                f"<td align='right'><span style='color:{color}'>{val:,} lbs</span></td>"
-                f"<td align='right'>{pct:.0f}% of {limit:,}</td>"
-                f"</tr>"
-            )
-        self.summary_label.setText("<table>" + "".join(rows) + "</table>")
+            rows_html += (f"<tr>"
+                          f"<td><b>{label}:</b></td>"
+                          f"<td align='right'><span style='color:{color}'>{val:,} lbs</span></td>"
+                          f"<td align='right'>&nbsp;{pct:.0f}% of {limit:,}</td>"
+                          f"</tr>")
+        self.lbl_summary.setText(f"<table>{rows_html}</table>")
 
         if plan.violations:
-            viol_html = "<br>".join(
-                f"<span style='color:red'>⚠ {v}</span>" for v in plan.violations
-            )
-            status = viol_html
+            v_html = "<br>".join(f"<span style='color:red'>⚠ {v}</span>" for v in plan.violations)
             if plan.override:
-                status += "<br><i>Override active — proceeding despite violations.</i>"
+                v_html += "<br><i>Override active.</i>"
+            self.lbl_status.setText(v_html)
         else:
-            status = "<span style='color:green'>✓ All axle weights within limits.</span>"
-        self.status_label.setText(status)
+            self.lbl_status.setText(
+                "<span style='color:green'>✓ All axle weights within legal limits.</span>")
 
-    def _print_plan(self):
-        if self._plan is None:
+    def _export_floor_plan(self):
+        if not self._plan:
             return
-
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Load Plan PDF", "load_plan.pdf", "PDF Files (*.pdf)"
-        )
-        if not path:
+            self, "Save Floor Plan PDF", "load_plan.pdf", "PDF Files (*.pdf)")
+        if path:
+            export_load_plan_pdf(self._plan, self._get_shipment_info(), path)
+            QMessageBox.information(self, "Saved", f"Floor plan saved:\n{path}")
+
+    def _export_labels(self):
+        if not self._plan:
             return
-
-        writer = QPdfWriter(path)
-        writer.setPageSize(QPageSize(QPageSize.PageSizeId.Letter))
-        writer.setPageOrientation(QPageLayout.Orientation.Portrait)
-        writer.setResolution(150)
-
-        painter = QPainter(writer)
-
-        page_rect = painter.viewport()
-        margin = 80
-        usable = page_rect.adjusted(margin, margin, -margin, -margin)
-
-        # Title
-        font_title = QFont("Arial", 18, QFont.Weight.Bold)
-        painter.setFont(font_title)
-        painter.drawText(usable, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter,
-                         "Freight Load Plan — 53' Dry Van")
-
-        # Axle weights text
-        aw = self._plan.axle_weights
-        font_body = QFont("Arial", 11)
-        painter.setFont(font_body)
-        lines = [
-            f"Steer: {aw.get('steer', 0):,} lbs   Drive: {aw.get('drive', 0):,} lbs   "
-            f"Trailer: {aw.get('trailer', 0):,} lbs   Gross: {aw.get('gross', 0):,} lbs"
-        ]
-        if self._plan.violations:
-            lines += ["VIOLATIONS: " + "; ".join(self._plan.violations)]
-        if self._plan.override:
-            lines += ["** Override active **"]
-
-        y_offset = 120
-        for line in lines:
-            painter.drawText(
-                usable.adjusted(0, y_offset, 0, 0),
-                Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
-                line
-            )
-            y_offset += 60
-
-        # Trailer drawing in remaining space
-        draw_rect = usable.adjusted(0, y_offset + 20, 0, 0)
-        qrectf = QRectF(draw_rect)
-        self.trailer_view._draw(painter, qrectf)
-
-        painter.end()
-
-        QMessageBox.information(self, "Saved", f"Load plan saved to:\n{path}")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Crate Labels PDF", "crate_labels.pdf", "PDF Files (*.pdf)")
+        if path:
+            export_crate_labels_pdf(self._plan, self._get_shipment_info(), path)
+            QMessageBox.information(self, "Saved", f"Crate labels saved:\n{path}")
 
 
-# ---------------------------------------------------------------------------
-# Manifest table dialog (position list)
-# ---------------------------------------------------------------------------
-
-class ManifestDialog(QDialog):
-    def __init__(self, plan: LoadPlan, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Load Manifest")
-        self.setMinimumSize(480, 400)
-        layout = QVBoxLayout(self)
-
-        lbl = QLabel("<b>Pallet Position Manifest</b>")
-        layout.addWidget(lbl)
-
-        table = QTableWidget(0, 5)
-        table.setHorizontalHeaderLabels(["Position", "Side", "Freight #", "Description", "Weight (lbs)"])
-        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-
-        for slot in sorted(plan.slots, key=lambda s: (s.row, s.col)):
-            r = table.rowCount()
-            table.insertRow(r)
-            pos = slot.row * COLS + slot.col + 1
-            side = "Left" if slot.col == 0 else "Right"
-            table.setItem(r, 0, QTableWidgetItem(str(pos)))
-            table.setItem(r, 1, QTableWidgetItem(side))
-            if slot.piece:
-                table.setItem(r, 2, QTableWidgetItem(str(slot.piece.piece_id)))
-                table.setItem(r, 3, QTableWidgetItem(slot.piece.description))
-                table.setItem(r, 4, QTableWidgetItem(f"{slot.piece.weight_lbs:,.0f}"))
-            else:
-                for c in [2, 3, 4]:
-                    table.setItem(r, c, QTableWidgetItem("(empty)"))
-
-        layout.addWidget(table)
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
