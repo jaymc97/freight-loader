@@ -810,9 +810,9 @@ class FreightLoaderApp(QMainWindow):
         grp_freight = QGroupBox("Freight Pieces")
         gl = QVBoxLayout(grp_freight)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
-            ["Crate #", "Label", "Part #", 'L"', 'W"', 'H"', "Weight (lbs)"])
+            ["Crate #", "Label", "Part #", 'L"', 'W"', 'H"', "Weight (lbs)", "PCS"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -943,10 +943,11 @@ class FreightLoaderApp(QMainWindow):
                 width=p.width_in,
                 height=p.height_in,
                 weight=p.weight_lbs,
+                pcs=p.pcs,
             )
 
     def _add_row(self, crate_id=None, label="", part_num="",
-                 length=48.0, width=48.0, height=48.0, weight=1000.0):
+                 length=48.0, width=48.0, height=48.0, weight=1000.0, pcs=0):
         r = self.table.rowCount()
         self.table.insertRow(r)
 
@@ -958,7 +959,7 @@ class FreightLoaderApp(QMainWindow):
         self._next_id = max(self._next_id, crate_id) + 1
 
         for col, val in enumerate([crate_id, label, part_num,
-                                    length, width, height, weight]):
+                                    length, width, height, weight, pcs]):
             item = QTableWidgetItem(str(val))
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             if col == 0:
@@ -988,7 +989,9 @@ class FreightLoaderApp(QMainWindow):
                 w_in     = float(self.table.item(r, 4).text())
                 h_in     = float(self.table.item(r, 5).text())
                 weight   = float(self.table.item(r, 6).text())
-                pieces.append(FreightPiece(crate_id, label, part, l_in, w_in, h_in, weight))
+                pcs_item = self.table.item(r, 7)
+                pcs      = int(pcs_item.text()) if pcs_item and pcs_item.text().strip() else 0
+                pieces.append(FreightPiece(crate_id, label, part, l_in, w_in, h_in, weight, pcs))
             except (ValueError, AttributeError) as e:
                 QMessageBox.warning(self, "Input Error", f"Row {r+1}: {e}")
                 return []
