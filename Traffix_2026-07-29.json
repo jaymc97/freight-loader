@@ -1,0 +1,298 @@
+{
+  "version": 1,
+  "saved_at": "2026-07-29T10:58:36",
+  "shipment": {
+    "customer": "Traffix",
+    "shipment_name": "Traffix Shipment",
+    "trailer_num": "",
+    "bol_num": "",
+    "date": "2026-07-29"
+  },
+  "axle_limits": {
+    "steer": 12000,
+    "drive": 34000,
+    "trailer": 34000
+  },
+  "override": false,
+  "excluded_ids": [
+    26,
+    27
+  ],
+  "freight": [
+    {
+      "piece_id": 1,
+      "crate_label": "Crate 1",
+      "part_number": "NE41P-0064-B",
+      "length_in": 42,
+      "width_in": 51,
+      "height_in": 18,
+      "weight_lbs": 1000,
+      "pcs": 500,
+      "notes": ""
+    },
+    {
+      "piece_id": 2,
+      "crate_label": "Crate 2",
+      "part_number": "NE21P-0079-C",
+      "length_in": 42,
+      "width_in": 42,
+      "height_in": 43,
+      "weight_lbs": 1650,
+      "pcs": 270,
+      "notes": ""
+    },
+    {
+      "piece_id": 3,
+      "crate_label": "Crate 3",
+      "part_number": "NE21P-0080-B",
+      "length_in": 43,
+      "width_in": 51,
+      "height_in": 17,
+      "weight_lbs": 700,
+      "pcs": 225,
+      "notes": ""
+    },
+    {
+      "piece_id": 4,
+      "crate_label": "Crate 4",
+      "part_number": "NE21P-0083-B",
+      "length_in": 48,
+      "width_in": 43,
+      "height_in": 37,
+      "weight_lbs": 1765,
+      "pcs": 18,
+      "notes": ""
+    },
+    {
+      "piece_id": 5,
+      "crate_label": "Crate 5",
+      "part_number": "NE21P-0083-B",
+      "length_in": 48,
+      "width_in": 43,
+      "height_in": 37,
+      "weight_lbs": 1765,
+      "pcs": 18,
+      "notes": ""
+    },
+    {
+      "piece_id": 6,
+      "crate_label": "Crate 6",
+      "part_number": "NE21P-0083-B",
+      "length_in": 48,
+      "width_in": 43,
+      "height_in": 37,
+      "weight_lbs": 1765,
+      "pcs": 18,
+      "notes": ""
+    },
+    {
+      "piece_id": 7,
+      "crate_label": "Crate 7",
+      "part_number": "NE21P-0083-B",
+      "length_in": 48,
+      "width_in": 43,
+      "height_in": 37,
+      "weight_lbs": 1765,
+      "pcs": 18,
+      "notes": ""
+    },
+    {
+      "piece_id": 8,
+      "crate_label": "Crate 8",
+      "part_number": "NE21P-0083-B",
+      "length_in": 48,
+      "width_in": 48,
+      "height_in": 43,
+      "weight_lbs": 785,
+      "pcs": 8,
+      "notes": ""
+    },
+    {
+      "piece_id": 9,
+      "crate_label": "Crate 9",
+      "part_number": "NE21P-0089-A",
+      "length_in": 42,
+      "width_in": 42,
+      "height_in": 43,
+      "weight_lbs": 2000,
+      "pcs": 284,
+      "notes": "Approx. weight"
+    },
+    {
+      "piece_id": 10,
+      "crate_label": "Crate 10",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 55,
+      "weight_lbs": 1700,
+      "pcs": 880,
+      "notes": "Also contains 120+240 pcs NE23P-0068-B"
+    },
+    {
+      "piece_id": 11,
+      "crate_label": "Crate 11",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 68,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 12,
+      "crate_label": "Crate 12",
+      "part_number": "NE41P-0064-B",
+      "length_in": 42,
+      "width_in": 51,
+      "height_in": 18,
+      "weight_lbs": 900,
+      "pcs": 436,
+      "notes": "Remaining pcs per Traffix instruction"
+    },
+    {
+      "piece_id": 13,
+      "crate_label": "Crate 13",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 14,
+      "crate_label": "Crate 14",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 15,
+      "crate_label": "Crate 15",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 16,
+      "crate_label": "Crate 16",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 17,
+      "crate_label": "Crate 17",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 18,
+      "crate_label": "Crate 18",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 19,
+      "crate_label": "Crate 19",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 20,
+      "crate_label": "Crate 20",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 21,
+      "crate_label": "Crate 21",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 22,
+      "crate_label": "Crate 22",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 23,
+      "crate_label": "Crate 23",
+      "part_number": "NE22P-0071-D",
+      "length_in": 44,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 24,
+      "crate_label": "Crate 24",
+      "part_number": "NE22P-0071-D",
+      "length_in": 48,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    },
+    {
+      "piece_id": 25,
+      "crate_label": "Crate 25",
+      "part_number": "NE22P-0071-D",
+      "length_in": 48,
+      "width_in": 44,
+      "height_in": 71,
+      "weight_lbs": 2000,
+      "pcs": 1620,
+      "notes": ""
+    }
+  ]
+}

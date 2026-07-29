@@ -6,8 +6,13 @@ Imports Excel packing lists, calculates balanced load plans, exports floor plan 
 import sys
 import math
 import datetime
+import json
+import os
+import re
 from dataclasses import dataclass
 from typing import Optional
+
+SAVE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 try:
     import openpyxl
@@ -195,6 +200,84 @@ def _calc_axle_weights(slots: list, override: bool) -> tuple:
         v.append(f"GROSS {truck_gross:,} lb > {TRAILER['gross_limit']:,} lb limit")
 
     return aw, v
+
+
+# ── Save / Load plan files ────────────────────────────────────────────────────
+def _safe_name(s: str) -> str:
+    """Strip characters unsafe for filenames, collapse whitespace to underscores."""
+    return re.sub(r'[^\w-]', '_', s).strip('_')
+
+def make_base_filename(info: ShipmentInfo) -> str:
+    """
+    Build the standard base name: Customer_BOL_DATE
+    Parts are omitted when blank. Spaces/special chars become underscores.
+    """
+    parts = [_safe_name(p) for p in [info.customer, info.bol_num, info.date] if p.strip()]
+    return '_'.join(parts) if parts else 'load_plan'
+
+def save_plan_json(pieces: list, info: ShipmentInfo, limits: dict,
+                   excluded_ids: list, override: bool, path: str):
+    data = {
+        "version": 1,
+        "saved_at": datetime.datetime.now().isoformat(timespec='seconds'),
+        "shipment": {
+            "customer":      info.customer,
+            "shipment_name": info.shipment_name,
+            "trailer_num":   info.trailer_num,
+            "bol_num":       info.bol_num,
+            "date":          info.date,
+        },
+        "axle_limits": limits,
+        "override":     override,
+        "excluded_ids": excluded_ids,
+        "freight": [
+            {
+                "piece_id":    p.piece_id,
+                "crate_label": p.crate_label,
+                "part_number": p.part_number,
+                "length_in":   p.length_in,
+                "width_in":    p.width_in,
+                "height_in":   p.height_in,
+                "weight_lbs":  p.weight_lbs,
+                "pcs":         p.pcs,
+                "notes":       p.notes,
+            }
+            for p in pieces
+        ],
+    }
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+
+def load_plan_json(path: str):
+    """Returns (pieces, info, limits, excluded_ids, override)."""
+    with open(path) as f:
+        data = json.load(f)
+    s = data['shipment']
+    info = ShipmentInfo(
+        customer=s.get('customer', ''),
+        shipment_name=s.get('shipment_name', ''),
+        trailer_num=s.get('trailer_num', ''),
+        bol_num=s.get('bol_num', ''),
+        date=s.get('date', ''),
+    )
+    pieces = [
+        FreightPiece(
+            piece_id=p['piece_id'],
+            crate_label=p['crate_label'],
+            part_number=p['part_number'],
+            length_in=p['length_in'],
+            width_in=p['width_in'],
+            height_in=p['height_in'],
+            weight_lbs=p['weight_lbs'],
+            pcs=p.get('pcs', 0),
+            notes=p.get('notes', ''),
+        )
+        for p in data['freight']
+    ]
+    limits = data.get('axle_limits', {'steer': 12000, 'drive': 34000, 'trailer': 34000})
+    excluded_ids = data.get('excluded_ids', [])
+    override = data.get('override', False)
+    return pieces, info, limits, excluded_ids, override
 
 
 # ── PDF helpers ───────────────────────────────────────────────────────────────
@@ -772,6 +855,7 @@ class FreightLoaderApp(QMainWindow):
         self._next_id = 1
         self._plan: Optional[LoadPlan] = None
         self._excluded_ids: list = []
+        self._current_file: Optional[str] = None   # path of the open .json plan
         self._build_ui()
 
     def _build_ui(self):
@@ -787,6 +871,21 @@ class FreightLoaderApp(QMainWindow):
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setSpacing(6)
+
+        # ── File actions ───────────────────────────────────────────────
+        file_row = QHBoxLayout()
+        btn_new   = QPushButton("New Plan")
+        btn_open  = QPushButton("Open Plan…")
+        btn_save  = QPushButton("Save Plan")
+        btn_saveas = QPushButton("Save As…")
+        for b in [btn_new, btn_open, btn_save, btn_saveas]:
+            b.setFixedHeight(30)
+            file_row.addWidget(b)
+        btn_new.clicked.connect(self._new_plan)
+        btn_open.clicked.connect(self._open_plan)
+        btn_save.clicked.connect(self._save_plan)
+        btn_saveas.clicked.connect(self._save_plan_as)
+        ll.addLayout(file_row)
 
         # ── Shipment Info ──────────────────────────────────────────────
         grp_info = QGroupBox("Shipment Info")
@@ -1051,22 +1150,122 @@ class FreightLoaderApp(QMainWindow):
             self.lbl_status.setText(
                 "<span style='color:green'>✓ All axle weights within legal limits.</span>")
 
+    # ── File: New / Open / Save ───────────────────────────────────────────────
+    def _new_plan(self):
+        if QMessageBox.question(self, "New Plan", "Clear everything and start a new plan?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                                ) != QMessageBox.StandardButton.Yes:
+            return
+        self.table.setRowCount(0)
+        self._next_id = 1
+        self._plan = None
+        self._excluded_ids = []
+        self._current_file = None
+        for f in [self.f_customer, self.f_shipment_name, self.f_trailer_num, self.f_bol]:
+            f.clear()
+        self.f_date.setText(datetime.date.today().strftime("%Y-%m-%d"))
+        for key, default in [("steer", 12000), ("drive", 34000), ("trailer", 34000)]:
+            self._limit_fields[key].setValue(default)
+        self.chk_override.setChecked(False)
+        self.lbl_summary.setText("—")
+        self.lbl_status.setText("No plan calculated.")
+        self.trailer_view.set_plan(None)
+        self.btn_plan_pdf.setEnabled(False)
+        self.btn_label_pdf.setEnabled(False)
+        self._set_title()
+
+    def _open_plan(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Load Plan", SAVE_DIR, "Load Plan Files (*.json)")
+        if not path:
+            return
+        try:
+            pieces, info, limits, excluded_ids, override = load_plan_json(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Open Failed", str(e))
+            return
+
+        # Populate shipment info
+        self.f_customer.setText(info.customer)
+        self.f_shipment_name.setText(info.shipment_name)
+        self.f_trailer_num.setText(info.trailer_num)
+        self.f_bol.setText(info.bol_num)
+        self.f_date.setText(info.date)
+
+        # Populate axle limits
+        for key in ("steer", "drive", "trailer"):
+            if key in limits:
+                self._limit_fields[key].setValue(limits[key])
+        self.chk_override.setChecked(override)
+
+        # Populate freight table
+        self._load_pieces(pieces)
+        self._excluded_ids = excluded_ids
+
+        # Recalculate and display
+        self._current_file = path
+        self._set_title()
+        self._calculate()
+
+    def _save_plan(self):
+        if self._current_file:
+            self._write_plan(self._current_file)
+        else:
+            self._save_plan_as()
+
+    def _save_plan_as(self):
+        info = self._get_shipment_info()
+        default_name = make_base_filename(info) + ".json"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Load Plan", os.path.join(SAVE_DIR, default_name),
+            "Load Plan Files (*.json)")
+        if path:
+            self._write_plan(path)
+            self._current_file = path
+            self._set_title()
+
+    def _write_plan(self, path: str):
+        pieces = self._read_pieces()
+        if not pieces and self.table.rowCount() > 0:
+            return   # parse error already shown by _read_pieces
+        info = self._get_shipment_info()
+        limits = {k: self._limit_fields[k].value() for k in ("steer", "drive", "trailer")}
+        try:
+            save_plan_json(pieces, info, limits, self._excluded_ids,
+                           self.chk_override.isChecked(), path)
+            self.lbl_status.setText(
+                self.lbl_status.text() +
+                f"<br><span style='color:#555'>Saved: {os.path.basename(path)}</span>")
+        except Exception as e:
+            QMessageBox.critical(self, "Save Failed", str(e))
+
+    def _set_title(self):
+        name = os.path.basename(self._current_file) if self._current_file else "Unsaved"
+        self.setWindowTitle(f"Freight Loader — {name}")
+
+    # ── PDF exports ───────────────────────────────────────────────────────────
     def _export_floor_plan(self):
         if not self._plan:
             return
+        info = self._get_shipment_info()
+        default = make_base_filename(info) + "_load_plan.pdf"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Floor Plan PDF", "load_plan.pdf", "PDF Files (*.pdf)")
+            self, "Save Floor Plan PDF", os.path.join(SAVE_DIR, default),
+            "PDF Files (*.pdf)")
         if path:
-            export_load_plan_pdf(self._plan, self._get_shipment_info(), path)
+            export_load_plan_pdf(self._plan, info, path)
             QMessageBox.information(self, "Saved", f"Floor plan saved:\n{path}")
 
     def _export_labels(self):
         if not self._plan:
             return
+        info = self._get_shipment_info()
+        default = make_base_filename(info) + "_labels.pdf"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Crate Labels PDF", "crate_labels.pdf", "PDF Files (*.pdf)")
+            self, "Save Crate Labels PDF", os.path.join(SAVE_DIR, default),
+            "PDF Files (*.pdf)")
         if path:
-            export_crate_labels_pdf(self._plan, self._get_shipment_info(), path)
+            export_crate_labels_pdf(self._plan, info, path)
             QMessageBox.information(self, "Saved", f"Crate labels saved:\n{path}")
 
 
