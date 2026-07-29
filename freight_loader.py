@@ -143,8 +143,13 @@ def plan_load(pieces: list, override: bool = False, excluded_ids: list = None) -
     for row_idx, pair in enumerate(row_assignments):
         a_piece, b_piece = pair
         row_depth = max(a_piece.length_in, b_piece.length_in if b_piece else 0)
-        slots.append(PalletSlot(row=row_idx, col=0, piece=a_piece, row_start_in=cursor))
-        slots.append(PalletSlot(row=row_idx, col=1, piece=b_piece, row_start_in=cursor))
+        # Alternate which side gets the heavier piece so lateral weight stays balanced
+        if row_idx % 2 == 0:
+            left_piece, right_piece = a_piece, b_piece
+        else:
+            left_piece, right_piece = b_piece, a_piece
+        slots.append(PalletSlot(row=row_idx, col=0, piece=left_piece,  row_start_in=cursor))
+        slots.append(PalletSlot(row=row_idx, col=1, piece=right_piece, row_start_in=cursor))
         cursor += row_depth
 
     axle_weights, violations = _calc_axle_weights(slots, override)
@@ -1135,10 +1140,26 @@ class FreightLoaderApp(QMainWindow):
                           f"<td align='right'><span style='color:{color}'>{val:,} lbs</span></td>"
                           f"<td align='right'>&nbsp;{pct:.0f}% of {limit:,}</td>"
                           f"</tr>")
-        # Freight gross — informational, no axle limit applies
+        # Freight gross
         fg = aw.get("freight_gross", 0)
         rows_html += (f"<tr><td><b>Freight Gross:</b></td>"
                       f"<td align='right'>{fg:,} lbs</td><td></td></tr>")
+
+        # Side weights
+        left_w  = sum(s.piece.weight_lbs for s in plan.slots if s.piece and s.col == 0)
+        right_w = sum(s.piece.weight_lbs for s in plan.slots if s.piece and s.col == 1)
+        diff    = abs(left_w - right_w)
+        heavier = "Left" if left_w > right_w else "Right"
+        diff_color = "#c0392b" if diff > 2000 else "#e67e22" if diff > 500 else "#27ae60"
+        rows_html += (
+            f"<tr><td colspan='3'><hr style='margin:2px'></td></tr>"
+            f"<tr><td><b>Left (A):</b></td><td align='right'>{left_w:,} lbs</td><td></td></tr>"
+            f"<tr><td><b>Right (B):</b></td><td align='right'>{right_w:,} lbs</td><td></td></tr>"
+            f"<tr><td><b>Side diff:</b></td>"
+            f"<td align='right'><span style='color:{diff_color}'>{diff:,} lbs</span></td>"
+            f"<td align='right'><span style='color:{diff_color}'>{heavier} heavier</span></td>"
+            f"</tr>"
+        )
         self.lbl_summary.setText(f"<table>{rows_html}</table>")
 
         if plan.violations:
