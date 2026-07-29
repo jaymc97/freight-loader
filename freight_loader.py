@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QHeaderView, QCheckBox, QSizePolicy, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QAbstractItemView, QFrame, QComboBox
 )
-from PyQt6.QtCore import Qt, QRectF, QPointF
+from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QPageLayout, QPageSize, QPdfWriter
 )
@@ -425,8 +425,10 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
 
             if slot and slot.piece:
                 if slot.is_center:
-                    # Span both columns
-                    cell = QRectF(x + 2, y + 2, col_w * 2 - 4, row_h - 4)
+                    full_w = col_w * 2
+                    crate_ratio = min(slot.piece.width_in / TRAILER["interior_width_in"], 1.0)
+                    gap = (full_w * (1.0 - crate_ratio)) / 2
+                    cell = QRectF(LM + gap + 2, y + 2, full_w * crate_ratio - 4, row_h - 4)
                 else:
                     cell = QRectF(x + 2, y + 2, col_w - 4, row_h - 4)
 
@@ -633,14 +635,111 @@ def _draw_crate_label(painter: QPainter, PW: int, PH: int,
 
 # ── Live Trailer View widget ──────────────────────────────────────────────────
 class TrailerView(QWidget):
+    plan_changed = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.plan: Optional[LoadPlan] = None
         self.setMinimumSize(320, 480)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._drag_src: Optional[tuple] = None
+        self._hover_slot: Optional[tuple] = None
+        self.setMouseTracking(True)
 
     def set_plan(self, plan: LoadPlan):
         self.plan = plan
+        self._drag_src = None
+        self._hover_slot = None
+        self.update()
+
+    # ── Layout constants (shared between hit-testing and drawing) ────────────
+    def _layout(self):
+        M, NOSE_H, ROW_LBL = 28, 22, 36
+        W, H = self.width(), self.height()
+        grid_x = M + ROW_LBL
+        grid_w = W - grid_x - M
+        grid_y = M + NOSE_H + 4
+        grid_h = H - grid_y - M - 20
+        col_w  = grid_w / 2
+        return grid_x, grid_w, grid_y, grid_h, col_w, M, NOSE_H, ROW_LBL
+
+    # ── Hit-test: which slot is under a mouse position ───────────────────────
+    def _slot_at(self, pos) -> Optional[tuple]:
+        if not self.plan or not self.plan.slots:
+            return None
+        grid_x, grid_w, grid_y, grid_h, col_w, *_ = self._layout()
+        trailer_len = TRAILER["interior_length_in"]
+        px, py = pos.x(), pos.y()
+        if not (grid_x <= px <= grid_x + grid_w and grid_y <= py <= grid_y + grid_h):
+            return None
+        col = 0 if px < grid_x + col_w else 1
+        slot_map = {(s.row, s.col): s for s in self.plan.slots}
+        for r in sorted(set(s.row for s in self.plan.slots)):
+            sa = slot_map.get((r, 0))
+            if sa and sa.piece:
+                y0 = grid_y + (sa.row_start_in / trailer_len) * grid_h
+                y1 = y0 + (sa.piece.length_in / trailer_len) * grid_h
+                if y0 <= py < y1:
+                    return (r, 0) if sa.is_center else (r, col)
+        return None
+
+    # ── Swap two pieces between slots ────────────────────────────────────────
+    def _swap_pieces(self, src: tuple, dst: tuple):
+        slot_map = {(s.row, s.col): s for s in self.plan.slots}
+        s1, s2 = slot_map.get(src), slot_map.get(dst)
+        if not s1 or s2 is None or s1.is_center or s2.is_center:
+            return
+        s1.piece, s2.piece = s2.piece, s1.piece
+        self.plan.axle_weights, self.plan.violations = _calc_axle_weights(
+            self.plan.slots, self.plan.override)
+        self.plan_changed.emit()
+        self.update()
+
+    # ── Mouse events ─────────────────────────────────────────────────────────
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        key = self._slot_at(event.pos())
+        if key:
+            slot_map = {(s.row, s.col): s for s in self.plan.slots}
+            s = slot_map.get(key)
+            if s and s.piece and not s.is_center:
+                self._drag_src = key
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        key = self._slot_at(event.pos())
+        if key != self._hover_slot:
+            self._hover_slot = key
+            self.update()
+        if self._drag_src:
+            slot_map = {(s.row, s.col): s for s in self.plan.slots}
+            tgt = slot_map.get(key) if key else None
+            can_drop = (key and key != self._drag_src and
+                        tgt is not None and not (tgt.is_center and tgt.piece))
+            self.setCursor(Qt.CursorShape.DragMoveCursor if can_drop
+                           else Qt.CursorShape.ClosedHandCursor)
+        else:
+            slot_map = {(s.row, s.col): s for s in self.plan.slots} if self.plan else {}
+            s = slot_map.get(key) if key else None
+            if s and s.piece and not s.is_center:
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_src:
+            dst = self._slot_at(event.pos())
+            if dst and dst != self._drag_src:
+                self._swap_pieces(self._drag_src, dst)
+            self._drag_src = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+
+    def leaveEvent(self, event):
+        self._drag_src = None
+        self._hover_slot = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         self.update()
 
     def paintEvent(self, event):
@@ -654,28 +753,19 @@ class TrailerView(QWidget):
                              "No load plan — press Calculate.")
             return
 
-        slots = self.plan.slots
-        rows  = sorted(set(s.row for s in slots))
+        slots  = self.plan.slots
+        rows   = sorted(set(s.row for s in slots))
         n_rows = len(rows)
 
-        M = 28
-        NOSE_H = 22
-        ROW_LBL = 36
-        W = self.width()
+        grid_x, grid_w, grid_y, grid_h, col_w, M, NOSE_H, ROW_LBL = self._layout()
         H = self.height()
-        grid_x = M + ROW_LBL
-        grid_w = W - grid_x - M
-        grid_y = M + NOSE_H + 4
-        grid_h = H - grid_y - M - 20
-        col_w  = grid_w / 2
-        row_h  = grid_h / n_rows if n_rows else 40
-
-        trailer_rect = QRectF(grid_x, grid_y, grid_w, grid_h)
+        trailer_len = TRAILER["interior_length_in"]
+        interior_w  = TRAILER["interior_width_in"]
 
         # Trailer outline
         painter.setPen(QPen(QColor("#444"), 2))
         painter.setBrush(QBrush(QColor("#f5f5f0")))
-        painter.drawRect(trailer_rect)
+        painter.drawRect(QRectF(grid_x, grid_y, grid_w, grid_h))
 
         # Nose label
         font = QFont("Arial", 8, QFont.Weight.Bold)
@@ -684,66 +774,60 @@ class TrailerView(QWidget):
         painter.drawText(QRectF(grid_x, M, grid_w, NOSE_H),
                          Qt.AlignmentFlag.AlignCenter, "◀  NOSE")
 
-        # Axle lines
-        trailer_len = TRAILER["interior_length_in"]
-        tandem_in   = TRAILER["tandem_from_nose_in"]
-
-        def depth_to_y(d):
-            return grid_y + (d / trailer_len) * grid_h
-
+        # Axle reference lines
+        tandem_in = TRAILER["tandem_from_nose_in"]
         for depth, label, color in [
             (36,        "Drive Axles",   "#e67e00"),
             (tandem_in, "Trailer Axles", "#c0392b"),
         ]:
-            ay = depth_to_y(depth)
+            ay = grid_y + (depth / trailer_len) * grid_h
             painter.setPen(QPen(QColor(color), 1.5, Qt.PenStyle.DashLine))
             painter.drawLine(QPointF(grid_x, ay), QPointF(grid_x + grid_w, ay))
             painter.setPen(QColor(color))
-            font_ax = QFont("Arial", 6)
-            painter.setFont(font_ax)
+            painter.setFont(QFont("Arial", 6))
             painter.drawText(QRectF(grid_x + 2, ay - 12, grid_w - 4, 12),
                              Qt.AlignmentFlag.AlignRight, label)
 
-        # Slot colors (cycle)
         COLORS = [
             "#4a90d9","#e67e22","#27ae60","#8e44ad","#c0392b","#16a085",
             "#d35400","#2980b9","#7f8c8d","#f39c12","#1abc9c","#e74c3c",
         ]
-
-        slot_map = {(s.row, s.col): s for s in slots}
+        slot_map   = {(s.row, s.col): s for s in slots}
         font_big   = QFont("Arial", 7, QFont.Weight.Bold)
         font_small = QFont("Arial", 5)
         font_rlbl  = QFont("Arial", 7, QFont.Weight.Bold)
 
         for r in rows:
-            y = grid_y + r * row_h
-            slot_a = slot_map.get((r, 0))
-            row_depth_in = (slot_a.row_start_in if slot_a else 0)
-            piece_a = slot_a.piece if slot_a else None
-            actual_row_h = ((piece_a.length_in / trailer_len) * grid_h) if piece_a else row_h
+            sa = slot_map.get((r, 0))
+            if not sa:
+                continue
+            y_px     = grid_y + (sa.row_start_in / trailer_len) * grid_h
+            piece_h  = ((sa.piece.length_in / trailer_len) * grid_h) if sa.piece else (grid_h / n_rows)
 
             # Row label
             painter.setFont(font_rlbl)
             painter.setPen(QColor("#444"))
-            painter.drawText(QRectF(M, y, ROW_LBL - 2, actual_row_h),
+            painter.drawText(QRectF(M, y_px, ROW_LBL - 2, piece_h),
                              Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                              f"R{r+1}")
-
-            y_px = grid_y + (row_depth_in / trailer_len) * grid_h
 
             for c in range(2):
                 slot = slot_map.get((r, c))
                 x = grid_x + c * col_w
+
                 if slot and slot.piece:
-                    # Center pieces: skip col=1 (already drawn by col=0)
                     if slot.col == 1 and slot.is_center:
-                        continue
+                        continue  # center piece drawn once via col=0
                     ph = (slot.piece.length_in / trailer_len) * grid_h
                     if slot.is_center:
-                        # Span both columns
-                        cell = QRectF(x + 1, y_px + 1, col_w * 2 - 2, ph - 2)
+                        # Actual width centered with gaps on each side
+                        crate_ratio = min(slot.piece.width_in / interior_w, 1.0)
+                        gap_px = (grid_w * (1.0 - crate_ratio)) / 2
+                        cell = QRectF(grid_x + gap_px + 1, y_px + 1,
+                                      grid_w * crate_ratio - 2, ph - 2)
                     else:
                         cell = QRectF(x + 1, y_px + 1, col_w - 2, ph - 2)
+
                     color = QColor(COLORS[(slot.piece.piece_id - 1) % len(COLORS)])
                     painter.setBrush(QBrush(color))
                     painter.setPen(QPen(QColor("#222"), 0.5))
@@ -762,15 +846,32 @@ class TrailerView(QWidget):
                         painter.drawText(cell.adjusted(2, cell.height() // 2, -2, -2),
                                          Qt.AlignmentFlag.AlignCenter,
                                          f"{slot.piece.weight_lbs:,.0f} lb")
+
+                    # Drag / drop highlights
+                    norm_key = (r, 0) if slot.is_center else (r, c)
+                    if self._drag_src and norm_key == self._drag_src:
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.setPen(QPen(QColor("#f39c12"), 2.5))
+                        painter.drawRect(cell)
+                    elif (self._drag_src and self._hover_slot and
+                          norm_key == self._hover_slot and norm_key != self._drag_src):
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.setPen(QPen(QColor("#27ae60"), 2.5))
+                        painter.drawRect(cell)
                 else:
-                    cell = QRectF(x + 1, y_px + 1, col_w - 2, row_h - 2)
+                    cell = QRectF(x + 1, y_px + 1, col_w - 2, piece_h - 2)
                     painter.setBrush(QBrush(QColor("#e8e8e8")))
                     painter.setPen(QPen(QColor("#bbb"), 0.5, Qt.PenStyle.DashLine))
                     painter.drawRect(cell)
+                    # Empty slot as drop target
+                    if (self._drag_src and self._hover_slot and
+                            (r, c) == self._hover_slot and (r, c) != self._drag_src):
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.setPen(QPen(QColor("#27ae60"), 2.5))
+                        painter.drawRect(cell)
 
         # Column labels at bottom
-        font = QFont("Arial", 7)
-        painter.setFont(font)
+        painter.setFont(QFont("Arial", 7))
         painter.setPen(QColor("#555"))
         for c, lbl in enumerate(["Position A (Left)", "Position B (Right)"]):
             painter.drawText(QRectF(grid_x + c * col_w, H - 20, col_w, 18),
@@ -1064,10 +1165,15 @@ class FreightLoaderApp(QMainWindow):
         scroll.setWidgetResizable(True)
         self.trailer_view = TrailerView()
         self.trailer_view.setMinimumHeight(600)
+        self.trailer_view.plan_changed.connect(self._on_plan_changed_by_drag)
         scroll.setWidget(self.trailer_view)
         rl.addWidget(scroll)
         splitter.addWidget(right)
         splitter.setSizes([500, 610])
+
+    def _on_plan_changed_by_drag(self):
+        if self._plan:
+            self._update_summary(self._plan)
 
     # ── Actions ──────────────────────────────────────────────────────────────
     def _get_shipment_info(self) -> ShipmentInfo:
