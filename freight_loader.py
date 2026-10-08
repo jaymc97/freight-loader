@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QPushButton, QLabel, QSpinBox,
     QLineEdit, QGroupBox, QSplitter, QScrollArea, QMessageBox,
     QHeaderView, QCheckBox, QSizePolicy, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QAbstractItemView, QFrame, QComboBox
+    QFileDialog, QFormLayout, QAbstractItemView, QFrame, QComboBox, QTabWidget
 )
 from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
 from PyQt6.QtGui import (
@@ -69,6 +69,7 @@ class FreightPiece:
     pcs: int = 0
     notes: str = ""
     placement: str = "auto"
+    stackable: bool = True
 
 @dataclass
 class ShipmentInfo:
@@ -86,6 +87,7 @@ class PalletSlot:
     piece: Optional[FreightPiece]
     row_start_in: float          # inches from nose to front of this row
     is_center: bool = False
+    tier: int = 0                # 0 = floor level, 1 = stacked on top
 
 @dataclass
 class LoadPlan:
@@ -98,24 +100,140 @@ class LoadPlan:
 
 
 # ── Algorithm ─────────────────────────────────────────────────────────────────
+def _overflow_count(pieces: list, mode: str) -> int:
+    """
+    How many pieces cannot fit on the trailer floor without stacking.
+    mode='center': each piece takes its own row (full-width).
+    mode='auto':   pieces pair side-by-side, two per row.
+    """
+    if not pieces:
+        return 0
+    trailer_len = TRAILER["interior_length_in"]
+    if mode == 'center':
+        sorted_p = sorted(pieces, key=lambda p: p.length_in, reverse=True)
+        cursor, fits = 0.0, 0
+        for p in sorted_p:
+            if cursor + p.length_in <= trailer_len:
+                cursor += p.length_in
+                fits += 1
+            else:
+                break
+    else:  # auto — two pieces share a row, depth = longer of the pair
+        sorted_p = sorted(pieces, key=lambda p: p.length_in, reverse=True)
+        cursor, fits, i = 0.0, 0, 0
+        while i < len(sorted_p):
+            a = sorted_p[i]
+            b = sorted_p[i + 1] if i + 1 < len(sorted_p) else None
+            row_depth = max(a.length_in, b.length_in if b else 0)
+            if cursor + row_depth <= trailer_len:
+                cursor += row_depth
+                fits += 2 if b else 1
+                i += 2
+            else:
+                break
+    return max(0, len(pieces) - fits)
+
+
+def _find_stack_pairs(pieces: list, max_stacks: int = 0) -> tuple:
+    """
+    Create exactly max_stacks vertical pairs (bottom, top) — no more.
+    Stacking is a last resort: only call this when overflow > 0.
+    Returns (stack_top_map: dict[bottom_piece_id -> top_FreightPiece], floor_pieces: list).
+    """
+    if max_stacks <= 0 or not pieces:
+        return {}, list(pieces)
+
+    trailer_h = TRAILER["interior_height_in"]
+    used_as_top = set()
+    stack_top_map: dict = {}
+
+    bottoms = sorted(
+        [p for p in pieces if p.stackable],
+        key=lambda p: p.length_in * p.width_in, reverse=True,
+    )
+    tops = sorted(pieces, key=lambda p: p.length_in * p.width_in)
+
+    for bottom in bottoms:
+        if len(stack_top_map) >= max_stacks:
+            break
+        if bottom.piece_id in used_as_top:
+            continue  # no triple stacking
+        if bottom.piece_id in stack_top_map:
+            continue
+        for top in tops:
+            if top.piece_id == bottom.piece_id:
+                continue
+            if top.piece_id in used_as_top:
+                continue
+            if top.piece_id in stack_top_map:
+                continue
+            if (top.length_in  <= bottom.length_in  and
+                top.width_in   <= bottom.width_in   and
+                top.height_in + bottom.height_in <= trailer_h and
+                top.weight_lbs <= bottom.weight_lbs):
+                stack_top_map[bottom.piece_id] = top
+                used_as_top.add(top.piece_id)
+                break
+
+    floor_pieces = [p for p in pieces if p.piece_id not in used_as_top]
+    return stack_top_map, floor_pieces
+
+
 def plan_load(pieces: list, override: bool = False, excluded_ids: list = None) -> LoadPlan:
     """
     Pair pieces heaviest+lightest for balanced rows, then order rows center-heavy
     so the heaviest rows sit near mid-trailer (best for drive/trailer axle balance).
+    Pieces marked stackable may receive a smaller/lighter piece on top (tier=1).
     """
     if not pieces:
         return LoadPlan([], {}, [], 0.0, override, excluded_ids or [])
 
-    # Separate center and auto pieces
-    center_pieces = [p for p in pieces if p.placement == "center"]
-    auto_pieces   = [p for p in pieces if p.placement != "center"]
+    active = [p for p in pieces if p.piece_id not in (excluded_ids or [])]
+    if not active:
+        return LoadPlan([], {}, [], 0.0, override, excluded_ids or [])
 
-    # Center pieces form their own row unit: (piece, None, True)
-    center_units = [(p, None, True) for p in center_pieces]
+    # Pieces wider than 70% of trailer must alternate left/right each row
+    # Pieces wider than half the trailer (but ≤70%) go plain center
+    half_w      = TRAILER["interior_width_in"] / 2
+    alt_w_thresh = TRAILER["interior_width_in"] * 0.70
+    for p in active:
+        if p.width_in > alt_w_thresh:
+            p.placement = "alt_center"
+        elif p.width_in > half_w:
+            p.placement = "center"
 
-    # Auto pieces are paired heaviest+lightest: (a, b, False)
-    n = len(auto_pieces)
-    sorted_p = sorted(auto_pieces, key=lambda p: p.weight_lbs, reverse=True)
+    # Separate center and auto pieces ("alt_center" is algorithmically identical to "center")
+    center_pieces = [p for p in active if p.placement in ("center", "alt_center")]
+    auto_pieces   = [p for p in active if p.placement not in ("center", "alt_center")]
+
+    # ── Center pieces: preserve input order (nose to tail), stack overflow in middle ──
+    center_sorted   = sorted(center_pieces, key=lambda p: p.piece_id)
+    center_overflow = _overflow_count(center_pieces, mode='center')
+    if center_overflow > 0 and center_overflow < len(center_sorted):
+        center_floor_list = center_sorted[:-center_overflow]   # first N onto floor in order
+        center_top_list   = center_sorted[-center_overflow:]   # last overflow go on top
+        # Stack tops on the middle floor pieces for balanced weight
+        n_cf      = len(center_floor_list)
+        mid_start = (n_cf - center_overflow) // 2
+        center_stack_map = {
+            center_floor_list[mid_start + i].piece_id: center_top_list[i]
+            for i in range(center_overflow)
+        }
+    else:
+        center_floor_list = center_sorted
+        center_stack_map  = {}
+
+    # ── Auto pieces: existing heaviest+lightest pairing ──────────────────────
+    auto_overflow              = _overflow_count(auto_pieces, mode='auto')
+    auto_stack_map, floor_pieces = _find_stack_pairs(auto_pieces, max_stacks=auto_overflow)
+    stack_top_map = {**center_stack_map, **auto_stack_map}
+
+    # Center floor pieces each occupy their own full-width row, in input order
+    center_units = [(p, None, True) for p in center_floor_list]
+
+    # Floor pieces (bottoms + unmatched) are paired side-by-side heaviest+lightest
+    n = len(floor_pieces)
+    sorted_p = sorted(floor_pieces, key=lambda p: p.weight_lbs, reverse=True)
     auto_units = []
     lo, hi = 0, n - 1
     while lo <= hi:
@@ -125,29 +243,32 @@ def plan_load(pieces: list, override: bool = False, excluded_ids: list = None) -
         lo += 1
         hi -= 1
 
-    # Combine all units, sort by total weight descending (heaviest unit first)
-    all_units = center_units + auto_units
-    all_units.sort(
+    # Center units stay in input order (nose to tail) — no reordering.
+    # Auto units get center-heavy placement (heaviest pair → middle row).
+    auto_units.sort(
         key=lambda u: u[0].weight_lbs + (u[1].weight_lbs if u[1] else 0),
         reverse=True
     )
+    n_auto = len(auto_units)
+    if n_auto:
+        mid = n_auto // 2
+        order = [mid]
+        lo_i, hi_i = mid - 1, mid + 1
+        while lo_i >= 0 or hi_i < n_auto:
+            if hi_i < n_auto:
+                order.append(hi_i)
+                hi_i += 1
+            if lo_i >= 0:
+                order.append(lo_i)
+                lo_i -= 1
+        auto_assigned = [None] * n_auto
+        for dest, unit in zip(order, auto_units):
+            auto_assigned[dest] = unit
+    else:
+        auto_assigned = []
 
-    # Center-heavy row placement: heaviest unit → middle row, then alternate toward nose/tail
-    n_rows = len(all_units)
-    mid = n_rows // 2
-    order = [mid]
-    lo_i, hi_i = mid - 1, mid + 1
-    while lo_i >= 0 or hi_i < n_rows:
-        if hi_i < n_rows:
-            order.append(hi_i)
-            hi_i += 1
-        if lo_i >= 0:
-            order.append(lo_i)
-            lo_i -= 1
-
-    row_assignments = [None] * n_rows
-    for dest, unit in zip(order, all_units):
-        row_assignments[dest] = unit
+    # Final row order: center pieces nose-to-tail first, then auto pairs
+    row_assignments = center_units + auto_assigned
 
     # Build slots (nose to tail) with cumulative row depths
     slots = []
@@ -156,21 +277,31 @@ def plan_load(pieces: list, override: bool = False, excluded_ids: list = None) -
         a_piece, b_piece, is_center = unit
         row_depth = max(a_piece.length_in, b_piece.length_in if b_piece else 0)
         if is_center:
-            # Both col=0 and col=1 point to the same piece, both marked is_center=True
             slots.append(PalletSlot(row=row_idx, col=0, piece=a_piece,
-                                    row_start_in=cursor, is_center=True))
+                                    row_start_in=cursor, is_center=True, tier=0))
             slots.append(PalletSlot(row=row_idx, col=1, piece=a_piece,
-                                    row_start_in=cursor, is_center=True))
+                                    row_start_in=cursor, is_center=True, tier=0))
+            if a_piece.piece_id in stack_top_map:
+                top = stack_top_map[a_piece.piece_id]
+                slots.append(PalletSlot(row=row_idx, col=0, piece=top,
+                                        row_start_in=cursor, is_center=True, tier=1))
+                slots.append(PalletSlot(row=row_idx, col=1, piece=top,
+                                        row_start_in=cursor, is_center=True, tier=1))
         else:
-            # Alternate which side gets the heavier piece so lateral weight stays balanced
             if row_idx % 2 == 0:
                 left_piece, right_piece = a_piece, b_piece
             else:
                 left_piece, right_piece = b_piece, a_piece
             slots.append(PalletSlot(row=row_idx, col=0, piece=left_piece,
-                                    row_start_in=cursor, is_center=False))
+                                    row_start_in=cursor, is_center=False, tier=0))
             slots.append(PalletSlot(row=row_idx, col=1, piece=right_piece,
-                                    row_start_in=cursor, is_center=False))
+                                    row_start_in=cursor, is_center=False, tier=0))
+            # Add tier=1 slots for any stacked tops
+            for col_idx, floor_p in ((0, left_piece), (1, right_piece)):
+                if floor_p and floor_p.piece_id in stack_top_map:
+                    top = stack_top_map[floor_p.piece_id]
+                    slots.append(PalletSlot(row=row_idx, col=col_idx, piece=top,
+                                            row_start_in=cursor, is_center=False, tier=1))
         cursor += row_depth
 
     axle_weights, violations = _calc_axle_weights(slots, override)
@@ -182,16 +313,23 @@ def _calc_axle_weights(slots: list, override: bool) -> tuple:
     Beam model: trailer kingpin (nose=0) and trailer tandem as two supports.
     Trailer tandem reaction = Σ(weight × center_from_nose) / tandem_position.
     Pin weight goes to tractor 5th wheel → split between drive and steer axles.
+    Tier=1 (stacked) pieces share the same floor position as tier=0 — their moment
+    arms are calculated independently, which is physically correct.
     """
     tandem_pos = TRAILER["tandem_from_nose_in"]
+    trailer_h  = TRAILER["interior_height_in"]
     total_cargo = 0.0
     moment = 0.0
 
+    # Build a map for height-clearance checks: (row, col) -> [tier0_piece, tier1_piece]
+    stack_map: dict = {}
     for slot in slots:
-        if slot.is_center and slot.col == 1:
-            continue  # center piece already counted via col=0
         if slot.piece is None:
             continue
+        if slot.is_center and slot.col == 1:
+            continue  # center piece already counted via col=0
+        key = (slot.row, slot.col)
+        stack_map.setdefault(key, {})[slot.tier] = slot.piece
         center = slot.row_start_in + slot.piece.length_in / 2.0
         total_cargo += slot.piece.weight_lbs
         moment += slot.piece.weight_lbs * center
@@ -202,8 +340,6 @@ def _calc_axle_weights(slots: list, override: bool) -> tuple:
     trailer_rxn = moment / tandem_pos
     pin_weight  = total_cargo - trailer_rxn
 
-    # 5th wheel is behind drives (overhang); adds slightly more than pin to drives,
-    # reduces steer. Approximate: drives get 1.05× pin, steer loses ~0.05× pin.
     steer_weight = TRAILER["steer_tare"] - round(pin_weight * 0.05)
     steer_weight = max(steer_weight, TRAILER["steer_tare"] - 2500)
     drive_weight  = TRAILER["drive_tare"] + round(pin_weight * 1.05)
@@ -226,6 +362,16 @@ def _calc_axle_weights(slots: list, override: bool) -> tuple:
         v.append(f"TRAILER TANDEM {aw['trailer']:,} lb > {TRAILER['trailer_limit']:,} lb limit")
     if truck_gross   > TRAILER["gross_limit"]:
         v.append(f"GROSS {truck_gross:,} lb > {TRAILER['gross_limit']:,} lb limit")
+
+    # Height clearance check for stacked positions
+    for (row, col), tiers in stack_map.items():
+        if 0 in tiers and 1 in tiers:
+            combined = tiers[0].height_in + tiers[1].height_in
+            if combined > trailer_h:
+                v.append(
+                    f"HEIGHT: {tiers[0].crate_label} + {tiers[1].crate_label} = "
+                    f"{combined:.0f}\" > {trailer_h}\" interior limit"
+                )
 
     return aw, v
 
@@ -270,6 +416,7 @@ def save_plan_json(pieces: list, info: ShipmentInfo, limits: dict,
                 "pcs":         p.pcs,
                 "notes":       p.notes,
                 "placement":   p.placement,
+                "stackable":   p.stackable,
             }
             for p in pieces
         ],
@@ -301,6 +448,7 @@ def load_plan_json(path: str):
             pcs=p.get('pcs', 0),
             notes=p.get('notes', ''),
             placement=p.get('placement', 'auto'),
+            stackable=p.get('stackable', True),
         )
         for p in data['freight']
     ]
@@ -326,6 +474,10 @@ def export_load_plan_pdf(plan: LoadPlan, info: ShipmentInfo, path: str):
     PW = writer.width()
     PH = writer.height()
     _draw_floor_plan(painter, PW, PH, plan, info)
+    # Add side elevation page if any pieces are stacked
+    if any(s.tier == 1 for s in plan.slots if s.piece):
+        writer.newPage()
+        _draw_side_elevation(painter, PW, PH, plan, info)
     painter.end()
 
 
@@ -399,13 +551,13 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
     grid_h = PH - M - TAIL_RESERVE - grid_top
     row_h = grid_h / n_rows if n_rows else 40
 
-    slot_map = {(s.row, s.col): s for s in plan.slots}
+    slot_map = {(s.row, s.col, s.tier): s for s in plan.slots}
 
     font_rlbl = QFont("Arial", 9, QFont.Weight.Bold)
     font_big   = QFont("Arial", 11, QFont.Weight.Bold)
     font_small = QFont("Arial", 9)
 
-    for r in rows:
+    for r_pos, r in enumerate(rows):
         y = grid_top + r * row_h
 
         # Row label
@@ -416,7 +568,7 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
                          f"R{r + 1}")
 
         for c in range(2):
-            slot = slot_map.get((r, c))
+            slot = slot_map.get((r, c, 0))
             x = LM + c * col_w
 
             # Center pieces: skip col=1 (already drawn by col=0)
@@ -425,31 +577,91 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
 
             if slot and slot.piece:
                 if slot.is_center:
-                    full_w = col_w * 2
+                    full_w      = col_w * 2
                     crate_ratio = min(slot.piece.width_in / TRAILER["interior_width_in"], 1.0)
-                    gap = (full_w * (1.0 - crate_ratio)) / 2
-                    cell = QRectF(LM + gap + 2, y + 2, full_w * crate_ratio - 4, row_h - 4)
+                    piece_w     = full_w * crate_ratio
+                    total_gap   = full_w - piece_w
+                    if slot.piece.placement == "alt_center":
+                        load_left = (r_pos % 2 == 0)
+                        gap = 0 if load_left else total_gap
+                    else:
+                        gap = total_gap / 2
+                    cell = QRectF(LM + gap + 2, y + 2, piece_w - 4, row_h - 4)
                 else:
                     cell = QRectF(x + 2, y + 2, col_w - 4, row_h - 4)
+
+                # Check for a stacked (tier=1) piece at this position
+                top_slot = slot_map.get((r, c, 1)) if not slot.is_center else None
 
                 painter.setBrush(QBrush(TEAL_LIGHT))
                 painter.setPen(QPen(TEAL_DARK, 1.5))
                 painter.drawRoundedRect(cell, 5, 5)
 
-                top_half = QRectF(cell.x() + 4, cell.y() + 2,
-                                  cell.width() - 8, cell.height() * 0.55)
-                bot_half = QRectF(cell.x() + 4, cell.y() + cell.height() * 0.55,
-                                  cell.width() - 8, cell.height() * 0.42)
+                if top_slot and top_slot.piece:
+                    # Split cell: bottom half = floor piece, top half = stacked piece
+                    mid_y = cell.y() + cell.height() * 0.5
+                    divider_y = cell.y() + cell.height() * 0.52
 
-                painter.setFont(font_big)
-                painter.setPen(TEAL_DARK)
-                painter.drawText(top_half,
-                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                                 slot.piece.crate_label)
-                painter.setFont(font_small)
-                painter.drawText(bot_half,
-                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                                 f"{slot.piece.weight_lbs:,.0f} lb")
+                    # Floor piece area
+                    bot_cell = QRectF(cell.x() + 4, cell.y() + 2,
+                                      cell.width() - 8, cell.height() * 0.46)
+                    painter.setFont(font_big)
+                    painter.setPen(TEAL_DARK)
+                    painter.drawText(bot_cell,
+                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                                     slot.piece.crate_label)
+                    painter.setFont(font_small)
+                    painter.drawText(
+                        QRectF(cell.x() + 4, cell.y() + cell.height() * 0.3,
+                               cell.width() - 8, cell.height() * 0.2),
+                        Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                        f"{slot.piece.weight_lbs:,.0f} lb")
+
+                    # Divider
+                    painter.setPen(QPen(TEAL_DARK, 1, Qt.PenStyle.DashLine))
+                    painter.drawLine(QPointF(cell.x() + 4, divider_y),
+                                     QPointF(cell.x() + cell.width() - 4, divider_y))
+
+                    # Stacked piece area (amber background badge)
+                    stack_rect = QRectF(cell.x() + 4, divider_y + 2,
+                                        cell.width() - 8, cell.height() * 0.44)
+                    painter.setBrush(QBrush(TAN))
+                    painter.setPen(QPen(QColor("#8B6914"), 1))
+                    painter.drawRoundedRect(stack_rect, 3, 3)
+                    painter.setFont(font_small)
+                    painter.setPen(QColor("#FFFFFF"))
+                    painter.drawText(
+                        QRectF(stack_rect.x(), stack_rect.y(),
+                               stack_rect.width(), stack_rect.height() * 0.55),
+                        Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                        f"▲ {top_slot.piece.crate_label}")
+                    painter.drawText(
+                        QRectF(stack_rect.x(), stack_rect.y() + stack_rect.height() * 0.5,
+                               stack_rect.width(), stack_rect.height() * 0.5),
+                        Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                        f"{top_slot.piece.weight_lbs:,.0f} lb")
+                else:
+                    top_half = QRectF(cell.x() + 4, cell.y() + 2,
+                                      cell.width() - 8, cell.height() * 0.55)
+                    bot_half = QRectF(cell.x() + 4, cell.y() + cell.height() * 0.55,
+                                      cell.width() - 8, cell.height() * 0.42)
+
+                    painter.setFont(font_big)
+                    painter.setPen(TEAL_DARK)
+                    if slot.piece.placement == "alt_center":
+                        load_left = (r_pos % 2 == 0)
+                        direction = "← LOAD LEFT" if load_left else "LOAD RIGHT →"
+                        painter.drawText(top_half,
+                                         Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                                         f"{direction}  {slot.piece.crate_label}")
+                    else:
+                        painter.drawText(top_half,
+                                         Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                                         slot.piece.crate_label)
+                    painter.setFont(font_small)
+                    painter.drawText(bot_half,
+                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                                     f"{slot.piece.weight_lbs:,.0f} lb")
             else:
                 cell = QRectF(x + 2, y + 2, col_w - 4, row_h - 4)
                 painter.setBrush(QBrush(VOID_BG))
@@ -498,9 +710,189 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
                          Qt.AlignmentFlag.AlignHCenter, aw_str)
 
 
+def _draw_side_elevation(painter: QPainter, PW: int, PH: int,
+                         plan: LoadPlan, info: ShipmentInfo):
+    """Side elevation: shows height profile of each row, bottom + stacked pieces."""
+    M = 72
+    LM = M + 50
+
+    # Title
+    painter.setPen(QColor("#111"))
+    font = QFont("Arial", 20, QFont.Weight.Bold)
+    painter.setFont(font)
+    painter.drawText(QRectF(LM, M, PW - LM - M, 48),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                     "Side Elevation — Stack Height Profile")
+
+    font = QFont("Arial", 10)
+    painter.setFont(font)
+    painter.setPen(QColor("#555"))
+    hdr = info.customer or info.shipment_name or ""
+    if info.date:
+        hdr = (hdr + "  |  " if hdr else "") + info.date
+    if hdr:
+        painter.drawText(QRectF(LM, M + 50, PW - LM - M, 26),
+                         Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, hdr)
+
+    interior_h = TRAILER["interior_height_in"]
+
+    # Build per-row stack info: row_idx -> (bottom_piece, top_piece or None, row_depth)
+    slot_map = {}
+    for s in plan.slots:
+        if s.piece:
+            slot_map[(s.row, s.col, s.tier)] = s
+
+    rows = sorted(set(s.row for s in plan.slots))
+    n_rows = len(rows)
+    if n_rows == 0:
+        return
+
+    # Drawing area
+    draw_x = LM
+    draw_y = M + 90
+    draw_w = PW - LM - M
+    draw_h = PH - draw_y - M - 60
+
+    # Scale: x = row position along trailer, y = height
+    row_w = draw_w / n_rows
+
+    # Interior height scale
+    h_scale = draw_h / interior_h
+
+    # Draw trailer ceiling line
+    ceiling_y = draw_y
+    painter.setPen(QPen(QColor("#444"), 2))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawLine(QPointF(draw_x, ceiling_y), QPointF(draw_x + draw_w, ceiling_y))
+    font = QFont("Arial", 8)
+    painter.setFont(font)
+    painter.setPen(QColor("#444"))
+    painter.drawText(QRectF(draw_x, ceiling_y - 14, 120, 14),
+                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                     f"Interior ceiling {interior_h}\"")
+
+    # Draw floor line
+    floor_y = draw_y + draw_h
+    painter.setPen(QPen(QColor("#444"), 2))
+    painter.drawLine(QPointF(draw_x, floor_y), QPointF(draw_x + draw_w, floor_y))
+
+    # Draw each row
+    font_lbl = QFont("Arial", 7, QFont.Weight.Bold)
+    font_sm   = QFont("Arial", 6)
+
+    for r_pos, r in enumerate(rows):
+        x0 = draw_x + r_pos * row_w
+        col_gap = 2
+
+        for c in range(2):
+            bot_slot = slot_map.get((r, c, 0))
+            top_slot = slot_map.get((r, c, 1))
+
+            # For center pieces, only draw col=0
+            if bot_slot and bot_slot.is_center and c == 1:
+                continue
+
+            cell_x = x0 + c * (row_w / 2) + col_gap
+            cell_w = (row_w / 2) - col_gap * 2
+            if bot_slot and bot_slot.is_center:
+                cell_x = x0 + col_gap
+                cell_w = row_w - col_gap * 2
+
+            if bot_slot and bot_slot.piece:
+                bot_h_px = bot_slot.piece.height_in * h_scale
+                bot_rect = QRectF(cell_x, floor_y - bot_h_px, cell_w, bot_h_px)
+                painter.setBrush(QBrush(TEAL_LIGHT))
+                painter.setPen(QPen(TEAL_DARK, 1))
+                painter.drawRect(bot_rect)
+
+                painter.setFont(font_lbl)
+                painter.setPen(TEAL_DARK)
+                painter.drawText(bot_rect.adjusted(1, 2, -1, -2),
+                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                                 bot_slot.piece.crate_label)
+                painter.setFont(font_sm)
+                painter.drawText(bot_rect.adjusted(1, 2, -1, -2),
+                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
+                                 f"{bot_slot.piece.height_in:.0f}\"")
+
+                if top_slot and top_slot.piece:
+                    top_h_px = top_slot.piece.height_in * h_scale
+                    top_rect = QRectF(cell_x, floor_y - bot_h_px - top_h_px,
+                                      cell_w, top_h_px)
+                    painter.setBrush(QBrush(TAN))
+                    painter.setPen(QPen(QColor("#8B6914"), 1))
+                    painter.drawRect(top_rect)
+
+                    painter.setFont(font_lbl)
+                    painter.setPen(QColor("#FFFFFF"))
+                    painter.drawText(top_rect.adjusted(1, 2, -1, -2),
+                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                                     top_slot.piece.crate_label)
+                    painter.setFont(font_sm)
+                    painter.drawText(top_rect.adjusted(1, 2, -1, -2),
+                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
+                                     f"{top_slot.piece.height_in:.0f}\"")
+
+                    # Danger if over ceiling
+                    combined = bot_slot.piece.height_in + top_slot.piece.height_in
+                    if combined > interior_h:
+                        painter.setPen(QPen(QColor("#c0392b"), 2))
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.drawRect(QRectF(cell_x, floor_y - combined * h_scale,
+                                                cell_w, combined * h_scale))
+            else:
+                # Empty slot
+                empty_h = 24
+                er = QRectF(cell_x, floor_y - empty_h, cell_w, empty_h)
+                painter.setBrush(QBrush(VOID_BG))
+                painter.setPen(QPen(GRAY_LINE, 1, Qt.PenStyle.DashLine))
+                painter.drawRect(er)
+
+        # Row label below floor
+        painter.setFont(font_sm)
+        painter.setPen(QColor("#555"))
+        painter.drawText(QRectF(x0, floor_y + 2, row_w, 16),
+                         Qt.AlignmentFlag.AlignHCenter, f"R{r+1}")
+
+    # Height ruler on the left
+    painter.setPen(QPen(QColor("#999"), 1))
+    for h_mark in range(0, interior_h + 1, 12):
+        y_mark = floor_y - h_mark * h_scale
+        painter.drawLine(QPointF(draw_x - 8, y_mark), QPointF(draw_x, y_mark))
+        painter.setFont(QFont("Arial", 6))
+        painter.setPen(QColor("#666"))
+        painter.drawText(QRectF(draw_x - 44, y_mark - 8, 34, 16),
+                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                         f"{h_mark}\"")
+        painter.setPen(QPen(QColor("#999"), 1))
+
+    # Legend
+    legend_y = PH - M - 40
+    painter.setBrush(QBrush(TEAL_LIGHT))
+    painter.setPen(QPen(TEAL_DARK, 1))
+    painter.drawRect(QRectF(LM, legend_y, 16, 12))
+    painter.setFont(QFont("Arial", 8))
+    painter.setPen(QColor("#333"))
+    painter.drawText(QRectF(LM + 20, legend_y, 120, 12),
+                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                     "Floor-level piece")
+    painter.setBrush(QBrush(TAN))
+    painter.setPen(QPen(QColor("#8B6914"), 1))
+    painter.drawRect(QRectF(LM + 160, legend_y, 16, 12))
+    painter.drawText(QRectF(LM + 182, legend_y, 120, 12),
+                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                     "Stacked piece (tier 2)")
+
+
 # ── PDF: Crate Labels ─────────────────────────────────────────────────────────
 def export_crate_labels_pdf(plan: LoadPlan, info: ShipmentInfo, path: str):
-    filled = sorted([s for s in plan.slots if s.piece], key=lambda s: (s.row, s.col))
+    # One label per unique piece, ordered: floor rows R1→Rn first, then stacked pieces
+    seen: set = set()
+    filled = []
+    for s in sorted(plan.slots, key=lambda s: (s.row, s.tier, s.col)):
+        if s.piece and s.piece.piece_id not in seen:
+            seen.add(s.piece.piece_id)
+            filled.append(s)
     if not filled:
         return
 
@@ -563,9 +955,24 @@ def _draw_crate_label(painter: QPainter, PW: int, PH: int,
                      slot.piece.crate_label.upper())
 
     # Position label
-    side_letter = "A" if slot.col == 0 else "B"
-    side_name   = "Left" if slot.col == 0 else "Right"
-    pos_str = f"Position {side_letter}  ({side_name})   ·   Row {slot.row + 1}"
+    row_num = slot.row + 1
+    if slot.is_center:
+        if slot.piece.placement == "alt_center":
+            rows_list = sorted(set(s.row for s in plan.slots))
+            r_pos = rows_list.index(slot.row) if slot.row in rows_list else slot.row
+            direction = "← Load Left" if r_pos % 2 == 0 else "Load Right →"
+            pos_str = f"{direction}   ·   Row {row_num}"
+        else:
+            pos_str = f"Full Width   ·   Row {row_num}"
+    else:
+        side_letter = "A" if slot.col == 0 else "B"
+        side_name   = "Left" if slot.col == 0 else "Right"
+        pos_str = f"Position {side_letter}  ({side_name})   ·   Row {row_num}"
+    if slot.tier == 1:
+        t0_map = {(s.row, s.col): s for s in plan.slots if s.tier == 0}
+        bot = t0_map.get((slot.row, slot.col))
+        if bot and bot.piece:
+            pos_str += f"   ·   Stacked on {bot.piece.crate_label}"
     font = QFont("Arial", 16)
     painter.setFont(font)
     painter.drawText(QRectF(box_x + 10, box_top + box_h * 0.62, box_w - 20, box_h * 0.34),
@@ -792,13 +1199,13 @@ class TrailerView(QWidget):
             "#4a90d9","#e67e22","#27ae60","#8e44ad","#c0392b","#16a085",
             "#d35400","#2980b9","#7f8c8d","#f39c12","#1abc9c","#e74c3c",
         ]
-        slot_map   = {(s.row, s.col): s for s in slots}
+        slot_map   = {(s.row, s.col, s.tier): s for s in slots}
         font_big   = QFont("Arial", 7, QFont.Weight.Bold)
         font_small = QFont("Arial", 5)
         font_rlbl  = QFont("Arial", 7, QFont.Weight.Bold)
 
-        for r in rows:
-            sa = slot_map.get((r, 0))
+        for r_pos, r in enumerate(rows):
+            sa = slot_map.get((r, 0, 0))
             if not sa:
                 continue
             y_px     = grid_y + (sa.row_start_in / trailer_len) * grid_h
@@ -812,7 +1219,7 @@ class TrailerView(QWidget):
                              f"R{r+1}")
 
             for c in range(2):
-                slot = slot_map.get((r, c))
+                slot = slot_map.get((r, c, 0))
                 x = grid_x + c * col_w
 
                 if slot and slot.piece:
@@ -820,11 +1227,17 @@ class TrailerView(QWidget):
                         continue  # center piece drawn once via col=0
                     ph = (slot.piece.length_in / trailer_len) * grid_h
                     if slot.is_center:
-                        # Actual width centered with gaps on each side
                         crate_ratio = min(slot.piece.width_in / interior_w, 1.0)
-                        gap_px = (grid_w * (1.0 - crate_ratio)) / 2
-                        cell = QRectF(grid_x + gap_px + 1, y_px + 1,
-                                      grid_w * crate_ratio - 2, ph - 2)
+                        piece_w_px  = grid_w * crate_ratio
+                        total_gap   = grid_w - piece_w_px
+                        if slot.piece.placement == "alt_center":
+                            # Alternate left/right by visual row position
+                            load_left = (r_pos % 2 == 0)
+                            offset_px = 0 if load_left else total_gap
+                        else:
+                            offset_px = total_gap / 2
+                        cell = QRectF(grid_x + offset_px + 1, y_px + 1,
+                                      piece_w_px - 2, ph - 2)
                     else:
                         cell = QRectF(x + 1, y_px + 1, col_w - 2, ph - 2)
 
@@ -836,9 +1249,16 @@ class TrailerView(QWidget):
                     painter.setFont(font_big)
                     painter.setPen(Qt.GlobalColor.white)
                     if slot.is_center:
-                        painter.drawText(cell.adjusted(2, 2, -2, -2),
-                                         Qt.AlignmentFlag.AlignCenter,
-                                         f"CENTER\n{slot.piece.crate_label}\n{slot.piece.weight_lbs:,.0f} lb")
+                        if slot.piece.placement == "alt_center":
+                            load_left = (r_pos % 2 == 0)
+                            direction = "← LEFT" if load_left else "RIGHT →"
+                            painter.drawText(cell.adjusted(2, 2, -2, -2),
+                                             Qt.AlignmentFlag.AlignCenter,
+                                             f"{direction}\n{slot.piece.crate_label}\n{slot.piece.weight_lbs:,.0f} lb")
+                        else:
+                            painter.drawText(cell.adjusted(2, 2, -2, -2),
+                                             Qt.AlignmentFlag.AlignCenter,
+                                             f"CENTER\n{slot.piece.crate_label}\n{slot.piece.weight_lbs:,.0f} lb")
                     else:
                         painter.drawText(cell.adjusted(2, 2, -2, -cell.height() // 2),
                                          Qt.AlignmentFlag.AlignCenter, slot.piece.crate_label)
@@ -858,6 +1278,22 @@ class TrailerView(QWidget):
                         painter.setBrush(Qt.BrushStyle.NoBrush)
                         painter.setPen(QPen(QColor("#27ae60"), 2.5))
                         painter.drawRect(cell)
+
+                    # Stacked piece badge (amber, top-right corner)
+                    top_slot = slot_map.get((r, c, 1)) if not slot.is_center else None
+                    if top_slot and top_slot.piece:
+                        badge_w = min(cell.width() * 0.6, 56)
+                        badge_h = min(cell.height() * 0.35, 22)
+                        badge = QRectF(cell.right() - badge_w - 1,
+                                       cell.top() + 1, badge_w, badge_h)
+                        painter.setBrush(QBrush(TAN))
+                        painter.setPen(QPen(QColor("#8B6914"), 1))
+                        painter.drawRoundedRect(badge, 2, 2)
+                        painter.setFont(QFont("Arial", 5, QFont.Weight.Bold))
+                        painter.setPen(Qt.GlobalColor.white)
+                        painter.drawText(badge,
+                                         Qt.AlignmentFlag.AlignCenter,
+                                         f"▲{top_slot.piece.crate_label}")
                 else:
                     cell = QRectF(x + 1, y_px + 1, col_w - 2, piece_h - 2)
                     painter.setBrush(QBrush(QColor("#e8e8e8")))
@@ -876,6 +1312,185 @@ class TrailerView(QWidget):
         for c, lbl in enumerate(["Position A (Left)", "Position B (Right)"]):
             painter.drawText(QRectF(grid_x + c * col_w, H - 20, col_w, 18),
                              Qt.AlignmentFlag.AlignCenter, lbl)
+
+
+# ── Side Elevation View widget ────────────────────────────────────────────────
+class SideElevationView(QWidget):
+    """Live side-elevation panel: shows height profile of each row, nose at left."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.plan: Optional[LoadPlan] = None
+        self.setMinimumSize(320, 300)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_plan(self, plan: Optional[LoadPlan]):
+        self.plan = plan
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._draw(painter)
+
+    def _draw(self, painter: QPainter):
+        if not self.plan or not self.plan.slots:
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             "No load plan — press Calculate.")
+            return
+
+        slots = self.plan.slots
+        rows  = sorted(set(s.row for s in slots))
+        n_rows = len(rows)
+        if not n_rows:
+            return
+
+        W, H = self.width(), self.height()
+        ML, MR, MT, MB = 52, 16, 30, 36   # margins: left (ruler), right, top, bottom (row labels)
+
+        interior_h  = TRAILER["interior_height_in"]
+        interior_len = TRAILER["interior_length_in"]
+
+        draw_x = ML
+        draw_y = MT
+        draw_w = W - ML - MR
+        draw_h = H - MT - MB
+
+        h_scale = draw_h / interior_h
+
+        slot_map = {}
+        for s in slots:
+            if s.piece:
+                slot_map[(s.row, s.col, s.tier)] = s
+
+        row_w = draw_w / n_rows
+
+        # Trailer ceiling
+        painter.setPen(QPen(QColor("#444"), 2))
+        painter.drawLine(QPointF(draw_x, draw_y),
+                         QPointF(draw_x + draw_w, draw_y))
+        painter.setFont(QFont("Arial", 7))
+        painter.setPen(QColor("#444"))
+        painter.drawText(QRectF(draw_x, draw_y - 14, 120, 13),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         f"Ceiling {interior_h}\"")
+
+        # Floor
+        floor_y = draw_y + draw_h
+        painter.setPen(QPen(QColor("#444"), 2))
+        painter.drawLine(QPointF(draw_x, floor_y),
+                         QPointF(draw_x + draw_w, floor_y))
+
+        # Height ruler
+        painter.setPen(QPen(QColor("#bbb"), 1))
+        for h_mark in range(0, interior_h + 1, 12):
+            y_mark = floor_y - h_mark * h_scale
+            painter.drawLine(QPointF(draw_x - 6, y_mark), QPointF(draw_x, y_mark))
+            painter.setFont(QFont("Arial", 6))
+            painter.setPen(QColor("#666"))
+            painter.drawText(QRectF(draw_x - ML, y_mark - 7, ML - 8, 14),
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                             f"{h_mark}\"")
+            painter.setPen(QPen(QColor("#bbb"), 1))
+
+        font_lbl = QFont("Arial", 6, QFont.Weight.Bold)
+        font_sm  = QFont("Arial", 5)
+        GAP = 1
+
+        for r_pos, r in enumerate(rows):
+            x0 = draw_x + r_pos * row_w
+
+            # Collect the two cols (or just col=0 for center)
+            drawn_center = False
+            for c in range(2):
+                bot = slot_map.get((r, c, 0))
+                top = slot_map.get((r, c, 1))
+
+                if bot and bot.is_center:
+                    if drawn_center:
+                        continue
+                    drawn_center = True
+                    cell_x = x0 + GAP
+                    cell_w = row_w - GAP * 2
+                elif bot:
+                    cell_x = x0 + c * (row_w / 2) + GAP
+                    cell_w = row_w / 2 - GAP * 2
+                else:
+                    continue
+
+                if bot and bot.piece:
+                    bot_h_px = bot.piece.height_in * h_scale
+                    bot_rect = QRectF(cell_x, floor_y - bot_h_px, cell_w, bot_h_px)
+                    painter.setBrush(QBrush(TEAL_LIGHT))
+                    painter.setPen(QPen(TEAL_DARK, 1))
+                    painter.drawRect(bot_rect)
+
+                    painter.setFont(font_lbl)
+                    painter.setPen(TEAL_DARK)
+                    painter.drawText(bot_rect.adjusted(1, 1, -1, -1),
+                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                                     bot.piece.crate_label)
+                    painter.setFont(font_sm)
+                    painter.drawText(bot_rect.adjusted(1, 1, -1, -1),
+                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
+                                     f"{bot.piece.height_in:.0f}\"")
+
+                    if top and top.piece:
+                        top_h_px = top.piece.height_in * h_scale
+                        top_rect = QRectF(cell_x, floor_y - bot_h_px - top_h_px,
+                                          cell_w, top_h_px)
+                        painter.setBrush(QBrush(TAN))
+                        painter.setPen(QPen(QColor("#8B6914"), 1))
+                        painter.drawRect(top_rect)
+
+                        painter.setFont(font_lbl)
+                        painter.setPen(QColor("#fff"))
+                        painter.drawText(top_rect.adjusted(1, 1, -1, -1),
+                                         Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                                         top.piece.crate_label)
+                        painter.setFont(font_sm)
+                        painter.drawText(top_rect.adjusted(1, 1, -1, -1),
+                                         Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
+                                         f"{top.piece.height_in:.0f}\"")
+
+                        # Red outline if combined height exceeds interior
+                        if bot.piece.height_in + top.piece.height_in > interior_h:
+                            painter.setBrush(Qt.BrushStyle.NoBrush)
+                            painter.setPen(QPen(QColor("#c0392b"), 2))
+                            painter.drawRect(QRectF(cell_x, floor_y - (bot_h_px + top_h_px),
+                                                    cell_w, bot_h_px + top_h_px))
+
+            # Row label below floor
+            painter.setFont(font_sm)
+            painter.setPen(QColor("#555"))
+            painter.drawText(QRectF(x0, floor_y + 3, row_w, MB - 4),
+                             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                             f"R{r+1}")
+
+        # Nose / Tail labels
+        painter.setFont(QFont("Arial", 7, QFont.Weight.Bold))
+        painter.setPen(QColor("#333"))
+        painter.drawText(QRectF(draw_x, draw_y, 40, draw_h),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, "NOSE▶")
+        painter.drawText(QRectF(draw_x + draw_w - 40, draw_y, 40, draw_h),
+                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "◀TAIL")
+
+        # Legend
+        painter.setBrush(QBrush(TEAL_LIGHT))
+        painter.setPen(QPen(TEAL_DARK, 1))
+        painter.drawRect(QRectF(draw_x, draw_y + 2, 10, 8))
+        painter.setFont(QFont("Arial", 6))
+        painter.setPen(QColor("#333"))
+        painter.drawText(QRectF(draw_x + 13, draw_y, 80, 12),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         "Floor level")
+        painter.setBrush(QBrush(TAN))
+        painter.setPen(QPen(QColor("#8B6914"), 1))
+        painter.drawRect(QRectF(draw_x + 80, draw_y + 2, 10, 8))
+        painter.setPen(QColor("#333"))
+        painter.drawText(QRectF(draw_x + 93, draw_y, 80, 12),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         "Stacked")
 
 
 # ── Excel Import Dialog ───────────────────────────────────────────────────────
@@ -907,9 +1522,9 @@ class ImportDialog(QDialog):
         layout.addWidget(lbl)
 
         # Preview table
-        self.table = QTableWidget(0, 9)
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(
-            ["✓ Include", "Crate #", "Part Number", "L\"", "W\"", "H\"", "Weight (lbs)", "PCS", "Notes"])
+            ["✓ Include", "Crate #", "Part Number", "L\"", "W\"", "H\"", "Weight (lbs)", "PCS", "Notes", "Stack?"])
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -948,15 +1563,17 @@ class ImportDialog(QDialog):
                 except (TypeError, ValueError):
                     continue
 
-                part   = str(row[1] or "")
-                l_in   = float(row[3] or 0)
-                w_in   = float(row[4] or 0)
-                h_in   = float(row[5] or 0)
-                weight = float(row[6] or 0)
-                pcs    = int(row[7] or 0)
-                notes  = str(row[9] or "")
+                part      = str(row[1] or "")
+                l_in      = float(row[3] or 0)
+                w_in      = float(row[4] or 0)
+                h_in      = float(row[5] or 0)
+                weight    = float(row[6] or 0)
+                pcs       = int(row[7] or 0)
+                notes     = str(row[9] or "")
+                raw_stk   = row[10] if len(row) > 10 else None
+                stackable = str(raw_stk).strip().upper() not in ("N", "NO", "0", "FALSE") if raw_stk is not None else True
 
-                self._raw_rows.append((crate_id, part, l_in, w_in, h_in, weight, pcs, notes))
+                self._raw_rows.append((crate_id, part, l_in, w_in, h_in, weight, pcs, notes, stackable))
 
                 r = self.table.rowCount()
                 self.table.insertRow(r)
@@ -971,7 +1588,8 @@ class ImportDialog(QDialog):
                 self.table.setCellWidget(r, 0, chk_widget)
 
                 for col, val in enumerate([crate_id, part, l_in, w_in, h_in,
-                                           f"{weight:,.0f}", pcs, notes], start=1):
+                                           f"{weight:,.0f}", pcs, notes,
+                                           "Yes" if stackable else "No"], start=1):
                     item = QTableWidgetItem(str(val))
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     self.table.setItem(r, col, item)
@@ -984,7 +1602,7 @@ class ImportDialog(QDialog):
         self.excluded_ids = []
 
         for r, raw in enumerate(self._raw_rows):
-            crate_id, part, l_in, w_in, h_in, weight, pcs, notes = raw
+            crate_id, part, l_in, w_in, h_in, weight, pcs, notes, stackable = raw
             chk_widget = self.table.cellWidget(r, 0)
             chk = chk_widget.findChild(QCheckBox)
             if chk and chk.isChecked():
@@ -998,6 +1616,7 @@ class ImportDialog(QDialog):
                     weight_lbs=weight,
                     pcs=pcs,
                     notes=notes,
+                    stackable=stackable,
                 ))
             else:
                 self.excluded_ids.append(crate_id)
@@ -1175,12 +1794,12 @@ class FreightLoaderApp(QMainWindow):
         grp_freight = QGroupBox("Freight Pieces")
         gl = QVBoxLayout(grp_freight)
 
-        self.table = QTableWidget(0, 9)
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(
-            ["Crate #", "Label", "Part #", 'L"', 'W"', 'H"', "Weight (lbs)", "PCS", "Pos."])
+            ["Crate #", "Label", "Part #", 'L"', 'W"', 'H"', "Weight (lbs)", "PCS", "Pos.", "Stack?"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        for col, w in [(0,58),(3,46),(4,46),(5,46),(6,88),(7,50),(8,72)]:
+        for col, w in [(0,58),(3,46),(4,46),(5,46),(6,88),(7,50),(8,72),(9,56)]:
             self.table.setColumnWidth(col, w)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         gl.addWidget(self.table)
@@ -1272,22 +1891,24 @@ class FreightLoaderApp(QMainWindow):
 
         splitter.addWidget(left)
 
-        # ══ RIGHT PANEL — trailer view ════════════════════════════════
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(0, 0, 0, 0)
-        lbl_view = QLabel("Trailer View — Top-Down (Nose at Top)")
-        lbl_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_view.setStyleSheet("font-weight:bold; font-size:11px;")
-        rl.addWidget(lbl_view)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        # ══ RIGHT PANEL — tabbed trailer views ═══════════════════════
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+
+        # Tab 1 — Top view
+        top_scroll = QScrollArea()
+        top_scroll.setWidgetResizable(True)
         self.trailer_view = TrailerView()
         self.trailer_view.setMinimumHeight(600)
         self.trailer_view.plan_changed.connect(self._on_plan_changed_by_drag)
-        scroll.setWidget(self.trailer_view)
-        rl.addWidget(scroll)
-        splitter.addWidget(right)
+        top_scroll.setWidget(self.trailer_view)
+        tabs.addTab(top_scroll, "Top View")
+
+        # Tab 2 — Side elevation
+        self.side_view = SideElevationView()
+        tabs.addTab(self.side_view, "Side View")
+
+        splitter.addWidget(tabs)
         splitter.setSizes([500, 610])
 
     def _on_plan_changed_by_drag(self):
@@ -1334,7 +1955,15 @@ class FreightLoaderApp(QMainWindow):
     def _load_pieces(self, pieces: list):
         self.table.setRowCount(0)
         self._next_id = 1
+        half_w       = TRAILER["interior_width_in"] / 2
+        alt_w_thresh = TRAILER["interior_width_in"] * 0.70
         for p in pieces:
+            if p.width_in > alt_w_thresh:
+                placement = "alt_center"
+            elif p.width_in > half_w:
+                placement = "center"
+            else:
+                placement = p.placement
             self._add_row(
                 crate_id=p.piece_id,
                 label=p.crate_label,
@@ -1344,12 +1973,13 @@ class FreightLoaderApp(QMainWindow):
                 height=p.height_in,
                 weight=p.weight_lbs,
                 pcs=p.pcs,
-                placement=p.placement,
+                placement=placement,
+                stackable=p.stackable,
             )
 
     def _add_row(self, crate_id=None, label="", part_num="",
                  length=48.0, width=48.0, height=48.0, weight=1000.0, pcs=0,
-                 placement="auto"):
+                 placement="auto", stackable=True):
         r = self.table.rowCount()
         self.table.insertRow(r)
 
@@ -1370,10 +2000,26 @@ class FreightLoaderApp(QMainWindow):
 
         # Col 8: Pos. placement combo box — changing it auto-recalculates
         combo = QComboBox()
-        combo.addItems(["Auto", "Center"])
-        combo.setCurrentIndex(1 if placement == "center" else 0)
+        combo.addItems(["Auto", "Center", "Alt. Center"])
+        if placement == "alt_center":
+            combo.setCurrentIndex(2)
+        elif placement == "center":
+            combo.setCurrentIndex(1)
+        else:
+            combo.setCurrentIndex(0)
         combo.currentIndexChanged.connect(lambda: self._calculate(silent=True))
         self.table.setCellWidget(r, 8, combo)
+
+        # Col 9: Stack? checkbox
+        stk_widget = QWidget()
+        stk_layout = QHBoxLayout(stk_widget)
+        stk_chk = QCheckBox()
+        stk_chk.setChecked(stackable)
+        stk_chk.stateChanged.connect(lambda: self._calculate(silent=True))
+        stk_layout.addWidget(stk_chk)
+        stk_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        stk_layout.setContentsMargins(0, 0, 0, 0)
+        self.table.setCellWidget(r, 9, stk_widget)
 
     def _remove_row(self):
         rows = sorted(set(i.row() for i in self.table.selectedItems()), reverse=True)
@@ -1401,9 +2047,18 @@ class FreightLoaderApp(QMainWindow):
                 pcs_item = self.table.item(r, 7)
                 pcs      = int(pcs_item.text()) if pcs_item and pcs_item.text().strip() else 0
                 combo    = self.table.cellWidget(r, 8)
-                placement = "center" if combo and combo.currentText() == "Center" else "auto"
+                txt = combo.currentText() if combo else "Auto"
+                if txt == "Alt. Center":
+                    placement = "alt_center"
+                elif txt == "Center":
+                    placement = "center"
+                else:
+                    placement = "auto"
+                stk_w = self.table.cellWidget(r, 9)
+                stk_chk = stk_w.findChild(QCheckBox) if stk_w else None
+                stackable = stk_chk.isChecked() if stk_chk else True
                 pieces.append(FreightPiece(crate_id, label, part, l_in, w_in, h_in, weight, pcs,
-                                           placement=placement))
+                                           placement=placement, stackable=stackable))
             except (ValueError, AttributeError) as e:
                 QMessageBox.warning(self, "Input Error", f"Row {r+1}: {e}")
                 return []
@@ -1428,6 +2083,7 @@ class FreightLoaderApp(QMainWindow):
 
         self._plan = plan
         self.trailer_view.set_plan(plan)
+        self.side_view.set_plan(plan)
         self._update_summary(plan)
         self.btn_plan_pdf.setEnabled(True)
         self.btn_label_pdf.setEnabled(True)
@@ -1471,6 +2127,18 @@ class FreightLoaderApp(QMainWindow):
             f"<td align='right'><span style='color:{diff_color}'>{heavier} heavier</span></td>"
             f"</tr>"
         )
+        if self._plan:
+            n_stacked = sum(1 for s in self._plan.slots if s.tier == 1 and s.piece)
+            if n_stacked:
+                stacked_labels = ", ".join(
+                    s.piece.crate_label for s in self._plan.slots
+                    if s.tier == 1 and s.piece)
+                rows_html += (
+                    f"<tr><td colspan='3'><hr style='margin:2px'></td></tr>"
+                    f"<tr><td><b>Stacked:</b></td>"
+                    f"<td align='right'>{n_stacked} crate(s)</td>"
+                    f"<td align='right' style='color:#8B6914'>{stacked_labels}</td></tr>"
+                )
         self.lbl_summary.setText(f"<table>{rows_html}</table>")
 
         if plan.violations:
@@ -1502,6 +2170,7 @@ class FreightLoaderApp(QMainWindow):
         self.lbl_summary.setText("—")
         self.lbl_status.setText("No plan calculated.")
         self.trailer_view.set_plan(None)
+        self.side_view.set_plan(None)
         self.btn_plan_pdf.setEnabled(False)
         self.btn_label_pdf.setEnabled(False)
         self._set_title()
