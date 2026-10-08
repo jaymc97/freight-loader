@@ -946,13 +946,33 @@ def _draw_crate_label(painter: QPainter, PW: int, PH: int,
     painter.setPen(QPen(TEAL_DARK, 2.5))
     painter.drawRoundedRect(box, 16, 16)
 
+    # Layout zones — shift to make room for notes when present
+    has_notes = bool(slot.piece.notes)
+    crate_h_frac  = 0.46 if has_notes else 0.58
+    notes_top_frac = 0.47
+    notes_h_frac   = 0.20
+    pos_top_frac  = 0.68 if has_notes else 0.62
+    pos_h_frac    = 0.29 if has_notes else 0.34
+
     # Crate number — very large
     font = QFont("Arial", 54, QFont.Weight.Bold)
     painter.setFont(font)
     painter.setPen(TEAL_DARK)
-    painter.drawText(QRectF(box_x + 10, box_top + 16, box_w - 20, box_h * 0.58),
+    painter.drawText(QRectF(box_x + 10, box_top + 16, box_w - 20, box_h * crate_h_frac),
                      Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
                      slot.piece.crate_label.upper())
+
+    # Notes — smaller, italic, below crate number
+    if has_notes:
+        font = QFont("Arial", 13)
+        font.setItalic(True)
+        painter.setFont(font)
+        painter.setPen(QColor("#1a5c52"))
+        painter.drawText(
+            QRectF(box_x + 14, box_top + box_h * notes_top_frac, box_w - 28, box_h * notes_h_frac),
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+            | Qt.TextFlag.TextWordWrap,
+            slot.piece.notes)
 
     # Position label
     row_num = slot.row + 1
@@ -974,8 +994,10 @@ def _draw_crate_label(painter: QPainter, PW: int, PH: int,
         if bot and bot.piece:
             pos_str += f"   ·   Stacked on {bot.piece.crate_label}"
     font = QFont("Arial", 16)
+    font.setItalic(False)
     painter.setFont(font)
-    painter.drawText(QRectF(box_x + 10, box_top + box_h * 0.62, box_w - 20, box_h * 0.34),
+    painter.setPen(TEAL_DARK)
+    painter.drawText(QRectF(box_x + 10, box_top + box_h * pos_top_frac, box_w - 20, box_h * pos_h_frac),
                      Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, pos_str)
 
     # ── Middle separator ───────────────────────────────────────────────
@@ -1794,13 +1816,14 @@ class FreightLoaderApp(QMainWindow):
         grp_freight = QGroupBox("Freight Pieces")
         gl = QVBoxLayout(grp_freight)
 
-        self.table = QTableWidget(0, 10)
+        self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
-            ["Crate #", "Label", "Part #", 'L"', 'W"', 'H"', "Weight (lbs)", "PCS", "Pos.", "Stack?"])
+            ["Crate #", "Label", "Part #", 'L"', 'W"', 'H"', "Weight (lbs)", "PCS", "Pos.", "Stack?", "Notes"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         for col, w in [(0,58),(3,46),(4,46),(5,46),(6,88),(7,50),(8,72),(9,56)]:
             self.table.setColumnWidth(col, w)
+        self.table.setColumnHidden(10, True)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         gl.addWidget(self.table)
 
@@ -1975,11 +1998,12 @@ class FreightLoaderApp(QMainWindow):
                 pcs=p.pcs,
                 placement=placement,
                 stackable=p.stackable,
+                notes=p.notes,
             )
 
     def _add_row(self, crate_id=None, label="", part_num="",
                  length=48.0, width=48.0, height=48.0, weight=1000.0, pcs=0,
-                 placement="auto", stackable=True):
+                 placement="auto", stackable=True, notes=""):
         r = self.table.rowCount()
         self.table.insertRow(r)
 
@@ -2021,6 +2045,10 @@ class FreightLoaderApp(QMainWindow):
         stk_layout.setContentsMargins(0, 0, 0, 0)
         self.table.setCellWidget(r, 9, stk_widget)
 
+        # Col 10: Notes (hidden — preserves notes through calculate cycles)
+        notes_item = QTableWidgetItem(notes)
+        self.table.setItem(r, 10, notes_item)
+
     def _remove_row(self):
         rows = sorted(set(i.row() for i in self.table.selectedItems()), reverse=True)
         for r in rows:
@@ -2057,8 +2085,10 @@ class FreightLoaderApp(QMainWindow):
                 stk_w = self.table.cellWidget(r, 9)
                 stk_chk = stk_w.findChild(QCheckBox) if stk_w else None
                 stackable = stk_chk.isChecked() if stk_chk else True
+                notes_item = self.table.item(r, 10)
+                notes = notes_item.text() if notes_item else ""
                 pieces.append(FreightPiece(crate_id, label, part, l_in, w_in, h_in, weight, pcs,
-                                           placement=placement, stackable=stackable))
+                                           notes=notes, placement=placement, stackable=stackable))
             except (ValueError, AttributeError) as e:
                 QMessageBox.warning(self, "Input Error", f"Row {r+1}: {e}")
                 return []
