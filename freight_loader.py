@@ -3,16 +3,49 @@ Freight Loader — 53' Dry Van Load Planning Tool
 Imports Excel packing lists, calculates balanced load plans, exports floor plan PDF and crate labels.
 """
 
+APP_VERSION = "2.0.0"
+
 import sys
 import math
 import datetime
 import json
 import os
 import re
-from dataclasses import dataclass
+import shutil
+import subprocess
+import itertools
+import tempfile
+import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 SAVE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_PATH = os.path.join(SAVE_DIR, "Freight_Loader_Import_Template.xlsx")
+PACKING_LIST_DIR = os.path.join(SAVE_DIR, "Saved Load Templates")   # filled-in Excel packing lists
+LOAD_PLANS_DIR = os.path.join(SAVE_DIR, "Load Plans")                # saved plans (.json) and PDFs
+OLD_PACKING_LIST_DIR = os.path.join(SAVE_DIR, "Packing Lists")      # name used before v2.0
+
+
+def ensure_folders():
+    """
+    Create the Load Plans folder and move the old "Packing Lists" folder to its
+    new name. If Windows has it locked (e.g. a list is open in Excel) the old
+    folder keeps being used and the rename is tried again next start.
+    """
+    global PACKING_LIST_DIR
+    os.makedirs(LOAD_PLANS_DIR, exist_ok=True)
+    if os.path.isdir(OLD_PACKING_LIST_DIR) and not os.path.exists(PACKING_LIST_DIR):
+        try:
+            os.rename(OLD_PACKING_LIST_DIR, PACKING_LIST_DIR)
+        except OSError:
+            PACKING_LIST_DIR = OLD_PACKING_LIST_DIR
+
+try:
+    from PyQt6.QtPdf import QPdfDocument
+    from PyQt6.QtPdfWidgets import QPdfView
+    HAS_QTPDF = True
+except ImportError:          # older PyQt6 builds without the PDF module
+    HAS_QTPDF = False
 
 try:
     import openpyxl
@@ -25,11 +58,14 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QPushButton, QLabel, QSpinBox,
     QLineEdit, QGroupBox, QSplitter, QScrollArea, QMessageBox,
     QHeaderView, QCheckBox, QSizePolicy, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QAbstractItemView, QFrame, QComboBox, QTabWidget
+    QFileDialog, QFormLayout, QAbstractItemView, QFrame, QComboBox, QTabWidget,
+    QButtonGroup, QToolTip
 )
-from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
+from PyQt6.QtCore import (Qt, QRectF, QPointF, QSize, QEvent, QSettings, QBuffer, QByteArray,
+                          QIODevice, pyqtSignal)
 from PyQt6.QtGui import (
-    QPainter, QColor, QPen, QBrush, QFont, QPageLayout, QPageSize, QPdfWriter
+    QPainter, QColor, QPen, QBrush, QFont, QPageLayout, QPageSize, QPdfWriter, QPolygonF,
+    QFontMetrics, QCursor
 )
 
 # ── Colors ───────────────────────────────────────────────────────────────────
@@ -39,6 +75,17 @@ TEAL_LIGHT = QColor("#cdeae5")
 TAN        = QColor("#c0a070")
 GRAY_LINE  = QColor("#b0b0b0")
 VOID_BG    = QColor("#f8f8f8")
+
+MAX_STOPS = 10
+# Delivery-stop badge colors, indexed by stop - 1
+STOP_COLORS = ["#1f4e79", "#7b2d8e", "#1e7b34", "#b03a2e", "#7a5c12",
+               "#0e6e6e", "#a0522d", "#4b0082", "#556b2f", "#8b1c62"]
+
+# Per-crate colors, indexed by piece_id (shared by top view and 3D view)
+CRATE_COLORS = [
+    "#4a90d9","#e67e22","#27ae60","#8e44ad","#c0392b","#16a085",
+    "#d35400","#2980b9","#7f8c8d","#f39c12","#1abc9c","#e74c3c",
+]
 
 # ── 53' Dry Van specs ────────────────────────────────────────────────────────
 TRAILER = {
@@ -70,6 +117,8 @@ class FreightPiece:
     notes: str = ""
     placement: str = "auto"
     stackable: bool = True
+    stop: int = 1          # delivery stop ID (1..MAX_STOPS); see the shipment's stop list
+    seq: int = 0           # delivery order on its truck, 1 = first (set by plan_load)
 
 @dataclass
 class ShipmentInfo:
@@ -79,6 +128,8 @@ class ShipmentInfo:
     bol_num: str = ""
     date: str = ""
     notes: str = ""
+    stop_names: list = field(default_factory=lambda: [""] * MAX_STOPS)
+    truck_label: str = ""      # e.g. "Truck 2 of 3" on PDFs (blank for a single truck)
 
 @dataclass
 class PalletSlot:
@@ -88,6 +139,9 @@ class PalletSlot:
     row_start_in: float          # inches from nose to front of this row
     is_center: bool = False
     tier: int = 0                # 0 = floor level, 1 = stacked on top
+    side: str = ""               # alt-center rows: "left"/"right" wall or "center"; "" = legacy
+    x_in: Optional[float] = None # manual position of a floor crate (front edge from nose, in);
+    y_in: Optional[float] = None #   left edge from the left wall — stacked crates follow it
 
 @dataclass
 class LoadPlan:
@@ -97,215 +151,553 @@ class LoadPlan:
     total_length_used_in: float
     override: bool = False
     excluded_ids: list = None
+    unplaced: list = None        # [(FreightPiece, reason)] that could not be loaded
+    stop_axles: list = None      # [(stop just delivered, steer, drive, trailer)] for remaining load
+    stop_names: list = None      # display names for stops 1..MAX_STOPS (set by the UI)
+    stop_order: list = None      # stop IDs in delivery order (first delivered = at the doors)
 
 
 # ── Algorithm ─────────────────────────────────────────────────────────────────
-def _overflow_count(pieces: list, mode: str) -> int:
+# 1. Pieces that can't physically go in the trailer are set aside with a reason.
+# 2. Each floor position is a "column": a bottom piece plus at most one piece
+#    stacked on it. Wide (or forced-center) columns take a full row; narrow ones
+#    pair two across, longest with next-longest, so short pieces don't sit
+#    beside long ones wasting floor.
+# 3. While the rows are longer than the trailer, stack the piece whose removal
+#    from the floor saves the most length (stacking is a last resort).
+# 4. If even maximum stacking won't fit, load the longest prefix of the freight
+#    list that fits; the rest is reported as not loaded.
+# 5. Order rows nose→tail to keep every axle legal and drive/trailer axles
+#    evenly loaded, then pick each piece's wall to balance left/right weight.
+# Multi-stop: rows are zoned by delivery stop — the last stop at the nose,
+# stop 1 at the doors. Pieces only pair or stack with pieces for the same
+# stop, rows only move within their zone, and axles are also checked for the
+# load that remains after each delivery.
+FIT_TOLERANCE_IN = 0.01
+
+
+@dataclass
+class _Column:
+    """One floor position: a bottom piece and optionally one piece stacked on it."""
+    bottom: FreightPiece
+    top: Optional[FreightPiece] = None
+
+    @property
+    def length(self) -> float:
+        return self.bottom.length_in
+
+    @property
+    def width(self) -> float:
+        return min(self.bottom.width_in, TRAILER["interior_width_in"])
+
+    @property
+    def weight(self) -> float:
+        return self.bottom.weight_lbs + (self.top.weight_lbs if self.top else 0.0)
+
+    @property
+    def seq(self) -> int:
+        return self.bottom.seq
+
+    @property
+    def full_row(self) -> bool:
+        return self.bottom.placement in ("center", "alt_center")
+
+    @property
+    def moment_in_row(self) -> float:
+        """Σ weight × centre distance from the front of its row."""
+        m = self.bottom.weight_lbs * self.bottom.length_in / 2
+        if self.top:
+            m += self.top.weight_lbs * self.top.length_in / 2
+        return m
+
+
+def _can_stack(bottom: FreightPiece, top: FreightPiece) -> bool:
+    return (bottom.stackable
+            and top.stop == bottom.stop
+            and top.length_in <= bottom.length_in
+            and top.width_in <= bottom.width_in
+            and bottom.height_in + top.height_in <= TRAILER["interior_height_in"]
+            and top.weight_lbs <= bottom.weight_lbs)
+
+
+def _floor_rows(columns: list) -> list:
     """
-    How many pieces cannot fit on the trailer floor without stacking.
-    mode='center': each piece takes its own row (full-width).
-    mode='auto':   pieces pair side-by-side, two per row.
+    Group columns into rows (lists of 1–2 columns from the same stop). A stop's
+    leftover unpaired column may share a row with the next stop's leftover —
+    that row sits on the zone boundary, so either piece unloads without moving
+    the other.
     """
-    if not pieces:
-        return 0
-    trailer_len = TRAILER["interior_length_in"]
-    if mode == 'center':
-        sorted_p = sorted(pieces, key=lambda p: p.length_in, reverse=True)
-        cursor, fits = 0.0, 0
-        for p in sorted_p:
-            if cursor + p.length_in <= trailer_len:
-                cursor += p.length_in
-                fits += 1
-            else:
-                break
-    else:  # auto — two pieces share a row, depth = longer of the pair
-        sorted_p = sorted(pieces, key=lambda p: p.length_in, reverse=True)
-        cursor, fits, i = 0.0, 0, 0
-        while i < len(sorted_p):
-            a = sorted_p[i]
-            b = sorted_p[i + 1] if i + 1 < len(sorted_p) else None
-            row_depth = max(a.length_in, b.length_in if b else 0)
-            if cursor + row_depth <= trailer_len:
-                cursor += row_depth
-                fits += 2 if b else 1
+    W = TRAILER["interior_width_in"]
+    rows = [[c] for c in columns if c.full_row]
+    stops = sorted({c.seq for c in columns})
+    leftover = {}
+    for stop in stops:
+        narrow = sorted((c for c in columns if not c.full_row and c.seq == stop),
+                        key=lambda c: c.length, reverse=True)
+        i = 0
+        while i < len(narrow):
+            a = narrow[i]
+            b = narrow[i + 1] if i + 1 < len(narrow) else None
+            if b is not None and a.width + b.width <= W:
+                rows.append([a, b])
                 i += 2
             else:
-                break
-    return max(0, len(pieces) - fits)
+                leftover.setdefault(stop, []).append(a)
+                i += 1
+    k = 0
+    while k < len(stops):
+        st = stops[k]
+        nxt = stops[k + 1] if k + 1 < len(stops) else None
+        if (st in leftover and nxt in leftover and len(leftover[st]) == 1
+                and len(leftover[nxt]) == 1
+                and leftover[st][0].width + leftover[nxt][0].width <= W):
+            rows.append([leftover.pop(st)[0], leftover.pop(nxt)[0]])
+            k += 2
+        else:
+            k += 1
+    for cols in leftover.values():
+        rows.extend([c] for c in cols)
+    return rows
 
 
-def _find_stack_pairs(pieces: list, max_stacks: int = 0) -> tuple:
+def _row_stop(row: list) -> float:
+    """Zone key for a row; a boundary row shared by two stops sits between them."""
+    return sum(c.seq for c in row) / len(row)
+
+
+def _rows_length(rows: list) -> float:
+    return sum(max(c.length for c in r) for r in rows)
+
+
+def _pack_columns(pieces: list) -> tuple:
+    """Columns for `pieces` with the least stacking needed to fit; (columns, fits)."""
+    L = TRAILER["interior_length_in"]
+    columns = [_Column(p) for p in pieces]
+    current = _rows_length(_floor_rows(columns))
+    while current > L + FIT_TOLERANCE_IN:
+        best = None
+        for t in columns:
+            if t.top is not None:
+                continue   # a column already carrying a piece can't go on top (no 3-high)
+            bottoms = [b for b in columns
+                       if b is not t and b.top is None and _can_stack(b.bottom, t.bottom)]
+            if not bottoms:
+                continue
+            rest_len = _rows_length(_floor_rows([c for c in columns if c is not t]))
+            gain = current - rest_len
+            # Most floor saved first, then lighter tops (lower centre of gravity)
+            key = (round(gain, 3), -t.bottom.weight_lbs)
+            if best is None or key > best[0]:
+                # Smallest suitable base keeps big bases free for big tops
+                base = min(bottoms, key=lambda b: (b.length * b.width, -b.bottom.weight_lbs))
+                best = (key, t, base, rest_len)
+        if best is None:
+            return columns, False
+        _key, t, base, rest_len = best
+        base.top = t.bottom
+        columns.remove(t)
+        current = rest_len
+    return columns, True
+
+
+def _axles_for(total: float, moment: float) -> tuple:
+    """(steer, drive, trailer) for a cargo total and moment about the kingpin."""
+    trailer = moment / TRAILER["tandem_from_nose_in"]
+    pin = total - trailer
+    steer = max(TRAILER["steer_tare"] - round(pin * 0.05), TRAILER["steer_tare"] - 2500)
+    drive = TRAILER["drive_tare"] + round(pin * 1.05)
+    return steer, drive, trailer
+
+
+def _overload(steer: float, drive: float, trailer: float) -> float:
+    return (max(0, steer - TRAILER["steer_limit"]) + max(0, drive - TRAILER["drive_limit"])
+            + max(0, trailer - TRAILER["trailer_limit"]))
+
+
+def _order_score(rows: list, order: list) -> float:
     """
-    Create exactly max_stacks vertical pairs (bottom, top) — no more.
-    Stacking is a last resort: only call this when overflow > 0.
-    Returns (stack_top_map: dict[bottom_piece_id -> top_FreightPiece], floor_pieces: list).
+    Lower is better: axle overload dominates (full load, and what remains after
+    each delivery stop), then drive/trailer imbalance of the full load.
+    rows[i] = (depth, weight, inner_moment, stop).
     """
-    if max_stacks <= 0 or not pieces:
-        return {}, list(pieces)
+    start = 0.0
+    by_stop = {}                      # stop -> [weight, moment]
+    for i in order:
+        depth, weight, inner, stop = rows[i]
+        acc = by_stop.setdefault(stop, [0.0, 0.0])
+        acc[0] += weight
+        acc[1] += weight * start + inner
+        start += depth
+    total = sum(a[0] for a in by_stop.values())
+    moment = sum(a[1] for a in by_stop.values())
+    steer, drive, trailer = _axles_for(total, moment)
+    over = _overload(steer, drive, trailer)
+    for delivered in sorted(by_stop)[:-1]:
+        rem = [a for st, a in by_stop.items() if st > delivered]
+        over += _overload(*_axles_for(sum(a[0] for a in rem), sum(a[1] for a in rem)))
+    balance = abs(drive / TRAILER["drive_limit"] - trailer / TRAILER["trailer_limit"])
+    return over * 10 + balance * 10_000
 
-    trailer_h = TRAILER["interior_height_in"]
-    used_as_top = set()
-    stack_top_map: dict = {}
 
-    bottoms = sorted(
-        [p for p in pieces if p.stackable],
-        key=lambda p: p.length_in * p.width_in, reverse=True,
-    )
-    tops = sorted(pieces, key=lambda p: p.length_in * p.width_in)
+def _zone_ok(rows: list, order: list) -> bool:
+    """Stops never increase toward the doors (last stop at the nose)."""
+    return all(rows[order[k]][3] >= rows[order[k + 1]][3] for k in range(len(order) - 1))
 
-    for bottom in bottoms:
-        if len(stack_top_map) >= max_stacks:
+
+def _balanced_order(rows: list) -> list:
+    """Row order nose→tail: zones by stop, heavy rows mid-zone, then swaps/moves."""
+    n = len(rows)
+    if n < 2:
+        return list(range(n))
+    order = []
+    for stop in sorted({r[3] for r in rows}, reverse=True):
+        zone = [i for i in range(n) if rows[i][3] == stop]
+        by_weight = sorted(zone, key=lambda i: rows[i][1], reverse=True)
+        m = len(zone)
+        mid = m // 2
+        slots = [mid]
+        lo, hi = mid - 1, mid + 1
+        while lo >= 0 or hi < m:
+            if hi < m:
+                slots.append(hi)
+                hi += 1
+            if lo >= 0:
+                slots.append(lo)
+                lo -= 1
+        placed = [None] * m
+        for dest, idx in zip(slots, by_weight):
+            placed[dest] = idx
+        order += placed
+
+    best = _order_score(rows, order)
+    for _ in range(50):
+        improved = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                if rows[order[i]][3] != rows[order[j]][3]:
+                    continue   # rows only trade places within their stop's zone
+                cand = order[:]
+                cand[i], cand[j] = cand[j], cand[i]
+                sc = _order_score(rows, cand)
+                if sc < best - 1e-9:
+                    order, best, improved = cand, sc, True
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                cand = order[:]
+                cand.insert(j, cand.pop(i))
+                if not _zone_ok(rows, cand):
+                    continue
+                sc = _order_score(rows, cand)
+                if sc < best - 1e-9:
+                    order, best, improved = cand, sc, True
+        if not improved:
             break
-        if bottom.piece_id in used_as_top:
-            continue  # no triple stacking
-        if bottom.piece_id in stack_top_map:
-            continue
-        for top in tops:
-            if top.piece_id == bottom.piece_id:
-                continue
-            if top.piece_id in used_as_top:
-                continue
-            if top.piece_id in stack_top_map:
-                continue
-            if (top.length_in  <= bottom.length_in  and
-                top.width_in   <= bottom.width_in   and
-                top.height_in + bottom.height_in <= trailer_h and
-                top.weight_lbs <= bottom.weight_lbs):
-                stack_top_map[bottom.piece_id] = top
-                used_as_top.add(top.piece_id)
-                break
-
-    floor_pieces = [p for p in pieces if p.piece_id not in used_as_top]
-    return stack_top_map, floor_pieces
+    return order
 
 
-def plan_load(pieces: list, override: bool = False, excluded_ids: list = None) -> LoadPlan:
+def _relayout_rows(slots: list) -> float:
+    """Recompute each row's start from the floor pieces' lengths; returns total length."""
+    depth = {}
+    for s in slots:
+        if s.piece and s.tier == 0:
+            depth[s.row] = max(depth.get(s.row, 0.0), s.piece.length_in)
+    start, cursor = {}, 0.0
+    for r in sorted(depth):
+        start[r] = cursor
+        cursor += depth[r]
+    for s in slots:
+        if s.row in start:
+            s.row_start_in = start[s.row]
+    return cursor
+
+
+def plan_load(pieces: list, override: bool = False, excluded_ids: list = None,
+              stop_order: list = None) -> LoadPlan:
     """
-    Pair pieces heaviest+lightest for balanced rows, then order rows center-heavy
-    so the heaviest rows sit near mid-trailer (best for drive/trailer axle balance).
-    Pieces marked stackable may receive a smaller/lighter piece on top (tier=1).
+    Build a load plan that fits the trailer, stacks only as needed and keeps
+    axle and side-to-side weight balanced. Pieces that won't fit are listed in
+    LoadPlan.unplaced and called out in the violations.
     """
-    if not pieces:
-        return LoadPlan([], {}, [], 0.0, override, excluded_ids or [])
-
-    active = [p for p in pieces if p.piece_id not in (excluded_ids or [])]
+    excluded_ids = excluded_ids or []
+    L, W, H = (TRAILER["interior_length_in"], TRAILER["interior_width_in"],
+               TRAILER["interior_height_in"])
+    active = [p for p in pieces if p.piece_id not in excluded_ids]
     if not active:
-        return LoadPlan([], {}, [], 0.0, override, excluded_ids or [])
+        return LoadPlan([], {}, [], 0.0, override, excluded_ids, [], [])
 
-    # Pieces wider than 70% of trailer must alternate left/right each row
-    # Pieces wider than half the trailer (but ≤70%) go plain center
-    half_w      = TRAILER["interior_width_in"] / 2
-    alt_w_thresh = TRAILER["interior_width_in"] * 0.70
+    # Delivery order: the given route order, then any other stops by ID
+    rank = {sid: i + 1 for i, sid in enumerate(stop_order or [])}
     for p in active:
-        if p.width_in > alt_w_thresh:
+        p.seq = rank.get(p.stop, len(rank) + p.stop)
+
+    # Wide pieces can't pair: >70% of the width alternates against a wall, >50% centres
+    for p in active:
+        if p.width_in > W * 0.70:
             p.placement = "alt_center"
-        elif p.width_in > half_w:
+        elif p.width_in > W / 2:
             p.placement = "center"
 
-    # Separate center and auto pieces ("alt_center" is algorithmically identical to "center")
-    center_pieces = [p for p in active if p.placement in ("center", "alt_center")]
-    auto_pieces   = [p for p in active if p.placement not in ("center", "alt_center")]
-
-    # ── Center pieces: preserve input order (nose to tail), stack overflow in middle ──
-    center_sorted   = sorted(center_pieces, key=lambda p: p.piece_id)
-    center_overflow = _overflow_count(center_pieces, mode='center')
-    if center_overflow > 0 and center_overflow < len(center_sorted):
-        center_floor_list = center_sorted[:-center_overflow]   # first N onto floor in order
-        center_top_list   = center_sorted[-center_overflow:]   # last overflow go on top
-        # Stack tops on the middle floor pieces for balanced weight
-        n_cf      = len(center_floor_list)
-        mid_start = (n_cf - center_overflow) // 2
-        center_stack_map = {
-            center_floor_list[mid_start + i].piece_id: center_top_list[i]
-            for i in range(center_overflow)
-        }
-    else:
-        center_floor_list = center_sorted
-        center_stack_map  = {}
-
-    # ── Auto pieces: existing heaviest+lightest pairing ──────────────────────
-    auto_overflow              = _overflow_count(auto_pieces, mode='auto')
-    auto_stack_map, floor_pieces = _find_stack_pairs(auto_pieces, max_stacks=auto_overflow)
-    stack_top_map = {**center_stack_map, **auto_stack_map}
-
-    # Center floor pieces each occupy their own full-width row, in input order
-    center_units = [(p, None, True) for p in center_floor_list]
-
-    # Floor pieces (bottoms + unmatched) are paired side-by-side heaviest+lightest
-    n = len(floor_pieces)
-    sorted_p = sorted(floor_pieces, key=lambda p: p.weight_lbs, reverse=True)
-    auto_units = []
-    lo, hi = 0, n - 1
-    while lo <= hi:
-        a = sorted_p[lo]
-        b = sorted_p[hi] if lo != hi else None
-        auto_units.append((a, b, False))
-        lo += 1
-        hi -= 1
-
-    # Center units stay in input order (nose to tail) — no reordering.
-    # Auto units get center-heavy placement (heaviest pair → middle row).
-    auto_units.sort(
-        key=lambda u: u[0].weight_lbs + (u[1].weight_lbs if u[1] else 0),
-        reverse=True
-    )
-    n_auto = len(auto_units)
-    if n_auto:
-        mid = n_auto // 2
-        order = [mid]
-        lo_i, hi_i = mid - 1, mid + 1
-        while lo_i >= 0 or hi_i < n_auto:
-            if hi_i < n_auto:
-                order.append(hi_i)
-                hi_i += 1
-            if lo_i >= 0:
-                order.append(lo_i)
-                lo_i -= 1
-        auto_assigned = [None] * n_auto
-        for dest, unit in zip(order, auto_units):
-            auto_assigned[dest] = unit
-    else:
-        auto_assigned = []
-
-    # Final row order: center pieces nose-to-tail first, then auto pairs
-    row_assignments = center_units + auto_assigned
-
-    # Build slots (nose to tail) with cumulative row depths
-    slots = []
-    cursor = 0.0
-    for row_idx, unit in enumerate(row_assignments):
-        a_piece, b_piece, is_center = unit
-        row_depth = max(a_piece.length_in, b_piece.length_in if b_piece else 0)
-        if is_center:
-            slots.append(PalletSlot(row=row_idx, col=0, piece=a_piece,
-                                    row_start_in=cursor, is_center=True, tier=0))
-            slots.append(PalletSlot(row=row_idx, col=1, piece=a_piece,
-                                    row_start_in=cursor, is_center=True, tier=0))
-            if a_piece.piece_id in stack_top_map:
-                top = stack_top_map[a_piece.piece_id]
-                slots.append(PalletSlot(row=row_idx, col=0, piece=top,
-                                        row_start_in=cursor, is_center=True, tier=1))
-                slots.append(PalletSlot(row=row_idx, col=1, piece=top,
-                                        row_start_in=cursor, is_center=True, tier=1))
+    unplaced, loadable = [], []
+    for p in active:
+        if p.length_in > L:
+            unplaced.append((p, f"longer than trailer ({p.length_in:.0f}\" > {L}\")"))
+        elif p.width_in > W:
+            unplaced.append((p, f"wider than trailer ({p.width_in:.0f}\" > {W}\")"))
+        elif p.height_in > H:
+            unplaced.append((p, f"taller than trailer ({p.height_in:.0f}\" > {H}\")"))
         else:
-            if row_idx % 2 == 0:
-                left_piece, right_piece = a_piece, b_piece
+            loadable.append(p)
+
+    columns, fits = _pack_columns(loadable)
+    if not fits:
+        # Load in delivery order, then list order, so what's left off comes from
+        # the last-delivered stop — never a scattering of every stop's freight
+        priority = sorted(loadable, key=lambda p: p.seq)   # stable: keeps list order
+        lo, hi, best_cols = 0, len(priority), []
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            cols, ok = _pack_columns(priority[:mid])
+            if ok:
+                lo, best_cols = mid, cols
             else:
-                left_piece, right_piece = b_piece, a_piece
-            slots.append(PalletSlot(row=row_idx, col=0, piece=left_piece,
-                                    row_start_in=cursor, is_center=False, tier=0))
-            slots.append(PalletSlot(row=row_idx, col=1, piece=right_piece,
-                                    row_start_in=cursor, is_center=False, tier=0))
-            # Add tier=1 slots for any stacked tops
-            for col_idx, floor_p in ((0, left_piece), (1, right_piece)):
-                if floor_p and floor_p.piece_id in stack_top_map:
-                    top = stack_top_map[floor_p.piece_id]
-                    slots.append(PalletSlot(row=row_idx, col=col_idx, piece=top,
-                                            row_start_in=cursor, is_center=False, tier=1))
-        cursor += row_depth
+                hi = mid - 1
+        columns = best_cols
+        placed_ids = {c.bottom.piece_id for c in columns} | \
+                     {c.top.piece_id for c in columns if c.top}
+        for p in loadable:
+            if p.piece_id not in placed_ids:
+                unplaced.append((p, "no room left on the trailer"))
+
+    rows = _floor_rows(columns)
+    row_stats = [(max(c.length for c in r), sum(c.weight for c in r),
+                  sum(c.moment_in_row for c in r), _row_stop(r)) for r in rows]
+    order = _balanced_order(row_stats)
+
+    # Choose each row's walls to balance left/right weight, then build slots nose→tail
+    ordered_rows = [rows[ri] for ri in order]
+    sides = _balance_sides(ordered_rows)
+    slots, cursor = [], 0.0
+    for row_idx, (row, state) in enumerate(zip(ordered_rows, sides)):
+        if len(row) == 1 and row[0].full_row:
+            c = row[0]
+            side = ""
+            if c.bottom.placement == "alt_center":
+                side = {LEFT: "left", RIGHT: "right", CENTER: "center"}[state]
+            for tier, piece in ((0, c.bottom), (1, c.top)):
+                if piece is None:
+                    continue
+                for col in (0, 1):
+                    slots.append(PalletSlot(row=row_idx, col=col, piece=piece,
+                                            row_start_in=cursor, is_center=True,
+                                            tier=tier, side=side))
+        else:
+            left, right = _row_walls(row, state == RIGHT)
+            for col, c in ((0, left), (1, right)):
+                slots.append(PalletSlot(row=row_idx, col=col, piece=c.bottom if c else None,
+                                        row_start_in=cursor, tier=0))
+                if c and c.top:
+                    slots.append(PalletSlot(row=row_idx, col=col, piece=c.top,
+                                            row_start_in=cursor, tier=1))
+        cursor += max(c.length for c in row)
 
     axle_weights, violations = _calc_axle_weights(slots, override)
-    return LoadPlan(slots, axle_weights, violations, cursor, override, excluded_ids or [])
+    stop_axles = _stop_axles(slots)
+    for delivered, steer, drive, trailer in stop_axles:
+        for name, val, lim in (("STEER", steer, "steer_limit"), ("DRIVE", drive, "drive_limit"),
+                               ("TRAILER TANDEM", trailer, "trailer_limit")):
+            if val > TRAILER[lim]:
+                violations.append(f"AFTER STOP {delivered} DELIVERY: {name} {val:,.0f} lb > "
+                                  f"{TRAILER[lim]:,} lb limit")
+    if unplaced:
+        violations.insert(0, _not_fit_message(unplaced))
+    order = sorted({p.stop for p in active}, key=lambda sid: rank.get(sid, len(rank) + sid))
+    return LoadPlan(slots, axle_weights, violations, cursor, override, excluded_ids, unplaced,
+                    stop_axles, stop_order=order)
+
+
+# Row side states: LEFT = heavier column / wall-hugging crate on the left wall,
+# RIGHT = mirrored, CENTER = wall-hugging (alt-center) crate centred in the width.
+LEFT, RIGHT, CENTER = 0, 1, 2
+
+
+def _row_walls(row: list, flip) -> tuple:
+    """(left column, right column) for a pair or lone-column row; flip swaps sides."""
+    cols = sorted(row, key=lambda c: c.weight, reverse=True)
+    left, right = (cols[0], cols[1] if len(cols) > 1 else None)
+    return (right, left) if flip else (left, right)
+
+
+def _is_wall_crate(row: list) -> bool:
+    """A single crate too wide to pair, carried against one wall (alt-center)."""
+    return len(row) == 1 and row[0].full_row and row[0].bottom.placement == "alt_center"
+
+
+def _row_lateral(row: list, state: int) -> list:
+    """[(seq, weight × offset right of centre)] for every piece in a row, as placed."""
+    W = TRAILER["interior_width_in"]
+    out = []
+    if len(row) == 1 and row[0].full_row:
+        c = row[0]
+        if c.bottom.placement != "alt_center" or state == CENTER:
+            return []                                   # centred: no lateral moment
+        for p in (c.bottom, c.top):
+            if p is not None:
+                off = (W - min(p.width_in, W)) / 2
+                out.append((p.seq, p.weight_lbs * (off if state == RIGHT else -off)))
+        return out
+    left, right = _row_walls(row, state == RIGHT)
+    for col, c in ((0, left), (1, right)):
+        if c is None:
+            continue
+        for p in (c.bottom, c.top):
+            if p is not None:
+                w = min(p.width_in, W)
+                yc = w / 2 if col == 0 else W - w / 2   # each piece sits against its wall
+                out.append((p.seq, p.weight_lbs * (yc - W / 2)))
+    return out
+
+
+LATERAL_AFTER_STOP_WEIGHT = 0.5   # balance after each delivery counts half as much as at departure
+EXHAUSTIVE_SIDE_COMBOS = 4096     # side combinations tried outright before switching to local search
+
+
+def _balance_sides(rows: list) -> list:
+    """
+    Side state per row (LEFT / RIGHT / CENTER) minimising left/right imbalance
+    of the full load plus, at half weight, the load left after each delivery.
+
+    Consecutive wall-hugging crates must alternate walls row by row — the
+    correct way to load them — so a run only chooses its starting wall, and
+    may centre its tail-most crate when that evens out the count. Side-by-side
+    rows choose freely which column goes on which wall.
+    """
+    n = len(rows)
+    wall = [_is_wall_crate(r) for r in rows]
+    states = [(LEFT, RIGHT, CENTER) if wall[i] else (LEFT, RIGHT) for i in range(n)]
+    lateral = [{st: _row_lateral(rows[i], st) for st in states[i]} for i in range(n)]
+    seqs = sorted({sq for lat in lateral for moments in lat.values() for sq, _ in moments})
+    thresholds = seqs[:-1]                       # deliveries after which freight remains
+    # vec[i][state] = row i's moment for [full load, after delivery 1, after delivery 2, …]
+    vec = [{st: [sum(m for _, m in moments)] +
+                [sum(m for sq, m in moments if sq > th) for th in thresholds]
+            for st, moments in lat.items()} for lat in lateral]
+    K = len(thresholds) + 1
+
+    def cost(flags):
+        acc = [0.0] * K
+        for v, f in zip(vec, flags):
+            row_v = v[f]
+            for k in range(K):
+                acc[k] += row_v[k]
+        return abs(acc[0]) + LATERAL_AFTER_STOP_WEIGHT * sum(abs(a) for a in acc[1:])
+
+    # Decision groups: each run of wall crates (alternating pattern options) and
+    # each side-by-side row whose side matters (left / right)
+    groups = []                                   # [(row indices, [state tuples])]
+    i = 0
+    while i < n:
+        if wall[i]:
+            j = i
+            while j + 1 < n and wall[j + 1]:
+                j += 1
+            run = list(range(i, j + 1))
+            pats = [tuple((start + k) % 2 for k in range(len(run))) for start in (RIGHT, LEFT)]
+            pats += [pat[:-1] + (CENTER,) for pat in pats]   # centring wins only if strictly better
+            groups.append((run, pats))
+            i = j + 1
+        else:
+            if vec[i][LEFT] != vec[i][RIGHT]:
+                groups.append(([i], [(LEFT,), (RIGHT,)]))
+            i += 1
+
+    def apply(choice):
+        flags = [LEFT] * n
+        for (idx, pats), k in zip(groups, choice):
+            for r, st in zip(idx, pats[k]):
+                flags[r] = st
+        return flags
+
+    combos = 1
+    for _, pats in groups:
+        combos *= len(pats)
+    if combos <= EXHAUSTIVE_SIDE_COMBOS:
+        best, best_flags = None, apply([0] * len(groups))
+        for choice in itertools.product(*[range(len(pats)) for _, pats in groups]):
+            trial = apply(choice)
+            c = cost(trial)
+            if best is None or c < best - 1e-9:
+                best, best_flags = c, trial
+        return best_flags
+    # Long loads: start from each group's first option, then change one or two
+    # groups at a time while that improves balance
+    choice = [0] * len(groups)
+    best = cost(apply(choice))
+    improved = True
+    while improved:
+        improved = False
+        for g in range(len(groups)):
+            for k in range(len(groups[g][1])):
+                if k != choice[g]:
+                    trial = choice[:]
+                    trial[g] = k
+                    c = cost(apply(trial))
+                    if c < best - 1e-9:
+                        best, choice, improved = c, trial, True
+        for a in range(len(groups)):
+            for b in range(a + 1, len(groups)):
+                for ka in range(len(groups[a][1])):
+                    for kb in range(len(groups[b][1])):
+                        trial = choice[:]
+                        trial[a], trial[b] = ka, kb
+                        c = cost(apply(trial))
+                        if c < best - 1e-9:
+                            best, choice, improved = c, trial, True
+    return apply(choice)
+
+
+def _stop_axles(slots: list) -> list:
+    """Axle weights of the load left on the trailer after each delivery but the last."""
+    stop_of = {s.piece.seq: s.piece.stop for s in slots if s.piece}
+    x_of = {b[0].piece_id: b[1] for b in _slot_boxes(slots)}   # honours manual moves
+    out = []
+    for delivered in sorted(stop_of)[:-1]:
+        total = moment = 0.0
+        for s in slots:
+            if s.piece is None or s.piece.seq <= delivered or (s.is_center and s.col == 1):
+                continue
+            total += s.piece.weight_lbs
+            moment += s.piece.weight_lbs * (x_of.get(s.piece.piece_id, s.row_start_in)
+                                            + s.piece.length_in / 2)
+        steer, drive, trailer = _axles_for(total, moment)
+        out.append((stop_of[delivered], round(steer), round(drive), round(trailer)))
+    return out
+
+
+def plan_stops(plan: Optional[LoadPlan]) -> list:
+    """Stop IDs present in a plan, in delivery order (first delivered first)."""
+    if not plan or not plan.slots:
+        return []
+    present = {s.piece.stop for s in plan.slots if s.piece}
+    order = [sid for sid in (plan.stop_order or []) if sid in present]
+    return order + sorted(present - set(order))
+
+
+def stop_label(plan: Optional[LoadPlan], stop: int, short: bool = False) -> str:
+    """'S2' / 'Stop 2 — Coldwater, MI' using the plan's stop names."""
+    if short:
+        return f"S{stop}"
+    names = (plan.stop_names if plan and plan.stop_names else None) or []
+    name = names[stop - 1] if stop - 1 < len(names) else ""
+    return f"Stop {stop}" + (f" — {name}" if name else "")
+
+
+def _not_fit_message(unplaced: list) -> str:
+    wt = sum(p.weight_lbs for p, _ in unplaced)
+    names = [p.crate_label for p, _ in unplaced]
+    labels = ", ".join(names[:10]) + (f" +{len(names) - 10} more" if len(names) > 10 else "")
+    return (f"DOES NOT FIT: {len(unplaced)} piece(s), {wt:,.0f} lb not loaded — {labels}")
 
 
 def _calc_axle_weights(slots: list, override: bool) -> tuple:
@@ -323,6 +715,7 @@ def _calc_axle_weights(slots: list, override: bool) -> tuple:
 
     # Build a map for height-clearance checks: (row, col) -> [tier0_piece, tier1_piece]
     stack_map: dict = {}
+    x_of = {b[0].piece_id: b[1] for b in _slot_boxes(slots)}   # honours manual moves
     for slot in slots:
         if slot.piece is None:
             continue
@@ -330,7 +723,7 @@ def _calc_axle_weights(slots: list, override: bool) -> tuple:
             continue  # center piece already counted via col=0
         key = (slot.row, slot.col)
         stack_map.setdefault(key, {})[slot.tier] = slot.piece
-        center = slot.row_start_in + slot.piece.length_in / 2.0
+        center = x_of.get(slot.piece.piece_id, slot.row_start_in) + slot.piece.length_in / 2.0
         total_cargo += slot.piece.weight_lbs
         moment += slot.piece.weight_lbs * center
 
@@ -376,6 +769,218 @@ def _calc_axle_weights(slots: list, override: bool) -> tuple:
     return aw, v
 
 
+# ── Stops, locations and trucks ──────────────────────────────────────────────
+# A shipment has up to MAX_STOPS delivery stops (each with an address or GPS
+# coordinates) and an origin. Stops are routed nearest-first from the origin;
+# freight is split into trucks along that route, one stop per truck where
+# possible. When a stop won't fit the user chooses: move the whole stop to a
+# new truck, or load what fits and ship the rest another way.
+MAX_PAYLOAD_LBS = 45_000          # legal freight weight for a 53' van at 80,000 lb gross
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OSRM_TABLE_URL = "https://router.project-osrm.org/table/v1/driving/"
+HTTP_USER_AGENT = "FreightLoader/1.0 (desktop load planner)"
+
+
+def parse_coords(text: str) -> Optional[tuple]:
+    """
+    (lat, lon) from typed GPS text, or None if it isn't coordinates.
+    Accepts "42.97, -85.67", "42.97 -85.67", "42.97°N 85.67°W" and Google Maps
+    links containing "@42.97,-85.67".
+    """
+    if not text:
+        return None
+    t = text.strip()
+    m = re.search(r"@(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)", t)
+    if m:
+        lat, lon = float(m.group(1)), float(m.group(2))
+    else:
+        m = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*°?\s*([NSns])?\s*[,;\s]\s*"
+                         r"(-?\d+(?:\.\d+)?)\s*°?\s*([EWew])?\s*", t)
+        if not m:
+            return None
+        lat, lon = float(m.group(1)), float(m.group(3))
+        if m.group(2) and m.group(2).upper() == "S":
+            lat = -abs(lat)
+        if m.group(4) and m.group(4).upper() == "W":
+            lon = -abs(lon)
+    if -90 <= lat <= 90 and -180 <= lon <= 180:
+        return lat, lon
+    return None
+
+
+def geocode_address(address: str) -> Optional[tuple]:
+    """(lat, lon, display_name) from OpenStreetMap Nominatim, or None. Needs internet."""
+    import urllib.parse
+    import urllib.request
+    url = NOMINATIM_URL + "?" + urllib.parse.urlencode(
+        {"q": address, "format": "json", "limit": 1, "countrycodes": "us,ca,mx"})
+    req = urllib.request.Request(url, headers={"User-Agent": HTTP_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        results = json.loads(resp.read().decode("utf-8"))
+    if not results:
+        return None
+    r = results[0]
+    return float(r["lat"]), float(r["lon"]), r.get("display_name", "")
+
+
+def road_distance_matrix(points: list) -> list:
+    """Road miles between every pair of (lat, lon) points via the public OSRM server."""
+    import urllib.request
+    coords = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in points)
+    req = urllib.request.Request(OSRM_TABLE_URL + coords + "?annotations=distance",
+                                 headers={"User-Agent": HTTP_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if data.get("code") != "Ok":
+        raise RuntimeError(data.get("message", "routing server error"))
+    return [[(d or 0.0) / 1609.344 for d in row] for row in data["distances"]]
+
+
+def straight_miles(a: tuple, b: tuple) -> float:
+    """Great-circle distance in miles between two (lat, lon) points."""
+    lat1, lon1, lat2, lon2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = (math.sin((lat2 - lat1) / 2) ** 2 +
+         math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2)
+    return 3958.8 * 2 * math.asin(math.sqrt(h))
+
+
+def route_order(stop_ids: list, coords: dict, dist=None, origin_key="origin") -> list:
+    """
+    Delivery order for `stop_ids`: nearest-neighbour from the origin, then
+    2-opt to remove crossings. `coords` maps "origin" and stop IDs to (lat, lon);
+    `dist(a_key, b_key)` gives miles (straight-line by default). Stops without
+    a location keep their ID order after the located ones; with no origin the
+    order is simply by stop ID.
+    """
+    if dist is None:
+        def dist(a, b):
+            return straight_miles(coords[a], coords[b])
+    located = [sid for sid in stop_ids if sid in coords]
+    unlocated = sorted(sid for sid in stop_ids if sid not in coords)
+    if origin_key not in coords or len(located) < 2:
+        return sorted(located) + unlocated if origin_key not in coords else \
+            located + unlocated
+    path, cur, left = [], origin_key, set(located)
+    while left:
+        nxt = min(left, key=lambda sid: (dist(cur, sid), sid))
+        path.append(nxt)
+        left.remove(nxt)
+        cur = nxt
+
+    def length(seq):
+        pts = [origin_key] + seq
+        return sum(dist(pts[k], pts[k + 1]) for k in range(len(pts) - 1))
+    best = length(path)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(len(path) - 1):
+            for j in range(i + 1, len(path)):
+                cand = path[:i] + path[i:j + 1][::-1] + path[j + 1:]
+                cl = length(cand)
+                if cl < best - 1e-9:
+                    path, best, improved = cand, cl, True
+    return path + unlocated
+
+
+def _normalize_placement(p: FreightPiece):
+    W = TRAILER["interior_width_in"]
+    if p.width_in > W * 0.70:
+        p.placement = "alt_center"
+    elif p.width_in > W / 2:
+        p.placement = "center"
+
+
+def physically_loadable(p: FreightPiece) -> Optional[str]:
+    """None if the piece can go in the trailer at all, else the reason it can't."""
+    L, W, H = (TRAILER["interior_length_in"], TRAILER["interior_width_in"],
+               TRAILER["interior_height_in"])
+    if p.length_in > L:
+        return f"longer than trailer ({p.length_in:.0f}\" > {L}\")"
+    if p.width_in > W:
+        return f"wider than trailer ({p.width_in:.0f}\" > {W}\")"
+    if p.height_in > H:
+        return f"taller than trailer ({p.height_in:.0f}\" > {H}\")"
+    if p.weight_lbs > MAX_PAYLOAD_LBS:
+        return f"heavier than a truck can legally carry ({p.weight_lbs:,.0f} lb)"
+    return None
+
+
+def fits_one_truck(pieces: list, stop_rank: dict) -> bool:
+    """True if `pieces` fit one trailer by floor space (with stacking) and payload."""
+    if sum(p.weight_lbs for p in pieces) > MAX_PAYLOAD_LBS:
+        return False
+    for p in pieces:
+        _normalize_placement(p)
+        p.seq = stop_rank.get(p.stop, len(stop_rank) + p.stop)
+    return _pack_columns(pieces)[1]
+
+
+def split_into_trucks(pieces: list, route: list, decide) -> tuple:
+    """
+    Assign pieces to trucks following `route` (stop IDs in global delivery order).
+    Returns (trucks, ship_other, impossible): trucks is a list of piece-ID
+    lists, ship_other the IDs to ship another way, impossible [(piece, reason)].
+
+    decide(info) is called when a stop doesn't fully fit and returns one of
+      "new_truck"   — move all of the stop's remaining pieces to a new truck
+      "ship_other"  — load what fits, ship the rest another way
+      "continue"    — load what fits, carry the rest on a new truck
+    info: {"stop", "truck" (1-based), "truck_empty", "pieces" (remaining),
+           "fit" (how many fit), "fit_lbs", "rest_lbs"}.
+    """
+    rank = {sid: i + 1 for i, sid in enumerate(route)}
+    impossible = [(p, why) for p in pieces if (why := physically_loadable(p))]
+    bad = {p.piece_id for p, _ in impossible}
+    by_stop = {}
+    for p in pieces:
+        if p.piece_id not in bad:
+            by_stop.setdefault(p.stop, []).append(p)
+    stops = [sid for sid in route if sid in by_stop] + \
+            sorted(sid for sid in by_stop if sid not in rank)
+
+    trucks, other = [[]], []
+    for sid in stops:
+        remaining = list(by_stop[sid])
+        while remaining:
+            cur = trucks[-1]
+            if fits_one_truck(cur + remaining, rank):
+                cur.extend(remaining)
+                break
+            # Largest prefix of this stop (in list order) that still fits
+            lo, hi = 0, len(remaining)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if fits_one_truck(cur + remaining[:mid], rank):
+                    lo = mid
+                else:
+                    hi = mid - 1
+            fit = lo
+            choice = decide({
+                "stop": sid, "truck": len(trucks), "truck_empty": not cur,
+                "pieces": remaining, "fit": fit,
+                "fit_lbs": sum(p.weight_lbs for p in remaining[:fit]),
+                "rest_lbs": sum(p.weight_lbs for p in remaining[fit:]),
+            })
+            if choice == "new_truck" and cur:
+                trucks.append([])
+                continue
+            cur.extend(remaining[:fit])
+            rest = remaining[fit:]
+            if choice == "continue" or (choice == "new_truck" and not cur):
+                trucks.append([])
+                remaining = rest
+                if fit == 0 and not cur:   # can't make progress — ship the rest
+                    other.extend(rest)
+                    break
+            else:
+                other.extend(rest)
+                break
+    trucks = [t for t in trucks if t]
+    return ([[p.piece_id for p in t] for t in trucks] or [[]],
+            [p.piece_id for p in other], impossible)
+
+
 # ── Save / Load plan files ────────────────────────────────────────────────────
 def _safe_name(s: str) -> str:
     """Strip characters unsafe for filenames, collapse whitespace to underscores."""
@@ -390,7 +995,8 @@ def make_base_filename(info: ShipmentInfo) -> str:
     return '_'.join(parts) if parts else 'load_plan'
 
 def save_plan_json(pieces: list, info: ShipmentInfo, limits: dict,
-                   excluded_ids: list, override: bool, path: str):
+                   excluded_ids: list, override: bool, path: str,
+                   securement: list = None, shipment: dict = None):
     data = {
         "version": 1,
         "saved_at": datetime.datetime.now().isoformat(timespec='seconds'),
@@ -400,6 +1006,7 @@ def save_plan_json(pieces: list, info: ShipmentInfo, limits: dict,
             "trailer_num":   info.trailer_num,
             "bol_num":       info.bol_num,
             "date":          info.date,
+            "stop_names":    list(info.stop_names),
         },
         "axle_limits": limits,
         "override":     override,
@@ -417,15 +1024,18 @@ def save_plan_json(pieces: list, info: ShipmentInfo, limits: dict,
                 "notes":       p.notes,
                 "placement":   p.placement,
                 "stackable":   p.stackable,
+                "stop":        p.stop,
             }
             for p in pieces
         ],
+        "securement": securement or [],
+        "shipment_plan": shipment or {},
     }
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
 
 def load_plan_json(path: str):
-    """Returns (pieces, info, limits, excluded_ids, override)."""
+    """Returns (pieces, info, limits, excluded_ids, override, securement, shipment_plan)."""
     with open(path) as f:
         data = json.load(f)
     s = data['shipment']
@@ -435,6 +1045,7 @@ def load_plan_json(path: str):
         trailer_num=s.get('trailer_num', ''),
         bol_num=s.get('bol_num', ''),
         date=s.get('date', ''),
+        stop_names=(list(s.get('stop_names', [])) + [""] * MAX_STOPS)[:MAX_STOPS],
     )
     pieces = [
         FreightPiece(
@@ -449,13 +1060,16 @@ def load_plan_json(path: str):
             notes=p.get('notes', ''),
             placement=p.get('placement', 'auto'),
             stackable=p.get('stackable', True),
+            stop=max(1, min(MAX_STOPS, int(p.get('stop', 1) or 1))),
         )
         for p in data['freight']
     ]
     limits = data.get('axle_limits', {'steer': 12000, 'drive': 34000, 'trailer': 34000})
     excluded_ids = data.get('excluded_ids', [])
     override = data.get('override', False)
-    return pieces, info, limits, excluded_ids, override
+    securement = data.get('securement', [])
+    shipment = data.get('shipment_plan', {}) or {}
+    return pieces, info, limits, excluded_ids, override, securement, shipment
 
 
 # ── PDF helpers ───────────────────────────────────────────────────────────────
@@ -467,35 +1081,484 @@ def _pdf_writer(path: str):
     return w
 
 
+def securement_summary(items: list) -> str:
+    """'1 load bar, 2 straps, 4 airbags' (empty string when there are none)."""
+    counts = {k: 0 for k in SECUREMENT_KINDS}
+    for item in items or []:
+        counts[item["kind"]] = counts.get(item["kind"], 0) + 1
+    return ", ".join(f"{n} {SECUREMENT_KINDS[k].lower()}{'s' if n != 1 else ''}"
+                     for k, n in counts.items() if n)
+
+
+# ── Shared to-scale renderers (screen tabs + PDF) ─────────────────────────────
+def _draw_securement_footprint(painter: QPainter, r: QRectF, kind: str, color: QColor,
+                               u: float, translucent: bool = False):
+    """Draw one securement part already mapped to a 2D rect (top or side view)."""
+    min_t = 1.6 * u   # keep thin parts (straps) visible
+    if r.width() < min_t:
+        r = QRectF(r.center().x() - min_t / 2, r.y(), min_t, r.height())
+    if r.height() < min_t:
+        r = QRectF(r.x(), r.center().y() - min_t / 2, r.width(), min_t)
+    if kind == "airbag":
+        if translucent:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#5d6d7e"), 0.9 * u, Qt.PenStyle.DashLine))
+        else:
+            painter.setBrush(QBrush(color))
+            painter.setPen(QPen(QColor("#7f8c8d"), 0.8 * u))
+        rad = min(r.width(), r.height()) * 0.4
+        painter.drawRoundedRect(r, rad, rad)
+    else:
+        painter.setBrush(QBrush(color))
+        painter.setPen(QPen(color.darker(160), 0.5 * u))
+        painter.drawRect(r)
+
+
+def _draw_top_plan(painter: QPainter, rect: QRectF, plan: Optional[LoadPlan],
+                   securement: list = None, u: float = 1.0, geom: dict = None) -> dict:
+    """
+    To-scale top view, nose at top, left wall (Position A) on the left — the
+    same geometry as the 3D view. Row notes fill the space to the right.
+    Shared by the Top View tab and the floor-plan PDF; `u` scales line widths
+    and spacing (1.0 on screen). Returns {(row, col): QRectF} for hit-testing.
+    """
+    L, W = TRAILER["interior_length_in"], TRAILER["interior_width_in"]
+    multi = len(plan_stops(plan)) > 1
+    LBL, END, LEGEND = 30 * u, 18 * u, (32 if multi else 16) * u
+    s = min((rect.height() - 2 * END - LEGEND) / L, rect.width() * 0.40 / W)
+    tw, th = W * s, L * s
+    tx, ty = rect.x() + LBL, rect.y() + END
+    note_x = tx + tw + 12 * u
+    note_w = max(10.0, rect.right() - note_x)
+    center = Qt.AlignmentFlag.AlignCenter
+    left_mid = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+
+    def to_rect(x, y, l, w):
+        return QRectF(tx + y * s, ty + x * s, w * s, l * s)
+
+    if geom is not None:   # lets the Top View map mouse pixels to trailer inches
+        geom.update(tx=tx, ty=ty, s=s)
+
+    # Trailer outline and end labels
+    painter.setPen(QPen(QColor("#444"), 2 * u))
+    painter.setBrush(QBrush(QColor("#f5f5f0")))
+    painter.drawRect(QRectF(tx, ty, tw, th))
+    painter.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+    painter.setPen(QColor("#333"))
+    painter.drawText(QRectF(tx - 40 * u, rect.y(), tw + 80 * u, END), center, "▲ NOSE")
+    painter.drawText(QRectF(tx - 40 * u, ty + th, tw + 80 * u, END), center, "DOORS")
+    painter.setFont(QFont("Arial", 6))
+    painter.setPen(QColor("#777"))
+    painter.drawText(QRectF(tx, ty + th + 1 * u, 20 * u, END), Qt.AlignmentFlag.AlignLeft, "L")
+    painter.drawText(QRectF(tx + tw - 20 * u, ty + th + 1 * u, 20 * u, END),
+                     Qt.AlignmentFlag.AlignRight, "R")
+
+    # Axle reference lines (labels right-aligned in the notes column)
+    for depth, label, color in [(36, "Drive axles", "#e67e00"),
+                                (TRAILER["tandem_from_nose_in"], "Trailer axles", "#c0392b")]:
+        ay = ty + depth * s
+        painter.setPen(QPen(QColor(color), 1.2 * u, Qt.PenStyle.DashLine))
+        painter.drawLine(QPointF(tx, ay), QPointF(tx + tw, ay))
+        painter.setFont(QFont("Arial", 6))
+        painter.setPen(QColor(color))
+        painter.drawText(QRectF(note_x, ay - 11 * u, note_w, 11 * u),
+                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, label)
+
+    if not plan or not plan.slots:
+        return {}
+
+    items = securement or []
+    boxes = _crate_boxes(plan)
+    box_of = {b[0].piece_id: b for b in boxes}
+    tops = {(sl.row, sl.col): sl.piece for sl in plan.slots
+            if sl.tier == 1 and sl.piece and not (sl.is_center and sl.col == 1)}
+    hits = {}
+    deferred = []   # labels/badges drawn last so straps don't cover them
+
+    # ── Crates (and open positions) ──────────────────────────────────────
+    for sl in plan.slots:
+        if sl.tier != 0 or (sl.is_center and sl.col == 1):
+            continue
+        if sl.piece is None:
+            other = next((o for o in plan.slots if o.row == sl.row and o.tier == 0
+                          and o.col != sl.col and o.piece), None)
+            depth = other.piece.length_in if other else 48
+            ow = min(other.piece.width_in, W) if other else W / 2
+            y0 = ow if sl.col == 1 else 0
+            r = to_rect(sl.row_start_in, y0, depth, W - ow).adjusted(u, u, -u, -u)
+            painter.setBrush(QBrush(VOID_BG))
+            painter.setPen(QPen(GRAY_LINE, u, Qt.PenStyle.DashLine))
+            painter.drawRect(r)
+            painter.setFont(QFont("Arial", 6))
+            painter.setPen(QColor("#999"))
+            painter.drawText(r, center, "open")
+            hits[(sl.row, sl.col)] = r
+            continue
+
+        p, x, y, z, l, w, h, _t = box_of[sl.piece.piece_id]
+        r = to_rect(x, y, l, w).adjusted(0.5 * u, 0.5 * u, -0.5 * u, -0.5 * u)
+        color = QColor(CRATE_COLORS[(p.piece_id - 1) % len(CRATE_COLORS)])
+        top = tops.get((sl.row, sl.col))
+        painter.setPen(QPen(QColor("#222"), 0.6 * u))
+        if top:
+            # 2-high: bottom crate peeks out as an offset "card" behind the top crate
+            painter.setBrush(QBrush(color.darker(135)))
+            painter.drawRect(r.translated(3 * u, 3 * u))
+            tb = box_of[top.piece_id]
+            tr = to_rect(tb[1], tb[2], tb[4], tb[5]).adjusted(0.5 * u, 0.5 * u, -0.5 * u, -0.5 * u)
+            painter.setBrush(QBrush(QColor(CRATE_COLORS[(top.piece_id - 1) % len(CRATE_COLORS)])))
+            painter.drawRect(tr)
+            deferred.append((tr.adjusted(2 * u, 10 * u, -2 * u, -1 * u),
+                             f"{top.crate_label} ▲\non {p.crate_label}",
+                             QRectF(tr.x() + 2 * u, tr.y() + 2 * u, 34 * u, 11 * u),
+                             p.stop if multi else None))
+        else:
+            painter.setBrush(QBrush(color))
+            painter.drawRect(r)
+            deferred.append((r.adjusted(2 * u, 1 * u, -2 * u, -1 * u),
+                             f"{p.crate_label}\n{p.weight_lbs:,.0f} lb", None,
+                             p.stop if multi else None))
+        hits[(sl.row, sl.col)] = r
+
+    # ── Securement footprints ────────────────────────────────────────────
+    order = {"airbag": 0, "load_bar": 1, "strap": 2}
+    for item in sorted(items, key=lambda it: order.get(it["kind"], 9)):
+        parts, err = securement_parts(item, boxes, items)
+        for x, y, z, l, w, h, color, _shape in parts:
+            _draw_securement_footprint(painter, to_rect(x, y, l, w), item["kind"], color, u)
+
+    for text_rect, text, badge, stop in deferred:
+        if stop is not None:
+            sb = QRectF(text_rect.right() - 18 * u, text_rect.bottom() - 12 * u, 18 * u, 11 * u)
+            painter.setBrush(QBrush(QColor(STOP_COLORS[(stop - 1) % len(STOP_COLORS)])))
+            painter.setPen(QPen(Qt.GlobalColor.white, 0.6 * u))
+            painter.drawRoundedRect(sb, 5 * u, 5 * u)
+            painter.setFont(QFont("Arial", 5, QFont.Weight.Bold))
+            painter.setPen(Qt.GlobalColor.white)
+            painter.drawText(sb, center, f"S{stop}")
+        if badge is not None:
+            painter.setBrush(QBrush(TAN))
+            painter.setPen(QPen(QColor("#8B6914"), 0.6 * u))
+            painter.drawRoundedRect(badge, 2 * u, 2 * u)
+            painter.setFont(QFont("Arial", 5, QFont.Weight.Bold))
+            painter.setPen(Qt.GlobalColor.white)
+            painter.drawText(badge, center, "2-HIGH")
+        # Shrink the label to fit narrow crates
+        size = 7
+        f = QFont("Arial", size, QFont.Weight.Bold)
+        while size > 4 and max(QFontMetrics(f, painter.device()).horizontalAdvance(line)
+                               for line in text.split("\n")) > text_rect.width():
+            size -= 0.5
+            f.setPointSizeF(size)
+        painter.setFont(f)
+        painter.setPen(Qt.GlobalColor.white)
+        painter.drawText(text_rect, center, text)
+
+    # ── Row labels + notes ───────────────────────────────────────────────
+    fm_font = QFont("Arial", 7)
+    for r_pos, row in enumerate(sorted(set(sl.row for sl in plan.slots))):
+        floor = [sl for sl in plan.slots if sl.row == row and sl.tier == 0 and sl.piece
+                 and not (sl.is_center and sl.col == 1)]
+        if not floor:
+            continue
+        xs = [(box_of[sl.piece.piece_id][1], box_of[sl.piece.piece_id][4]) for sl in floor]
+        start = min(x for x, _ in xs)
+        depth = max(x + l for x, l in xs) - start
+        cy = ty + (start + depth / 2) * s
+        painter.setFont(QFont("Arial", 7, QFont.Weight.Bold))
+        painter.setPen(QColor("#444"))
+        painter.drawText(QRectF(rect.x(), cy - 8 * u, LBL - 4 * u, 16 * u),
+                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"R{row + 1}")
+
+        bits, weight, pids = [], 0.0, set()
+        for sl in sorted(floor, key=lambda q: q.col):
+            top = tops.get((sl.row, sl.col))
+            weight += sl.piece.weight_lbs + (top.weight_lbs if top else 0)
+            pids.add(sl.piece.piece_id)
+            if top:
+                pids.add(top.piece_id)
+                bits.append(f"{sl.piece.crate_label} + {top.crate_label} (2-high)")
+            else:
+                bits.append(sl.piece.crate_label)
+            if sl.is_center and sl.piece.placement == "alt_center":
+                y_off = box_of[sl.piece.piece_id][2]
+                bits[-1] += (" ← LEFT" if y_off < 0.5 else
+                             " RIGHT →" if y_off + box_of[sl.piece.piece_id][5] > W - 0.5
+                             else " CENTER")
+        sec = securement_summary([it for it in items if it["piece_id"] in pids])
+        note = f"{' | '.join(bits)}  ·  {weight:,.0f} lb" + (f"  ·  {sec}" if sec else "")
+        if multi:
+            row_stops = [pc.stop for pc in sorted({sl.piece.seq: sl.piece for sl in floor}.values(),
+                                                    key=lambda pc: -pc.seq)]
+            note = f"[{'/'.join(f'S{st}' for st in row_stops)}]  " + note
+        painter.setFont(fm_font)
+        painter.setPen(QColor("#333"))
+        note = QFontMetrics(fm_font, painter.device()).elidedText(
+            note, Qt.TextElideMode.ElideRight, int(note_w))
+        painter.drawText(QRectF(note_x, cy - 8 * u, note_w, 16 * u), left_mid, note)
+
+    # ── Stop zone dividers ───────────────────────────────────────────────
+    if multi:
+        zone_rows = {}
+        for sl in plan.slots:
+            if sl.piece and sl.tier == 0:
+                zone_rows.setdefault(sl.row, [sl.row_start_in, set()])[1].add(sl.piece.seq)
+        ordered = [zone_rows[r] for r in sorted(zone_rows)]
+        # Divide between rows whose stops don't overlap; a row shared by two
+        # stops is itself the boundary, so it gets no divider
+        for (start_a, stops_a), (start_b, stops_b) in zip(ordered, ordered[1:]):
+            stop_a, stop_b = min(stops_a), max(stops_b)
+            seq_to_id = {sl.piece.seq: sl.piece.stop for sl in plan.slots if sl.piece}
+            if stop_a > stop_b:
+                stop_a, stop_b = seq_to_id[stop_a], seq_to_id[stop_b]
+                zy = ty + start_b * s
+                painter.setPen(QPen(QColor("#333"), 2 * u, Qt.PenStyle.DashDotLine))
+                painter.drawLine(QPointF(tx - 6 * u, zy), QPointF(tx + tw + 6 * u, zy))
+                painter.setFont(QFont("Arial", 6, QFont.Weight.Bold))
+                painter.setPen(QColor("#333"))
+                painter.drawText(QRectF(note_x, zy - 6 * u, note_w, 12 * u),
+                                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                                 f"▲ S{stop_a}   ─ ─   S{stop_b} ▼")
+
+    # ── Legend ───────────────────────────────────────────────────────────
+    lx, ly = note_x, rect.bottom() - LEGEND + 3 * u
+    if multi:
+        sx = note_x
+        painter.setFont(QFont("Arial", 6))
+        for st in plan_stops(plan):
+            sb = QRectF(sx, ly + 2 * u, 18 * u, 9 * u)
+            painter.setBrush(QBrush(QColor(STOP_COLORS[(st - 1) % len(STOP_COLORS)])))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(sb, 4 * u, 4 * u)
+            painter.setFont(QFont("Arial", 5, QFont.Weight.Bold))
+            painter.setPen(Qt.GlobalColor.white)
+            painter.drawText(sb, center, f"S{st}")
+            painter.setFont(QFont("Arial", 6))
+            painter.setPen(QColor("#555"))
+            text = stop_label(plan, st)[len(f"Stop {st}"):].lstrip(" —") or f"Stop {st}"
+            if st == plan_stops(plan)[0]:
+                text += " (1st, doors)"
+            painter.drawText(QRectF(sx + 21 * u, ly, 200 * u, 12 * u), left_mid, text)
+            sx += 21 * u + QFontMetrics(painter.font(), painter.device()).horizontalAdvance(text) + 12 * u
+        ly += 16 * u
+    painter.setFont(QFont("Arial", 6))
+    for kind, label in [("stack", "2-high stack"), ("load_bar", "Load bar"),
+                        ("strap", "Strap"), ("airbag", "Airbag")]:
+        sw = QRectF(lx, ly + 2 * u, 14 * u, 8 * u)
+        if kind == "stack":
+            painter.setBrush(QBrush(TAN))
+            painter.setPen(QPen(QColor("#8B6914"), 0.6 * u))
+            painter.drawRoundedRect(sw, 2 * u, 2 * u)
+        else:
+            _draw_securement_footprint(painter, sw, kind, SECUREMENT_COLORS[kind], u)
+        painter.setPen(QColor("#555"))
+        painter.drawText(QRectF(lx + 17 * u, ly, 70 * u, 12 * u), left_mid, label)
+        lx += 17 * u + QFontMetrics(painter.font(), painter.device()).horizontalAdvance(label) + 12 * u
+    return hits
+
+
+def _draw_side_plan(painter: QPainter, rect: QRectF, plan: Optional[LoadPlan],
+                    securement: list = None, u: float = 1.0):
+    """
+    To-scale side elevation seen from the left wall (nose at left), same
+    geometry as the 3D view's Side preset. Shared by the Side View tab and the PDF.
+    """
+    L, H = TRAILER["interior_length_in"], TRAILER["interior_height_in"]
+    ML, MT, MB = 38 * u, 22 * u, 36 * u
+    s = min((rect.width() - ML - 10 * u) / L, (rect.height() - MT - MB) / H)
+    ox = rect.x() + ML
+    spare = rect.height() - MT - MB - H * s
+    floor_y = rect.y() + MT + spare / 2 + H * s
+    top_y = floor_y - H * s
+    center = Qt.AlignmentFlag.AlignCenter
+
+    painter.setPen(QPen(QColor("#444"), 2 * u))
+    painter.setBrush(QBrush(QColor("#f5f5f0")))
+    painter.drawRect(QRectF(ox, top_y, L * s, H * s))
+
+    painter.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+    painter.setPen(QColor("#333"))
+    painter.drawText(QRectF(ox, top_y - 16 * u, 80 * u, 14 * u),
+                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "◀ NOSE")
+    painter.drawText(QRectF(ox + L * s - 80 * u, top_y - 16 * u, 80 * u, 14 * u),
+                     Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "DOORS ▶")
+    painter.setFont(QFont("Arial", 6))
+    painter.setPen(QColor("#666"))
+    painter.drawText(QRectF(ox, top_y - 16 * u, L * s, 14 * u), center,
+                     f"Interior {L}\" L × {H}\" H  (viewed from left side)")
+
+    # Height ruler (every 12")
+    for hm in range(0, H + 1, 12):
+        yy = floor_y - hm * s
+        painter.setPen(QPen(QColor("#bbb"), u))
+        painter.drawLine(QPointF(ox - 5 * u, yy), QPointF(ox, yy))
+        painter.setPen(QColor("#666"))
+        painter.drawText(QRectF(rect.x(), yy - 6 * u, ML - 7 * u, 12 * u),
+                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"{hm}\"")
+
+    # Length ruler (every 5 ft)
+    for xm in range(0, L + 1, 60):
+        xx = ox + xm * s
+        painter.setPen(QPen(QColor("#bbb"), u))
+        painter.drawLine(QPointF(xx, floor_y + 15 * u), QPointF(xx, floor_y + 20 * u))
+        painter.setPen(QColor("#666"))
+        painter.drawText(QRectF(xx - 20 * u, floor_y + 20 * u, 40 * u, 12 * u), center,
+                         f"{xm // 12}'")
+
+    # Axle markers
+    for depth, label, color in [(36, "Drive", "#e67e00"),
+                                (TRAILER["tandem_from_nose_in"], "Trailer axles", "#c0392b")]:
+        xx = ox + depth * s
+        painter.setPen(QPen(QColor(color), 1.0 * u, Qt.PenStyle.DashLine))
+        painter.drawLine(QPointF(xx, top_y), QPointF(xx, floor_y))
+        painter.setFont(QFont("Arial", 6))
+        painter.setPen(QColor(color))
+        painter.drawText(QRectF(xx + 2 * u, top_y + 1 * u, 80 * u, 10 * u),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, label)
+
+    if not plan or not plan.slots:
+        return
+
+    items = securement or []
+    boxes = _crate_boxes(plan)
+    multi = len(plan_stops(plan)) > 1
+    dividers = []   # (x, label) between delivery-stop zones, drawn last
+    if multi:
+        zone_rows = {}
+        for sl in plan.slots:
+            if sl.piece and sl.tier == 0:
+                zone_rows.setdefault(sl.row, [sl.row_start_in, set()])[1].add(sl.piece.seq)
+        ordered = [zone_rows[r] for r in sorted(zone_rows)]
+        # Divide between rows whose stops don't overlap; a row shared by two
+        # stops is itself the boundary, so it gets no divider
+        for (start_a, stops_a), (start_b, stops_b) in zip(ordered, ordered[1:]):
+            stop_a, stop_b = min(stops_a), max(stops_b)
+            seq_to_id = {sl.piece.seq: sl.piece.stop for sl in plan.slots if sl.piece}
+            if stop_a > stop_b:
+                stop_a, stop_b = seq_to_id[stop_a], seq_to_id[stop_b]
+                dividers.append((ox + start_b * s, f"S{stop_a} | S{stop_b}"))
+    # Far side (right wall) first so crates nearer the viewer paint over it
+    labels = []   # drawn after securement so straps don't cover them
+    for p, x, y, z, l, w, h, tier in sorted(boxes, key=lambda b: -b[2]):
+        r = QRectF(ox + x * s, floor_y - (z + h) * s, l * s, h * s).adjusted(
+            0.5 * u, 0.5 * u, -0.5 * u, 0)
+        painter.setBrush(QBrush(QColor(CRATE_COLORS[(p.piece_id - 1) % len(CRATE_COLORS)])))
+        painter.setPen(QPen(QColor("#222"), 0.6 * u))
+        painter.drawRect(r)
+        # Skip the label when a nearer crate hides most of this one
+        hidden = any(o[2] < y and
+                     (min(x + l, o[1] + o[4]) - max(x, o[1])) *
+                     (min(z + h, o[3] + o[6]) - max(z, o[3])) > 0.5 * l * h
+                     for o in boxes
+                     if min(x + l, o[1] + o[4]) > max(x, o[1]) and min(z + h, o[3] + o[6]) > max(z, o[3]))
+        if not hidden:
+            labels.append((r.adjusted(u, u, -u, -u),
+                           f"{p.crate_label}{' ▲' if tier == 1 else ''}"
+                           f"{f' S{p.stop}' if multi else ''}\n{h:.0f}\""))
+        if z + h > H:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#c0392b"), 2 * u))
+            painter.drawRect(QRectF(ox + x * s, floor_y - (z + h) * s, l * s, (z + h) * s))
+
+    # Securement (airbags as dashed outlines — they may sit in front of a crate)
+    for item in items:
+        parts, err = securement_parts(item, boxes, items)
+        for x, y, z, l, w, h, color, _shape in parts:
+            r = QRectF(ox + x * s, floor_y - (z + h) * s, l * s, h * s)
+            _draw_securement_footprint(painter, r, item["kind"], color, u, translucent=True)
+
+    painter.setFont(QFont("Arial", 6, QFont.Weight.Bold))
+    painter.setPen(Qt.GlobalColor.white)
+    for r, text in labels:
+        painter.drawText(r, center, text)
+
+    for xx, text in dividers:
+        painter.setPen(QPen(QColor("#333"), 1.6 * u, Qt.PenStyle.DashDotLine))
+        painter.drawLine(QPointF(xx, top_y - 4 * u), QPointF(xx, floor_y + 4 * u))
+        tag = QRectF(xx - 22 * u, top_y + 3 * u, 44 * u, 11 * u)
+        painter.setBrush(QBrush(QColor("#ffffff")))
+        painter.setPen(QPen(QColor("#333"), 0.8 * u))
+        painter.drawRoundedRect(tag, 3 * u, 3 * u)
+        painter.setFont(QFont("Arial", 6, QFont.Weight.Bold))
+        painter.setPen(QColor("#333"))
+        painter.drawText(tag, center, text)
+
+    # Row labels under the floor
+    painter.setFont(QFont("Arial", 6))
+    painter.setPen(QColor("#555"))
+    for row in sorted(set(sl.row for sl in plan.slots)):
+        floor = [sl for sl in plan.slots if sl.row == row and sl.tier == 0 and sl.piece]
+        if not floor:
+            continue
+        start = floor[0].row_start_in
+        depth = max(sl.piece.length_in for sl in floor)
+        painter.drawText(QRectF(ox + start * s, floor_y + 2 * u, depth * s, 12 * u),
+                         center, f"R{row + 1}")
+
+
 # ── PDF: Load Plan Floor Plan ─────────────────────────────────────────────────
-def export_load_plan_pdf(plan: LoadPlan, info: ShipmentInfo, path: str):
-    writer = _pdf_writer(path)
-    painter = QPainter(writer)
-    PW = writer.width()
-    PH = writer.height()
-    _draw_floor_plan(painter, PW, PH, plan, info)
-    # Add side elevation page if any pieces are stacked
-    if any(s.tier == 1 for s in plan.slots if s.piece):
-        writer.newPage()
-        _draw_side_elevation(painter, PW, PH, plan, info)
-    painter.end()
+def export_load_plan_pdf(plan: LoadPlan, info: ShipmentInfo, path: str,
+                         securement: list = None, include_3d: bool = False):
+    """Floor plan PDF for one truck (same pages as a one-truck shipment)."""
+    export_shipment_pdf([(plan, info)], path, securement, include_3d)
+
+
+PDF_3D_ANGLES = [                                   # (caption, yaw°, pitch°)
+    ("3/4 view from rear-left (doors)", -40.0, 28.0),
+    ("3/4 view from front-right (nose)", 140.0, 28.0),
+    ("Overhead from left side", -70.0, 55.0),
+    ("Rear — looking in through the doors", 0.0, 10.0),
+]
+
+
+def _draw_3d_page(painter: QPainter, PW: int, PH: int, plan: LoadPlan,
+                  info: ShipmentInfo, securement: list = None):
+    """One landscape page: the loaded trailer from four 3D angles in a 2×2 grid."""
+    M = 72
+    painter.setPen(QColor("#111"))
+    painter.setFont(QFont("Arial", 20, QFont.Weight.Bold))
+    painter.drawText(QRectF(M, M, PW - 2 * M, 44),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, "3D Views" + (f"  —  {info.truck_label}" if info.truck_label else ""))
+    hdr = "  |  ".join(part for part in [info.customer or info.shipment_name, info.date,
+                                         securement_summary(securement)] if part)
+    if hdr:
+        painter.setFont(QFont("Arial", 10))
+        painter.setPen(QColor("#555"))
+        painter.drawText(QRectF(M, M + 44, PW - 2 * M, 24),
+                         Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, hdr)
+
+    top, gap, cap = M + 78, 24, 26
+    cell_w = (PW - 2 * M - gap) / 2
+    cell_h = (PH - top - M - gap) / 2
+    for i, (caption, yaw, pitch) in enumerate(PDF_3D_ANGLES):
+        cx = M + (i % 2) * (cell_w + gap)
+        cy = top + (i // 2) * (cell_h + gap)
+        frame = QRectF(cx, cy, cell_w, cell_h)
+        painter.fillRect(frame, QColor("#fafafa"))
+        painter.setPen(QPen(QColor("#ccc"), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(frame)
+        painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        painter.setPen(QColor("#333"))
+        painter.drawText(QRectF(cx + 10, cy + 4, cell_w - 20, cap),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, caption)
+        _draw_3d_snapshot(painter, QRectF(cx + 4, cy + cap, cell_w - 8, cell_h - cap - 4),
+                          plan, securement, yaw, pitch)
 
 
 def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
-                     plan: LoadPlan, info: ShipmentInfo):
+                     plan: LoadPlan, info: ShipmentInfo, securement: list = None):
     M = 72       # margin ~0.48"
-    LM = M + 50  # extra left for row labels
+    u = 150 / 96   # PDF px per screen px (writer runs at 150 dpi)
 
     # ── Title ──────────────────────────────────────────────────────────
     painter.setPen(QColor("#111"))
-    font = QFont("Arial", 20, QFont.Weight.Bold)
-    painter.setFont(font)
-    painter.drawText(QRectF(LM, M, PW - LM - M, 48),
+    painter.setFont(QFont("Arial", 20, QFont.Weight.Bold))
+    painter.drawText(QRectF(M, M, PW - 2 * M, 48),
                      Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                     "Trailer Loading Floor Plan")
+                     "Trailer Loading Floor Plan" + (f"  —  {info.truck_label}" if info.truck_label else ""))
 
-    font = QFont("Arial", 10)
-    painter.setFont(font)
+    painter.setFont(QFont("Arial", 10))
     # Deduplicate center pieces (two slots share one piece)
     seen = set()
     total_w, n_crates = 0, 0
@@ -506,9 +1569,10 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
             n_crates += 1
     excl = (f"Crates {', '.join(str(x) for x in plan.excluded_ids)} excluded  |  "
             if plan.excluded_ids else "")
-    sub = (f"{info.customer or info.shipment_name}  |  {TRAILER['name']}  |  "
-           f"{excl}Total: {total_w:,.0f} lb / {n_crates} crates")
-    painter.drawText(QRectF(LM, M + 50, PW - LM - M, 26),
+    sub = "  |  ".join(part for part in [
+        info.customer or info.shipment_name, TRAILER['name'],
+        f"{excl}Total: {total_w:,.0f} lb / {n_crates} crates"] if part)
+    painter.drawText(QRectF(M, M + 50, PW - 2 * M, 26),
                      Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, sub)
 
     detail_parts = []
@@ -516,185 +1580,48 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
     if info.trailer_num: detail_parts.append(f"Trailer: {info.trailer_num}")
     if info.bol_num:     detail_parts.append(f"BOL: {info.bol_num}")
     if detail_parts:
-        painter.drawText(QRectF(LM, M + 76, PW - LM - M, 22),
+        painter.drawText(QRectF(M, M + 76, PW - 2 * M, 22),
                          Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
                          "  |  ".join(detail_parts))
 
-    # ── Column headers ──────────────────────────────────────────────────
-    col_w = (PW - LM - M) / 2
-    hdr_y = M + 108
+    # ── To-scale plan ───────────────────────────────────────────────────
+    not_loaded, NOT_LOADED_H = "", 0             # wrapped "does not fit" block
+    if plan.unplaced:
+        not_loaded = (f"NOT LOADED — does not fit ({len(plan.unplaced)} pcs, "
+                      f"{sum(p.weight_lbs for p, _ in plan.unplaced):,.0f} lb): "
+                      + ", ".join(p.crate_label for p, _ in plan.unplaced))
+        painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        NOT_LOADED_H = painter.fontMetrics().boundingRect(
+            0, 0, int(PW - 2 * M), 10_000, int(Qt.TextFlag.TextWordWrap.value), not_loaded).height() + 12
+    TAIL_RESERVE = 110 + NOT_LOADED_H            # space for notes at bottom
+    plan_top = M + 108
+    _draw_top_plan(painter, QRectF(M, plan_top, PW - 2 * M, PH - M - TAIL_RESERVE - plan_top),
+                   plan, securement, u)
 
-    font = QFont("Arial", 12, QFont.Weight.Bold)
-    painter.setFont(font)
-    painter.setPen(QColor("#222"))
-    painter.drawText(QRectF(LM, hdr_y, PW - LM - M, 28),
-                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                     "NOSE  (load first)")
-
-    hdr_y += 30
-    font = QFont("Arial", 11, QFont.Weight.Bold)
-    painter.setFont(font)
-    painter.setPen(TEAL_DARK)
-    painter.drawText(QRectF(LM, hdr_y, col_w, 24),
-                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                     "Position A")
-    painter.drawText(QRectF(LM + col_w, hdr_y, col_w, 24),
-                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                     "Position B")
-
-    # ── Grid ────────────────────────────────────────────────────────────
-    grid_top = hdr_y + 28
+    # ── Footer notes ───────────────────────────────────────────────────
     rows = sorted(set(s.row for s in plan.slots))
     n_rows = len(rows)
-
-    TAIL_RESERVE = 100   # space for tail label + notes at bottom
-    grid_h = PH - M - TAIL_RESERVE - grid_top
-    row_h = grid_h / n_rows if n_rows else 40
-
-    slot_map = {(s.row, s.col, s.tier): s for s in plan.slots}
-
-    font_rlbl = QFont("Arial", 9, QFont.Weight.Bold)
-    font_big   = QFont("Arial", 11, QFont.Weight.Bold)
-    font_small = QFont("Arial", 9)
-
-    for r_pos, r in enumerate(rows):
-        y = grid_top + r * row_h
-
-        # Row label
-        painter.setFont(font_rlbl)
-        painter.setPen(QColor("#444"))
-        painter.drawText(QRectF(M, y, 46, row_h),
-                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                         f"R{r + 1}")
-
-        for c in range(2):
-            slot = slot_map.get((r, c, 0))
-            x = LM + c * col_w
-
-            # Center pieces: skip col=1 (already drawn by col=0)
-            if slot and slot.is_center and c == 1:
-                continue
-
-            if slot and slot.piece:
-                if slot.is_center:
-                    full_w      = col_w * 2
-                    crate_ratio = min(slot.piece.width_in / TRAILER["interior_width_in"], 1.0)
-                    piece_w     = full_w * crate_ratio
-                    total_gap   = full_w - piece_w
-                    if slot.piece.placement == "alt_center":
-                        load_left = (r_pos % 2 == 0)
-                        gap = 0 if load_left else total_gap
-                    else:
-                        gap = total_gap / 2
-                    cell = QRectF(LM + gap + 2, y + 2, piece_w - 4, row_h - 4)
-                else:
-                    cell = QRectF(x + 2, y + 2, col_w - 4, row_h - 4)
-
-                # Check for a stacked (tier=1) piece at this position
-                top_slot = slot_map.get((r, c, 1)) if not slot.is_center else None
-
-                painter.setBrush(QBrush(TEAL_LIGHT))
-                painter.setPen(QPen(TEAL_DARK, 1.5))
-                painter.drawRoundedRect(cell, 5, 5)
-
-                if top_slot and top_slot.piece:
-                    # Split cell: bottom half = floor piece, top half = stacked piece
-                    mid_y = cell.y() + cell.height() * 0.5
-                    divider_y = cell.y() + cell.height() * 0.52
-
-                    # Floor piece area
-                    bot_cell = QRectF(cell.x() + 4, cell.y() + 2,
-                                      cell.width() - 8, cell.height() * 0.46)
-                    painter.setFont(font_big)
-                    painter.setPen(TEAL_DARK)
-                    painter.drawText(bot_cell,
-                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                                     slot.piece.crate_label)
-                    painter.setFont(font_small)
-                    painter.drawText(
-                        QRectF(cell.x() + 4, cell.y() + cell.height() * 0.3,
-                               cell.width() - 8, cell.height() * 0.2),
-                        Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                        f"{slot.piece.weight_lbs:,.0f} lb")
-
-                    # Divider
-                    painter.setPen(QPen(TEAL_DARK, 1, Qt.PenStyle.DashLine))
-                    painter.drawLine(QPointF(cell.x() + 4, divider_y),
-                                     QPointF(cell.x() + cell.width() - 4, divider_y))
-
-                    # Stacked piece area (amber background badge)
-                    stack_rect = QRectF(cell.x() + 4, divider_y + 2,
-                                        cell.width() - 8, cell.height() * 0.44)
-                    painter.setBrush(QBrush(TAN))
-                    painter.setPen(QPen(QColor("#8B6914"), 1))
-                    painter.drawRoundedRect(stack_rect, 3, 3)
-                    painter.setFont(font_small)
-                    painter.setPen(QColor("#FFFFFF"))
-                    painter.drawText(
-                        QRectF(stack_rect.x(), stack_rect.y(),
-                               stack_rect.width(), stack_rect.height() * 0.55),
-                        Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                        f"▲ {top_slot.piece.crate_label}")
-                    painter.drawText(
-                        QRectF(stack_rect.x(), stack_rect.y() + stack_rect.height() * 0.5,
-                               stack_rect.width(), stack_rect.height() * 0.5),
-                        Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                        f"{top_slot.piece.weight_lbs:,.0f} lb")
-                else:
-                    top_half = QRectF(cell.x() + 4, cell.y() + 2,
-                                      cell.width() - 8, cell.height() * 0.55)
-                    bot_half = QRectF(cell.x() + 4, cell.y() + cell.height() * 0.55,
-                                      cell.width() - 8, cell.height() * 0.42)
-
-                    painter.setFont(font_big)
-                    painter.setPen(TEAL_DARK)
-                    if slot.piece.placement == "alt_center":
-                        load_left = (r_pos % 2 == 0)
-                        direction = "← LOAD LEFT" if load_left else "LOAD RIGHT →"
-                        painter.drawText(top_half,
-                                         Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                                         f"{direction}  {slot.piece.crate_label}")
-                    else:
-                        painter.drawText(top_half,
-                                         Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                                         slot.piece.crate_label)
-                    painter.setFont(font_small)
-                    painter.drawText(bot_half,
-                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                                     f"{slot.piece.weight_lbs:,.0f} lb")
-            else:
-                cell = QRectF(x + 2, y + 2, col_w - 4, row_h - 4)
-                painter.setBrush(QBrush(VOID_BG))
-                pen = QPen(GRAY_LINE, 1, Qt.PenStyle.DashLine)
-                painter.setPen(pen)
-                painter.drawRoundedRect(cell, 5, 5)
-                painter.setFont(font_small)
-                painter.setPen(QColor("#999"))
-                painter.drawText(cell, Qt.AlignmentFlag.AlignCenter,
-                                 "Open\nBlock / void-fill")
-
-    # ── Tail label ─────────────────────────────────────────────────────
-    tail_y = PH - M - TAIL_RESERVE + 6
-    font = QFont("Arial", 12, QFont.Weight.Bold)
-    painter.setFont(font)
-    painter.setPen(QColor("#111"))
-    painter.drawText(QRectF(LM, tail_y, PW - LM - M, 28),
-                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                     "TAIL  (rear doors, load last)")
-
-    # Clear space note
+    tail_y = PH - M - TAIL_RESERVE + 8
+    if not_loaded:
+        painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        painter.setPen(QColor("#c0392b"))
+        painter.drawText(QRectF(M, tail_y, PW - 2 * M, NOT_LOADED_H),
+                         Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap, not_loaded)
+        tail_y += NOT_LOADED_H
     clear_in = TRAILER["interior_length_in"] - plan.total_length_used_in
-    clear_ft = clear_in / 12.0
-    font = QFont("Arial", 8)
-    painter.setFont(font)
+    painter.setFont(QFont("Arial", 8))
     painter.setPen(QColor("#555"))
-    painter.drawText(QRectF(LM, tail_y + 30, PW - LM - M, 20),
-                     Qt.AlignmentFlag.AlignHCenter,
-                     f"~{clear_ft:.1f} ft clear space behind row {n_rows} for load bars / void-fill")
-
-    note = ("Load strictly R1 to R13 in order.  "
+    painter.drawText(QRectF(M, tail_y, PW - 2 * M, 20), Qt.AlignmentFlag.AlignHCenter,
+                     f"~{clear_in / 12.0:.1f} ft ({clear_in:.0f}\") clear space behind row {n_rows}")
+    sec = securement_summary(securement)
+    if sec:
+        painter.setPen(QColor("#333"))
+        painter.drawText(QRectF(M, tail_y + 20, PW - 2 * M, 20), Qt.AlignmentFlag.AlignHCenter,
+                         f"Securement: {sec}")
+    painter.setPen(QColor("#555"))
+    note = (f"Load strictly R1 to R{n_rows} in order.  "
             "Weigh loaded trailer on a certified scale and adjust tandem slide as needed before transport.")
-    painter.drawText(QRectF(LM, tail_y + 50, PW - LM - M, 30),
+    painter.drawText(QRectF(M, tail_y + 40, PW - 2 * M, 34),
                      Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap, note)
 
     # Axle weight summary
@@ -706,207 +1633,129 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
                   f"Trailer: {aw.get('trailer', 0):,} lb  |  "
                   f"Freight Gross: {aw.get('freight_gross', 0):,} lb")
         painter.setPen(TEAL_DARK)
-        painter.drawText(QRectF(LM, PH - M - 16, PW - LM - M, 16),
+        painter.drawText(QRectF(M, PH - M - 16, PW - 2 * M, 16),
                          Qt.AlignmentFlag.AlignHCenter, aw_str)
 
 
 def _draw_side_elevation(painter: QPainter, PW: int, PH: int,
-                         plan: LoadPlan, info: ShipmentInfo):
-    """Side elevation: shows height profile of each row, bottom + stacked pieces."""
+                         plan: LoadPlan, info: ShipmentInfo, securement: list = None):
+    """Side elevation page: to-scale profile of every crate, stacks and securement."""
     M = 72
-    LM = M + 50
+    u = 150 / 96   # PDF px per screen px (writer runs at 150 dpi)
 
-    # Title
     painter.setPen(QColor("#111"))
-    font = QFont("Arial", 20, QFont.Weight.Bold)
-    painter.setFont(font)
-    painter.drawText(QRectF(LM, M, PW - LM - M, 48),
+    painter.setFont(QFont("Arial", 20, QFont.Weight.Bold))
+    painter.drawText(QRectF(M, M, PW - 2 * M, 48),
                      Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                     "Side Elevation — Stack Height Profile")
+                     "Side Elevation — Stack Height Profile" + (f"  —  {info.truck_label}" if info.truck_label else ""))
 
-    font = QFont("Arial", 10)
-    painter.setFont(font)
+    painter.setFont(QFont("Arial", 10))
     painter.setPen(QColor("#555"))
     hdr = info.customer or info.shipment_name or ""
     if info.date:
         hdr = (hdr + "  |  " if hdr else "") + info.date
     if hdr:
-        painter.drawText(QRectF(LM, M + 50, PW - LM - M, 26),
+        painter.drawText(QRectF(M, M + 50, PW - 2 * M, 26),
                          Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, hdr)
 
-    interior_h = TRAILER["interior_height_in"]
+    # A 53' van is ~6:1, so the to-scale profile is a wide strip near the top
+    side_h = (PW - 2 * M) * 0.26
+    _draw_side_plan(painter, QRectF(M, M + 84, PW - 2 * M, side_h), plan, securement, u)
+    if securement:
+        _draw_securement_table(painter, QRectF(M, M + 100 + side_h, PW - 2 * M,
+                                               PH - 2 * M - 100 - side_h), plan, securement)
 
-    # Build per-row stack info: row_idx -> (bottom_piece, top_piece or None, row_depth)
-    slot_map = {}
-    for s in plan.slots:
-        if s.piece:
-            slot_map[(s.row, s.col, s.tier)] = s
 
-    rows = sorted(set(s.row for s in plan.slots))
-    n_rows = len(rows)
-    if n_rows == 0:
-        return
+def securement_rows(plan: LoadPlan, securement: list) -> list:
+    """One loader-checklist row per securement item, sorted nose to tail."""
+    row_of, label_of, start_of = {}, {}, {}
+    for sl in plan.slots:
+        if sl.piece:
+            row_of[sl.piece.piece_id] = sl.row
+            label_of[sl.piece.piece_id] = sl.piece.crate_label
+            start_of[sl.piece.piece_id] = sl.row_start_in
+    boxes = _crate_boxes(plan)
+    face_text = {"nose": "nose face", "tail": "tail face", "left": "left side",
+                 "right": "right side", "top": "over the top"}
+    rows = []
+    for item in securement:
+        pid = item["piece_id"]
+        if pid not in row_of:
+            continue
+        parts, err = securement_parts(item, boxes, securement)
+        where = face_text.get(item["face"], item["face"])
+        if item["kind"] == "strap" and item["face"] != "top":
+            same = [it for it in securement if it["kind"] == "strap"
+                    and it["piece_id"] == pid and it["face"] == item["face"]]
+            if len(same) > 1:
+                where += ", upper" if item.get("n", 0) == min(it.get("n", 0) for it in same) else ", lower"
+        detail = ""
+        if parts and not err:
+            x, y, z, l, w, h = parts[0][:6]
+            if item["kind"] == "airbag":
+                gap = l if item["face"] in ("nose", "tail") else w
+                detail = f"fills {gap + 0.6:.0f}\" void"
+            elif item["kind"] == "load_bar":
+                detail = f"{z + h / 2:.0f}\" above floor, {x + l / 2:.0f}\" from nose"
+            elif item["face"] != "top":
+                detail = f"{z + h / 2:.0f}\" above floor"
+        elif err:
+            detail = "does not fit current plan"
+        rows.append((row_of[pid], start_of[pid], f"R{row_of[pid] + 1}", label_of[pid],
+                     SECUREMENT_KINDS[item["kind"]], where, detail))
+    rows.sort(key=lambda r: (r[1], r[0]))
+    return [r[2:] for r in rows]
 
-    # Drawing area
-    draw_x = LM
-    draw_y = M + 90
-    draw_w = PW - LM - M
-    draw_h = PH - draw_y - M - 60
 
-    # Scale: x = row position along trailer, y = height
-    row_w = draw_w / n_rows
-
-    # Interior height scale
-    h_scale = draw_h / interior_h
-
-    # Draw trailer ceiling line
-    ceiling_y = draw_y
-    painter.setPen(QPen(QColor("#444"), 2))
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-    painter.drawLine(QPointF(draw_x, ceiling_y), QPointF(draw_x + draw_w, ceiling_y))
-    font = QFont("Arial", 8)
-    painter.setFont(font)
-    painter.setPen(QColor("#444"))
-    painter.drawText(QRectF(draw_x, ceiling_y - 14, 120, 14),
+def _draw_securement_table(painter: QPainter, rect: QRectF, plan: LoadPlan, securement: list):
+    """Loader checklist: one line per load bar / strap / airbag, nose to tail."""
+    rows = securement_rows(plan, securement)
+    painter.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+    painter.setPen(QColor("#111"))
+    painter.drawText(QRectF(rect.x(), rect.y(), rect.width(), 26),
                      Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                     f"Interior ceiling {interior_h}\"")
-
-    # Draw floor line
-    floor_y = draw_y + draw_h
-    painter.setPen(QPen(QColor("#444"), 2))
-    painter.drawLine(QPointF(draw_x, floor_y), QPointF(draw_x + draw_w, floor_y))
-
-    # Draw each row
-    font_lbl = QFont("Arial", 7, QFont.Weight.Bold)
-    font_sm   = QFont("Arial", 6)
-
-    for r_pos, r in enumerate(rows):
-        x0 = draw_x + r_pos * row_w
-        col_gap = 2
-
-        for c in range(2):
-            bot_slot = slot_map.get((r, c, 0))
-            top_slot = slot_map.get((r, c, 1))
-
-            # For center pieces, only draw col=0
-            if bot_slot and bot_slot.is_center and c == 1:
-                continue
-
-            cell_x = x0 + c * (row_w / 2) + col_gap
-            cell_w = (row_w / 2) - col_gap * 2
-            if bot_slot and bot_slot.is_center:
-                cell_x = x0 + col_gap
-                cell_w = row_w - col_gap * 2
-
-            if bot_slot and bot_slot.piece:
-                bot_h_px = bot_slot.piece.height_in * h_scale
-                bot_rect = QRectF(cell_x, floor_y - bot_h_px, cell_w, bot_h_px)
-                painter.setBrush(QBrush(TEAL_LIGHT))
-                painter.setPen(QPen(TEAL_DARK, 1))
-                painter.drawRect(bot_rect)
-
-                painter.setFont(font_lbl)
-                painter.setPen(TEAL_DARK)
-                painter.drawText(bot_rect.adjusted(1, 2, -1, -2),
-                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-                                 bot_slot.piece.crate_label)
-                painter.setFont(font_sm)
-                painter.drawText(bot_rect.adjusted(1, 2, -1, -2),
-                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
-                                 f"{bot_slot.piece.height_in:.0f}\"")
-
-                if top_slot and top_slot.piece:
-                    top_h_px = top_slot.piece.height_in * h_scale
-                    top_rect = QRectF(cell_x, floor_y - bot_h_px - top_h_px,
-                                      cell_w, top_h_px)
-                    painter.setBrush(QBrush(TAN))
-                    painter.setPen(QPen(QColor("#8B6914"), 1))
-                    painter.drawRect(top_rect)
-
-                    painter.setFont(font_lbl)
-                    painter.setPen(QColor("#FFFFFF"))
-                    painter.drawText(top_rect.adjusted(1, 2, -1, -2),
-                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-                                     top_slot.piece.crate_label)
-                    painter.setFont(font_sm)
-                    painter.drawText(top_rect.adjusted(1, 2, -1, -2),
-                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
-                                     f"{top_slot.piece.height_in:.0f}\"")
-
-                    # Danger if over ceiling
-                    combined = bot_slot.piece.height_in + top_slot.piece.height_in
-                    if combined > interior_h:
-                        painter.setPen(QPen(QColor("#c0392b"), 2))
-                        painter.setBrush(Qt.BrushStyle.NoBrush)
-                        painter.drawRect(QRectF(cell_x, floor_y - combined * h_scale,
-                                                cell_w, combined * h_scale))
-            else:
-                # Empty slot
-                empty_h = 24
-                er = QRectF(cell_x, floor_y - empty_h, cell_w, empty_h)
-                painter.setBrush(QBrush(VOID_BG))
-                painter.setPen(QPen(GRAY_LINE, 1, Qt.PenStyle.DashLine))
-                painter.drawRect(er)
-
-        # Row label below floor
-        painter.setFont(font_sm)
-        painter.setPen(QColor("#555"))
-        painter.drawText(QRectF(x0, floor_y + 2, row_w, 16),
-                         Qt.AlignmentFlag.AlignHCenter, f"R{r+1}")
-
-    # Height ruler on the left
-    painter.setPen(QPen(QColor("#999"), 1))
-    for h_mark in range(0, interior_h + 1, 12):
-        y_mark = floor_y - h_mark * h_scale
-        painter.drawLine(QPointF(draw_x - 8, y_mark), QPointF(draw_x, y_mark))
-        painter.setFont(QFont("Arial", 6))
-        painter.setPen(QColor("#666"))
-        painter.drawText(QRectF(draw_x - 44, y_mark - 8, 34, 16),
-                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                         f"{h_mark}\"")
-        painter.setPen(QPen(QColor("#999"), 1))
-
-    # Legend
-    legend_y = PH - M - 40
-    painter.setBrush(QBrush(TEAL_LIGHT))
-    painter.setPen(QPen(TEAL_DARK, 1))
-    painter.drawRect(QRectF(LM, legend_y, 16, 12))
-    painter.setFont(QFont("Arial", 8))
-    painter.setPen(QColor("#333"))
-    painter.drawText(QRectF(LM + 20, legend_y, 120, 12),
-                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                     "Floor-level piece")
-    painter.setBrush(QBrush(TAN))
-    painter.setPen(QPen(QColor("#8B6914"), 1))
-    painter.drawRect(QRectF(LM + 160, legend_y, 16, 12))
-    painter.drawText(QRectF(LM + 182, legend_y, 120, 12),
-                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                     "Stacked piece (tier 2)")
+                     f"Securement Checklist  —  {securement_summary(securement)}")
+    cols = [("✓", 0.04), ("Row", 0.07), ("Crate", 0.14), ("Item", 0.12),
+            ("Location", 0.25), ("Detail", 0.38)]
+    line_h = 26
+    y = rect.y() + 32
+    # Two side-by-side columns of rows if they won't fit in one
+    max_rows = max(1, int((rect.bottom() - y) / line_h) - 1)
+    n_cols = 1 if len(rows) <= max_rows else 2
+    col_w = rect.width() / n_cols
+    for c in range(n_cols):
+        chunk = rows[c * max_rows:(c + 1) * max_rows]
+        if not chunk:
+            break
+        x0 = rect.x() + c * col_w
+        painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        painter.setPen(TEAL_DARK)
+        cx = x0
+        for name, frac in cols:
+            painter.drawText(QRectF(cx, y, col_w * frac, line_h),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
+            cx += col_w * frac
+        painter.setPen(QPen(TEAL_DARK, 1))
+        painter.drawLine(QPointF(x0, y + line_h), QPointF(x0 + col_w - 20, y + line_h))
+        painter.setFont(QFont("Arial", 9))
+        for i, row in enumerate(chunk):
+            ry = y + line_h * (i + 1)
+            if i % 2:
+                painter.fillRect(QRectF(x0, ry, col_w - 20, line_h), QColor("#f2f9f8"))
+            painter.setPen(QPen(QColor("#555"), 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(QRectF(x0 + 4, ry + 7, 12, 12))
+            cx = x0 + col_w * cols[0][1]
+            painter.setPen(QColor("#222"))
+            for val, (_name, frac) in zip(row, cols[1:]):
+                painter.drawText(QRectF(cx, ry, col_w * frac - 4, line_h),
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, val)
+                cx += col_w * frac
 
 
 # ── PDF: Crate Labels ─────────────────────────────────────────────────────────
 def export_crate_labels_pdf(plan: LoadPlan, info: ShipmentInfo, path: str):
-    # One label per unique piece, ordered: floor rows R1→Rn first, then stacked pieces
-    seen: set = set()
-    filled = []
-    for s in sorted(plan.slots, key=lambda s: (s.row, s.tier, s.col)):
-        if s.piece and s.piece.piece_id not in seen:
-            seen.add(s.piece.piece_id)
-            filled.append(s)
-    if not filled:
-        return
-
-    writer = _pdf_writer(path)
-    painter = QPainter(writer)
-    PW = writer.width()
-    PH = writer.height()
-
-    for i, slot in enumerate(filled):
-        if i > 0:
-            writer.newPage()
-        _draw_crate_label(painter, PW, PH, slot, plan, info)
-
-    painter.end()
+    export_shipment_labels([(plan, info)], path)
 
 
 def _draw_crate_label(painter: QPainter, PW: int, PH: int,
@@ -929,6 +1778,8 @@ def _draw_crate_label(painter: QPainter, PW: int, PH: int,
     hdr = info.customer or info.shipment_name or "Freight Shipment"
     if info.date:
         hdr += f"   |   {info.date}"
+    if info.truck_label:
+        hdr += f"   |   {info.truck_label}"
     painter.drawText(QRectF(INNER_X, PAD + 10, INNER_W, sep1_y - PAD - 14),
                      Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, hdr)
 
@@ -945,6 +1796,22 @@ def _draw_crate_label(painter: QPainter, PW: int, PH: int,
     painter.setBrush(QBrush(TEAL_LIGHT))
     painter.setPen(QPen(TEAL_DARK, 2.5))
     painter.drawRoundedRect(box, 16, 16)
+
+    if len(plan_stops(plan)) > 1:   # big delivery-stop badge for multi-stop loads
+        stop = slot.piece.stop
+        badge = QRectF(box_x + box_w - 190, box_top - 14, 180, 46)
+        painter.setBrush(QBrush(QColor(STOP_COLORS[(stop - 1) % len(STOP_COLORS)])))
+        painter.setPen(QPen(Qt.GlobalColor.white, 2))
+        painter.drawRoundedRect(badge, 10, 10)
+        painter.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        painter.setPen(Qt.GlobalColor.white)
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, f"STOP {stop}")
+        name = stop_label(plan, stop)[len(f"Stop {stop}"):].lstrip(" —")
+        if name:
+            painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+            painter.setPen(QColor(STOP_COLORS[(stop - 1) % len(STOP_COLORS)]))
+            painter.drawText(QRectF(box_x + box_w - 400, box_top + 34, 390, 20),
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, name)
 
     # Layout zones — shift to make room for notes when present
     has_notes = bool(slot.piece.notes)
@@ -1063,109 +1930,262 @@ def _draw_crate_label(painter: QPainter, PW: int, PH: int,
 
 
 # ── Live Trailer View widget ──────────────────────────────────────────────────
+SNAP_IN = 2.0      # a dragged crate snaps to a wall or neighbouring edge within this distance
+
+
+def _slide_footprint(fp: tuple, target: tuple, obstacles: list) -> tuple:
+    """
+    Move footprint fp = (x, y, l, w) toward target (x, y) without leaving the
+    trailer or passing through obstacles [(x, y, l, w)]: it slides along each
+    axis until it touches something. Tries length-then-width and width-then-
+    length and keeps whichever ends closer to the target.
+    """
+    L, W = TRAILER["interior_length_in"], TRAILER["interior_width_in"]
+    x0, y0, l, w = fp
+    tx, ty = target
+
+    def sweep(x, y, t, axis):
+        size, lim_hi = (l, L) if axis == 0 else (w, W)
+        pos = x if axis == 0 else y
+        hi, lo = lim_hi - size, 0.0
+        for ox, oy, ol, ow in obstacles:
+            # Only obstacles beside this crate's path along the other axis matter
+            if axis == 0 and min(y + w, oy + ow) - max(y, oy) <= 0.01:
+                continue
+            if axis == 1 and min(x + l, ox + ol) - max(x, ox) <= 0.01:
+                continue
+            o_lo, o_size = (ox, ol) if axis == 0 else (oy, ow)
+            if o_lo >= pos + size - 0.01:
+                hi = min(hi, o_lo - size)
+            elif o_lo + o_size <= pos + 0.01:
+                lo = max(lo, o_lo + o_size)
+        return max(lo, min(hi, t))
+
+    xa = sweep(x0, y0, tx, 0)
+    ya = sweep(xa, y0, ty, 1)
+    yb = sweep(x0, y0, ty, 1)
+    xb = sweep(x0, yb, tx, 0)
+    da = (xa - tx) ** 2 + (ya - ty) ** 2
+    db = (xb - tx) ** 2 + (yb - ty) ** 2
+    return (xa, ya) if da <= db else (xb, yb)
+
+
+def _snap_footprint(fp: tuple, pos: tuple, obstacles: list) -> tuple:
+    """Pull a position onto nearby walls / neighbouring crate edges, if still clear."""
+    L, W = TRAILER["interior_length_in"], TRAILER["interior_width_in"]
+    _x0, _y0, l, w = fp
+    x, y = pos
+    xs = [0.0, L - l] + [v for ox, oy, ol, ow in obstacles for v in (ox + ol, ox - l, ox)]
+    ys = [0.0, W - w] + [v for ox, oy, ol, ow in obstacles for v in (oy + ow, oy - w, oy)]
+
+    def clear(cx, cy):
+        return (0 <= cx <= L - l + 0.01 and 0 <= cy <= W - w + 0.01 and
+                all(min(cx + l, ox + ol) - max(cx, ox) <= 0.01 or
+                    min(cy + w, oy + ow) - max(cy, oy) <= 0.01 for ox, oy, ol, ow in obstacles))
+    best_x = min(xs, key=lambda v: abs(v - x))
+    if abs(best_x - x) <= SNAP_IN and clear(best_x, y):
+        x = best_x
+    best_y = min(ys, key=lambda v: abs(v - y))
+    if abs(best_y - y) <= SNAP_IN and clear(x, best_y):
+        y = best_y
+    return x, y
+
+
 class TrailerView(QWidget):
+    """
+    To-scale top view. Drag a crate to shift it (it slides until it touches a
+    crate or wall, snapping to nearby edges); Ctrl+drag onto another position
+    swaps two side-by-side crates.
+    """
     plan_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.plan: Optional[LoadPlan] = None
+        self.securement: list = []
         self.setMinimumSize(320, 480)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._drag_src: Optional[tuple] = None
+        self._drag_src: Optional[tuple] = None   # Ctrl+drag swap source (row, col)
+        self._move = None                        # active shift: dict, see _start_move
         self._hover_slot: Optional[tuple] = None
+        self._hits: dict = {}        # (row, col) -> QRectF, from the last paint
+        self._geom: dict = {}        # tx, ty, s from the last paint (pixels ↔ inches)
+        self.zoom_focus_x: Optional[float] = None
         self.setMouseTracking(True)
 
     def set_plan(self, plan: LoadPlan):
         self.plan = plan
         self._drag_src = None
+        self._move = None
         self._hover_slot = None
         self.update()
 
-    # ── Layout constants (shared between hit-testing and drawing) ────────────
-    def _layout(self):
-        M, NOSE_H, ROW_LBL = 28, 22, 36
-        W, H = self.width(), self.height()
-        grid_x = M + ROW_LBL
-        grid_w = W - grid_x - M
-        grid_y = M + NOSE_H + 4
-        grid_h = H - grid_y - M - 20
-        col_w  = grid_w / 2
-        return grid_x, grid_w, grid_y, grid_h, col_w, M, NOSE_H, ROW_LBL
+    def set_securement(self, items: list):
+        self.securement = items
+        self.update()
 
     # ── Hit-test: which slot is under a mouse position ───────────────────────
     def _slot_at(self, pos) -> Optional[tuple]:
         if not self.plan or not self.plan.slots:
             return None
-        grid_x, grid_w, grid_y, grid_h, col_w, *_ = self._layout()
-        trailer_len = TRAILER["interior_length_in"]
-        px, py = pos.x(), pos.y()
-        if not (grid_x <= px <= grid_x + grid_w and grid_y <= py <= grid_y + grid_h):
-            return None
-        col = 0 if px < grid_x + col_w else 1
-        slot_map = {(s.row, s.col): s for s in self.plan.slots}
-        for r in sorted(set(s.row for s in self.plan.slots)):
-            sa = slot_map.get((r, 0))
-            if sa and sa.piece:
-                y0 = grid_y + (sa.row_start_in / trailer_len) * grid_h
-                y1 = y0 + (sa.piece.length_in / trailer_len) * grid_h
-                if y0 <= py < y1:
-                    return (r, 0) if sa.is_center else (r, col)
+        for key, r in self._hits.items():
+            if r.contains(QPointF(pos)):
+                return key
         return None
 
-    # ── Swap two pieces between slots ────────────────────────────────────────
+    def _floor_slot(self, key) -> Optional[PalletSlot]:
+        if not key or not self.plan:
+            return None
+        return next((s for s in self.plan.slots
+                     if (s.row, s.col) == key and s.tier == 0 and s.piece), None)
+
+    # ── Shift a crate (and whatever is stacked on it) ────────────────────────
+    def _start_move(self, slot: PalletSlot, pos):
+        boxes = _crate_boxes(self.plan)
+        me = next(b for b in boxes if b[0].piece_id == slot.piece.piece_id)
+        moving_ids = {slot.piece.piece_id} | {
+            s.piece.piece_id for s in self.plan.slots
+            if s.tier == 1 and s.piece and s.row == slot.row
+            and (slot.is_center or s.col == slot.col)}
+        self._move = {
+            "slot": slot, "press": QPointF(pos), "fp": (me[1], me[2], me[4], me[5]),
+            "pos": (me[1], me[2]),
+            "obstacles": [(b[1], b[2], b[4], b[5]) for b in boxes
+                          if b[7] == 0 and b[0].piece_id not in moving_ids],
+        }
+
+    def _update_move(self, pos):
+        m, g = self._move, self._geom
+        if not g:
+            return
+        dx_px, dy_px = pos.x() - m["press"].x(), pos.y() - m["press"].y()
+        x0, y0, l, w = m["fp"]
+        # Screen down = toward the doors (+x); screen right = toward the right wall (+y)
+        target = (round(x0 + dy_px / g["s"]), round(y0 + dx_px / g["s"]))
+        slid = _slide_footprint(m["fp"], target, m["obstacles"])
+        m["pos"] = _snap_footprint(m["fp"], slid, m["obstacles"])
+        self.update()
+
+    def _finish_move(self):
+        m = self._move
+        self._move = None
+        x0, y0, _l, _w = m["fp"]
+        nx, ny = m["pos"]
+        if abs(nx - x0) < 0.01 and abs(ny - y0) < 0.01:
+            self.update()
+            return
+        slot = m["slot"]
+        slot.x_in, slot.y_in = nx, ny
+        _refresh_plan_metrics(self.plan)
+        self.plan_changed.emit()
+        self.update()
+
+    # ── Swap two pieces between slots (Ctrl+drag) ────────────────────────────
     def _swap_pieces(self, src: tuple, dst: tuple):
-        slot_map = {(s.row, s.col): s for s in self.plan.slots}
+        slot_map = {(s.row, s.col): s for s in self.plan.slots if s.tier == 0}
         s1, s2 = slot_map.get(src), slot_map.get(dst)
         if not s1 or s2 is None or s1.is_center or s2.is_center:
             return
-        s1.piece, s2.piece = s2.piece, s1.piece
-        self.plan.axle_weights, self.plan.violations = _calc_axle_weights(
-            self.plan.slots, self.plan.override)
+        # Stacked tops travel with their bottom crate
+        tops = {(s.row, s.col): s for s in self.plan.slots if s.tier == 1}
+        t1, t2 = tops.get(src), tops.get(dst)
+        # Crates only trade places with crates for the same stop (or move into an
+        # open position in a row of their own stop)
+        if s2.piece is not None:
+            same_stop = s2.piece.stop == s1.piece.stop
+        else:
+            same_stop = all(s.piece.stop == s1.piece.stop for s in self.plan.slots
+                            if s.row == s2.row and s.piece)
+        if not same_stop:
+            QToolTip.showText(QCursor.pos(), "Swap not allowed — crates stay in their "
+                              "delivery stop's zone.", self)
+            return
+        saved = [(s1.x_in, s1.y_in), (s2.x_in, s2.y_in)]
+
+        def exchange():
+            s1.piece, s2.piece = s2.piece, s1.piece
+            for t in (t1, t2):
+                if t:
+                    t.row, t.col = (dst if (t.row, t.col) == src else src)
+            return _relayout_rows(self.plan.slots)
+
+        # Swapped crates take their new position's normal spot (manual moves cleared)
+        s1.x_in = s1.y_in = s2.x_in = s2.y_in = None
+        new_len = exchange()
+        problems = _layout_problems(self.plan.slots)
+        if new_len > TRAILER["interior_length_in"] + FIT_TOLERANCE_IN or problems:
+            exchange()
+            (s1.x_in, s1.y_in), (s2.x_in, s2.y_in) = saved
+            why = (f"the load would be {new_len:.0f}\" long, more than the "
+                   f"{TRAILER['interior_length_in']}\" trailer" if not problems
+                   else problems[0] + " (a crate you moved is in the way)")
+            QToolTip.showText(QCursor.pos(), f"Swap not allowed — {why}.", self)
+            self.update()
+            return
+        _refresh_plan_metrics(self.plan)
         self.plan_changed.emit()
         self.update()
 
     # ── Mouse events ─────────────────────────────────────────────────────────
+    def _draggable(self, key) -> bool:
+        """Side-by-side crates can be swapped (Ctrl+drag)."""
+        s = self._floor_slot(key)
+        return bool(s and not s.is_center)
+
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         key = self._slot_at(event.pos())
-        if key:
-            slot_map = {(s.row, s.col): s for s in self.plan.slots}
-            s = slot_map.get(key)
-            if s and s.piece and not s.is_center:
+        slot = self._floor_slot(key)
+        if slot is None:
+            return
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self._draggable(key):
                 self._drag_src = key
-                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        else:
+            self._start_move(slot, event.pos())
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, event):
+        if self._move:
+            self._update_move(event.pos())
+            return
         key = self._slot_at(event.pos())
         if key != self._hover_slot:
             self._hover_slot = key
             self.update()
         if self._drag_src:
-            slot_map = {(s.row, s.col): s for s in self.plan.slots}
-            tgt = slot_map.get(key) if key else None
+            tgt = next((s for s in self.plan.slots
+                        if (s.row, s.col) == key and s.tier == 0), None) if key else None
             can_drop = (key and key != self._drag_src and
-                        tgt is not None and not (tgt.is_center and tgt.piece))
+                        tgt is not None and not tgt.is_center)
             self.setCursor(Qt.CursorShape.DragMoveCursor if can_drop
                            else Qt.CursorShape.ClosedHandCursor)
+        elif self._floor_slot(key):
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            slot = self._floor_slot(key)
+            self.setToolTip(f"{slot.piece.crate_label}: drag to shift"
+                            + ("  ·  Ctrl+drag to swap" if not slot.is_center else ""))
         else:
-            slot_map = {(s.row, s.col): s for s in self.plan.slots} if self.plan else {}
-            s = slot_map.get(key) if key else None
-            if s and s.piece and not s.is_center:
-                self.setCursor(Qt.CursorShape.OpenHandCursor)
-            else:
-                self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.setToolTip("")
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self._drag_src:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._move:
+            self._finish_move()
+        elif self._drag_src:
             dst = self._slot_at(event.pos())
             if dst and dst != self._drag_src:
                 self._swap_pieces(self._drag_src, dst)
             self._drag_src = None
-            self.setCursor(Qt.CursorShape.ArrowCursor)
-            self.update()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
 
     def leaveEvent(self, event):
+        if self._move:          # keep a drag alive if the mouse briefly leaves
+            return
         self._drag_src = None
         self._hover_slot = None
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -1174,357 +2194,1438 @@ class TrailerView(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self._draw(painter)
-
-    def _draw(self, painter: QPainter):
+        self._geom = {}
+        self._hits = _draw_top_plan(painter, QRectF(self.rect()).adjusted(8, 4, -8, -4),
+                                    self.plan, self.securement, geom=self._geom)
+        if self._hits:   # zoom buttons centre on the trailer, not the notes column
+            self.zoom_focus_x = (min(r.left() for r in self._hits.values()) +
+                                 max(r.right() for r in self._hits.values())) / 2
         if not self.plan or not self.plan.slots:
+            painter.setPen(QColor("#555"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
                              "No load plan — press Calculate.")
             return
-
-        slots  = self.plan.slots
-        rows   = sorted(set(s.row for s in slots))
-        n_rows = len(rows)
-
-        grid_x, grid_w, grid_y, grid_h, col_w, M, NOSE_H, ROW_LBL = self._layout()
-        H = self.height()
-        trailer_len = TRAILER["interior_length_in"]
-        interior_w  = TRAILER["interior_width_in"]
-
-        # Trailer outline
-        painter.setPen(QPen(QColor("#444"), 2))
-        painter.setBrush(QBrush(QColor("#f5f5f0")))
-        painter.drawRect(QRectF(grid_x, grid_y, grid_w, grid_h))
-
-        # Nose label
-        font = QFont("Arial", 8, QFont.Weight.Bold)
-        painter.setFont(font)
-        painter.setPen(QColor("#333"))
-        painter.drawText(QRectF(grid_x, M, grid_w, NOSE_H),
-                         Qt.AlignmentFlag.AlignCenter, "◀  NOSE")
-
-        # Axle reference lines
-        tandem_in = TRAILER["tandem_from_nose_in"]
-        for depth, label, color in [
-            (36,        "Drive Axles",   "#e67e00"),
-            (tandem_in, "Trailer Axles", "#c0392b"),
-        ]:
-            ay = grid_y + (depth / trailer_len) * grid_h
-            painter.setPen(QPen(QColor(color), 1.5, Qt.PenStyle.DashLine))
-            painter.drawLine(QPointF(grid_x, ay), QPointF(grid_x + grid_w, ay))
-            painter.setPen(QColor(color))
-            painter.setFont(QFont("Arial", 6))
-            painter.drawText(QRectF(grid_x + 2, ay - 12, grid_w - 4, 12),
-                             Qt.AlignmentFlag.AlignRight, label)
-
-        COLORS = [
-            "#4a90d9","#e67e22","#27ae60","#8e44ad","#c0392b","#16a085",
-            "#d35400","#2980b9","#7f8c8d","#f39c12","#1abc9c","#e74c3c",
-        ]
-        slot_map   = {(s.row, s.col, s.tier): s for s in slots}
-        font_big   = QFont("Arial", 7, QFont.Weight.Bold)
-        font_small = QFont("Arial", 5)
-        font_rlbl  = QFont("Arial", 7, QFont.Weight.Bold)
-
-        for r_pos, r in enumerate(rows):
-            sa = slot_map.get((r, 0, 0))
-            if not sa:
-                continue
-            y_px     = grid_y + (sa.row_start_in / trailer_len) * grid_h
-            piece_h  = ((sa.piece.length_in / trailer_len) * grid_h) if sa.piece else (grid_h / n_rows)
-
-            # Row label
-            painter.setFont(font_rlbl)
-            painter.setPen(QColor("#444"))
-            painter.drawText(QRectF(M, y_px, ROW_LBL - 2, piece_h),
-                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                             f"R{r+1}")
-
-            for c in range(2):
-                slot = slot_map.get((r, c, 0))
-                x = grid_x + c * col_w
-
-                if slot and slot.piece:
-                    if slot.col == 1 and slot.is_center:
-                        continue  # center piece drawn once via col=0
-                    ph = (slot.piece.length_in / trailer_len) * grid_h
-                    if slot.is_center:
-                        crate_ratio = min(slot.piece.width_in / interior_w, 1.0)
-                        piece_w_px  = grid_w * crate_ratio
-                        total_gap   = grid_w - piece_w_px
-                        if slot.piece.placement == "alt_center":
-                            # Alternate left/right by visual row position
-                            load_left = (r_pos % 2 == 0)
-                            offset_px = 0 if load_left else total_gap
-                        else:
-                            offset_px = total_gap / 2
-                        cell = QRectF(grid_x + offset_px + 1, y_px + 1,
-                                      piece_w_px - 2, ph - 2)
-                    else:
-                        cell = QRectF(x + 1, y_px + 1, col_w - 2, ph - 2)
-
-                    color = QColor(COLORS[(slot.piece.piece_id - 1) % len(COLORS)])
-                    painter.setBrush(QBrush(color))
-                    painter.setPen(QPen(QColor("#222"), 0.5))
-                    painter.drawRect(cell)
-
-                    painter.setFont(font_big)
-                    painter.setPen(Qt.GlobalColor.white)
-                    if slot.is_center:
-                        if slot.piece.placement == "alt_center":
-                            load_left = (r_pos % 2 == 0)
-                            direction = "← LEFT" if load_left else "RIGHT →"
-                            painter.drawText(cell.adjusted(2, 2, -2, -2),
-                                             Qt.AlignmentFlag.AlignCenter,
-                                             f"{direction}\n{slot.piece.crate_label}\n{slot.piece.weight_lbs:,.0f} lb")
-                        else:
-                            painter.drawText(cell.adjusted(2, 2, -2, -2),
-                                             Qt.AlignmentFlag.AlignCenter,
-                                             f"CENTER\n{slot.piece.crate_label}\n{slot.piece.weight_lbs:,.0f} lb")
-                    else:
-                        painter.drawText(cell.adjusted(2, 2, -2, -cell.height() // 2),
-                                         Qt.AlignmentFlag.AlignCenter, slot.piece.crate_label)
-                        painter.setFont(font_small)
-                        painter.drawText(cell.adjusted(2, cell.height() // 2, -2, -2),
-                                         Qt.AlignmentFlag.AlignCenter,
-                                         f"{slot.piece.weight_lbs:,.0f} lb")
-
-                    # Drag / drop highlights
-                    norm_key = (r, 0) if slot.is_center else (r, c)
-                    if self._drag_src and norm_key == self._drag_src:
-                        painter.setBrush(Qt.BrushStyle.NoBrush)
-                        painter.setPen(QPen(QColor("#f39c12"), 2.5))
-                        painter.drawRect(cell)
-                    elif (self._drag_src and self._hover_slot and
-                          norm_key == self._hover_slot and norm_key != self._drag_src):
-                        painter.setBrush(Qt.BrushStyle.NoBrush)
-                        painter.setPen(QPen(QColor("#27ae60"), 2.5))
-                        painter.drawRect(cell)
-
-                    # Stacked piece badge (amber, top-right corner)
-                    top_slot = slot_map.get((r, c, 1)) if not slot.is_center else None
-                    if top_slot and top_slot.piece:
-                        badge_w = min(cell.width() * 0.6, 56)
-                        badge_h = min(cell.height() * 0.35, 22)
-                        badge = QRectF(cell.right() - badge_w - 1,
-                                       cell.top() + 1, badge_w, badge_h)
-                        painter.setBrush(QBrush(TAN))
-                        painter.setPen(QPen(QColor("#8B6914"), 1))
-                        painter.drawRoundedRect(badge, 2, 2)
-                        painter.setFont(QFont("Arial", 5, QFont.Weight.Bold))
-                        painter.setPen(Qt.GlobalColor.white)
-                        painter.drawText(badge,
-                                         Qt.AlignmentFlag.AlignCenter,
-                                         f"▲{top_slot.piece.crate_label}")
-                else:
-                    cell = QRectF(x + 1, y_px + 1, col_w - 2, piece_h - 2)
-                    painter.setBrush(QBrush(QColor("#e8e8e8")))
-                    painter.setPen(QPen(QColor("#bbb"), 0.5, Qt.PenStyle.DashLine))
-                    painter.drawRect(cell)
-                    # Empty slot as drop target
-                    if (self._drag_src and self._hover_slot and
-                            (r, c) == self._hover_slot and (r, c) != self._drag_src):
-                        painter.setBrush(Qt.BrushStyle.NoBrush)
-                        painter.setPen(QPen(QColor("#27ae60"), 2.5))
-                        painter.drawRect(cell)
-
-        # Column labels at bottom
-        painter.setFont(QFont("Arial", 7))
-        painter.setPen(QColor("#555"))
-        for c, lbl in enumerate(["Position A (Left)", "Position B (Right)"]):
-            painter.drawText(QRectF(grid_x + c * col_w, H - 20, col_w, 18),
-                             Qt.AlignmentFlag.AlignCenter, lbl)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if self._move and self._geom:
+            # Ghost of where the crate will land, with its position readout
+            g, m = self._geom, self._move
+            x, y = m["pos"]
+            _x0, _y0, l, w = m["fp"]
+            ghost = QRectF(g["tx"] + y * g["s"], g["ty"] + x * g["s"], w * g["s"], l * g["s"])
+            painter.setBrush(QBrush(QColor(243, 156, 18, 70)))
+            painter.setPen(QPen(QColor("#f39c12"), 2.5, Qt.PenStyle.DashLine))
+            painter.drawRect(ghost)
+            W_in = TRAILER["interior_width_in"]
+            label = (f"{m['slot'].piece.crate_label}: {x:.0f}\" from nose · "
+                     f"{y:.0f}\" from left · {W_in - y - w:.0f}\" from right")
+            painter.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+            fm = painter.fontMetrics()
+            tag = QRectF(ghost.right() + 6, ghost.center().y() - 10,
+                         fm.horizontalAdvance(label) + 12, 20)
+            painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
+            painter.setPen(QPen(QColor("#f39c12"), 1))
+            painter.drawRoundedRect(tag, 4, 4)
+            painter.setPen(QColor("#333"))
+            painter.drawText(tag, Qt.AlignmentFlag.AlignCenter, label)
+        elif self._drag_src in self._hits:
+            painter.setPen(QPen(QColor("#f39c12"), 2.5))
+            painter.drawRect(self._hits[self._drag_src])
+            if self._hover_slot in self._hits and self._hover_slot != self._drag_src:
+                painter.setPen(QPen(QColor("#27ae60"), 2.5))
+                painter.drawRect(self._hits[self._hover_slot])
 
 
 # ── Side Elevation View widget ────────────────────────────────────────────────
 class SideElevationView(QWidget):
-    """Live side-elevation panel: shows height profile of each row, nose at left."""
+    """Live to-scale side elevation, nose at left, viewed from the left wall."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.plan: Optional[LoadPlan] = None
-        self.setMinimumSize(320, 300)
+        self.securement: list = []
+        self.setMinimumSize(320, 200)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def set_plan(self, plan: Optional[LoadPlan]):
         self.plan = plan
         self.update()
 
+    def set_securement(self, items: list):
+        self.securement = items
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self._draw(painter)
-
-    def _draw(self, painter: QPainter):
+        _draw_side_plan(painter, QRectF(self.rect()).adjusted(8, 8, -8, -8),
+                        self.plan, self.securement)
         if not self.plan or not self.plan.slots:
+            painter.setPen(QColor("#555"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
                              "No load plan — press Calculate.")
+
+
+# ── 3D View widget ────────────────────────────────────────────────────────────
+def _crate_boxes(plan: LoadPlan) -> list:
+    """World-space boxes for every placed piece (see _slot_boxes)."""
+    return _slot_boxes(plan.slots)
+
+
+def _slot_boxes(slots: list) -> list:
+    """
+    World-space boxes for every placed piece: (piece, x, y, z, l, w, h, tier).
+    x = inches from nose, y = inches from left wall (Position A), z = inches up.
+    Lateral placement mirrors the top view: alt_center alternates left/right by
+    visual row, center is centered, side-by-side pieces sit against their wall.
+    A floor crate moved by hand (x_in / y_in) carries its stacked crate with it.
+    """
+    interior_w = TRAILER["interior_width_in"]
+    rows = sorted(set(s.row for s in slots))
+    r_pos_of = {r: i for i, r in enumerate(rows)}
+    bottoms = {(s.row, s.col): s.piece for s in slots if s.tier == 0 and s.piece}
+
+    placed = []   # (slot, piece, x, y, z, l, w, h)
+    for s in slots:
+        if s.piece is None or (s.is_center and s.col == 1):
+            continue
+        p = s.piece
+        w = min(p.width_in, interior_w)
+        if s.is_center:
+            gap = interior_w - w
+            if p.placement == "alt_center":
+                if s.side:
+                    y = {"left": 0.0, "center": gap / 2}.get(s.side, gap)
+                else:   # plans built before walls were chosen: alternate by row
+                    y = 0.0 if r_pos_of[s.row] % 2 == 0 else gap
+            else:
+                y = gap / 2
+        else:
+            y = 0.0 if s.col == 0 else interior_w - w
+        z = 0.0
+        if s.tier == 1:
+            base = bottoms.get((s.row, s.col))
+            z = base.height_in if base else 0.0
+        placed.append((s, p, s.row_start_in, y, z, p.length_in, w, p.height_in))
+
+    # Manual moves: offset each moved floor crate and whatever sits on it
+    shift = {}
+    for s, p, x, y, *_ in placed:
+        if s.tier == 0 and s.x_in is not None:
+            shift[(s.row, 0 if s.is_center else s.col)] = (s.x_in - x, s.y_in - y)
+    boxes = []
+    for s, p, x, y, z, l, w, h in placed:
+        dx, dy = shift.get((s.row, 0 if s.is_center else s.col), (0.0, 0.0))
+        boxes.append((p, x + dx, y + dy, z, l, w, h, s.tier))
+    return boxes
+
+
+def _layout_problems(slots: list) -> list:
+    """Floor crates outside the trailer or overlapping each other (after manual moves)."""
+    L, W = TRAILER["interior_length_in"], TRAILER["interior_width_in"]
+    floor = [b for b in _slot_boxes(slots) if b[7] == 0]
+    out = []
+    for p, x, y, z, l, w, h, _t in floor:
+        if x < -0.01 or y < -0.01 or x + l > L + 0.01 or y + w > W + 0.01:
+            out.append(f"{p.crate_label} is outside the trailer")
+    for i, a in enumerate(floor):
+        for b2 in floor[i + 1:]:
+            if (min(a[1] + a[4], b2[1] + b2[4]) - max(a[1], b2[1]) > 0.01 and
+                    min(a[2] + a[5], b2[2] + b2[5]) - max(a[2], b2[2]) > 0.01):
+                out.append(f"{a[0].crate_label} overlaps {b2[0].crate_label}")
+    return out
+
+
+def _refresh_plan_metrics(plan: LoadPlan):
+    """Recompute length, axle weights and violations from where crates actually sit."""
+    boxes = _crate_boxes(plan)
+    plan.total_length_used_in = max((b[1] + b[4] for b in boxes if b[7] == 0), default=0.0)
+    plan.axle_weights, violations = _calc_axle_weights(plan.slots, plan.override)
+    plan.stop_axles = _stop_axles(plan.slots)
+    for delivered, steer, drive, trailer in plan.stop_axles:
+        for name, val, lim in (("STEER", steer, "steer_limit"), ("DRIVE", drive, "drive_limit"),
+                               ("TRAILER TANDEM", trailer, "trailer_limit")):
+            if val > TRAILER[lim]:
+                violations.append(f"AFTER STOP {delivered} DELIVERY: {name} {val:,.0f} lb > "
+                                  f"{TRAILER[lim]:,} lb limit")
+    if plan.unplaced:
+        violations.insert(0, _not_fit_message(plan.unplaced))
+    plan.violations = violations
+
+
+# ── Securement (load bars, straps, airbags) ──────────────────────────────────
+# Each item is anchored to a crate face: {"kind": ..., "piece_id": ..., "face": ...}
+# face ∈ nose / tail / left / right / top. Geometry is rebuilt from the current
+# plan on every draw, so items follow their crate when the plan is recalculated.
+SECUREMENT_KINDS = {"load_bar": "Load Bar", "strap": "Strap", "airbag": "Airbag"}
+SECUREMENT_COLORS = {
+    "load_bar": QColor("#9aa3ab"),
+    "strap":    QColor("#f1c40f"),
+    "airbag":   QColor(226, 233, 242, 225),
+}
+RATCHET_COLOR = QColor("#555555")
+FACE_OF_NORMAL = {(-1, 0, 0): "nose", (1, 0, 0): "tail", (0, -1, 0): "left",
+                  (0, 1, 0): "right", (0, 0, 1): "top", (0, 0, -1): "bottom"}
+AIRBAG_MIN_GAP = 2.0     # inches — smaller voids don't need a bag
+AIRBAG_MAX_GAP = 36.0    # inches — larger voids need a load bar or filler
+
+
+def _free_gap(face: str, plane: float, ranges: dict, boxes: list, skip_pid: int) -> float:
+    """
+    Clear distance from a crate face (at `plane`) to the next crate or trailer
+    wall in the face's direction. `ranges` maps the other two axes (0=x, 1=y,
+    2=z) to the (lo, hi) span that an obstacle must overlap to count.
+    """
+    axis = 0 if face in ("nose", "tail") else 1
+    positive = face in ("tail", "right")
+    limit = (TRAILER["interior_length_in"] if axis == 0 else TRAILER["interior_width_in"])
+    best = limit if positive else 0.0
+    for p, x, y, z, l, w, h, _t in boxes:
+        if p.piece_id == skip_pid:
+            continue
+        lo, size = (x, y, z), (l, w, h)
+        if any(min(b, lo[ax] + size[ax]) - max(a, lo[ax]) <= 0.5
+               for ax, (a, b) in ranges.items()):
+            continue
+        if positive and lo[axis] >= plane - 0.5:
+            best = min(best, lo[axis])
+        elif not positive and lo[axis] + size[axis] <= plane + 0.5:
+            best = max(best, lo[axis] + size[axis])
+    return abs(best - plane)
+
+
+def _boxes_overlap(a: tuple, b: tuple) -> bool:
+    """True if two (x, y, z, l, w, h, ...) parts intersect by more than a hair."""
+    return all(min(a[i] + a[i + 3], b[i] + b[i + 3]) - max(a[i], b[i]) > 0.05
+               for i in range(3))
+
+
+MAX_STRAPS_PER_FACE = 2
+
+
+def securement_parts(item: dict, boxes: list, items: list = None) -> tuple:
+    """
+    Solid parts for one securement item:
+    ([(x, y, z, l, w, h, QColor, shape), ...], error) with shape "box" or "pillow".
+    `items` (all securement) lets two straps on one face spread out.
+    Returns ([], None) when the anchor crate isn't in the plan (e.g. excluded).
+    """
+    parts, err = _securement_boxes(item, boxes, items or [item])
+    shape = "pillow" if item["kind"] == "airbag" else "box"
+    return [pt + (shape,) for pt in parts], err
+
+
+def _securement_boxes(item: dict, boxes: list, items: list) -> tuple:
+    box = next((b for b in boxes if b[0].piece_id == item["piece_id"]), None)
+    if box is None:
+        return [], None
+    p, x, y, z, l, w, h, _t = box
+    kind, face = item["kind"], item["face"]
+    W = TRAILER["interior_width_in"]
+    color = SECUREMENT_COLORS[kind]
+    tail = face == "tail"
+
+    if kind == "load_bar":
+        zc = z + h * 0.6
+        plane = x + l if tail else x
+        gap = _free_gap(face, plane, {1: (0, W), 2: (zc - 1.5, zc + 1.5)}, boxes, p.piece_id)
+        if gap < 3.0:
+            return [], f"No room for a load bar ({gap:.0f}\" clear behind {p.crate_label})"
+        x0 = plane + 0.3 if tail else plane - 3.3
+        return [(x0, 0, zc - 1.25, 3, W, 2.5, color),
+                (x0 - 0.5, 0, zc - 3, 4, 1.5, 6, color),          # wall feet
+                (x0 - 0.5, W - 1.5, zc - 3, 4, 1.5, 6, color)], None
+
+    if kind == "strap":
+        # Rank among straps sharing this crate face (0 or 1)
+        siblings = sorted(it.get("n", 0) for it in items if it["kind"] == "strap"
+                          and it["piece_id"] == item["piece_id"] and it["face"] == face)
+        rank = siblings.index(item.get("n", 0)) if item.get("n", 0) in siblings else 0
+        if face in ("nose", "tail"):
+            # Upper strap clears a load bar (0.6h) on the same face; second strap goes low
+            zc = z + h * (0.8 if rank == 0 else 0.3)
+            plane = x + l if tail else x
+            gap = _free_gap(face, plane, {1: (0, W), 2: (zc - 1, zc + 1)}, boxes, p.piece_id)
+            if gap < 1.0:
+                return [], (f"No room for a strap on the {face} of {p.crate_label} — "
+                            f"the next crate is right against it")
+            x0 = x + l + 0.1 if tail else x - 0.5
+            return [(x0, 0, zc - 1, 0.4, W, 2, color),
+                    (x0 - 0.6 if not tail else x0, W * 0.65, zc - 1.5, 1.0, 4, 3, RATCHET_COLOR)], None
+        # Over the top, down both sides of the crate; two straps sit at 1/4 and 3/4
+        xc = x + l * ((0.5,) if len(siblings) < 2 else (0.25, 0.75))[min(rank, 1)]
+        return [(xc - 1, y, z + h, 2, w, 0.4, color),
+                (xc - 1, y - 0.4, z, 2, 0.4, h + 0.4, color),
+                (xc - 1, y + w, z, 2, 0.4, h + 0.4, color),
+                (xc - 1.5, y + w + 0.4, z + h * 0.5, 3, 1.0, 4, RATCHET_COLOR)], None
+
+    if kind == "airbag":
+        if face in ("nose", "tail"):
+            plane = x + l if tail else x
+            gap = _free_gap(face, plane, {1: (y, y + w), 2: (z, z + h)}, boxes, p.piece_id)
+        else:
+            def side_gap(sd):
+                pl = y + w if sd == "right" else y
+                return pl, _free_gap(sd, pl, {0: (x, x + l), 2: (z, z + h)}, boxes, p.piece_id)
+            plane, gap = side_gap(face)
+            other = "right" if face == "left" else "left"
+            # An airbag beside a crate follows the gap: if a re-plan moved the crate to
+            # the other wall, use the opposite side (unless another airbag is already there)
+            if gap < AIRBAG_MIN_GAP and not any(
+                    it is not item and it["kind"] == "airbag" and
+                    it["piece_id"] == item["piece_id"] and it["face"] == other for it in items):
+                o_plane, o_gap = side_gap(other)
+                if o_gap >= AIRBAG_MIN_GAP:
+                    face, plane, gap = other, o_plane, o_gap
+        if gap < AIRBAG_MIN_GAP:
+            return [], f"No void to fill on the {face} of {p.crate_label} ({gap:.1f}\")"
+        if gap > AIRBAG_MAX_GAP:
+            return [], (f"Void on the {face} of {p.crate_label} is {gap:.0f}\" — "
+                        f"too large for an airbag. Use a load bar or filler.")
+        t = gap - 0.6
+        zb, hb = z + h * 0.1, h * 0.8
+        if face in ("nose", "tail"):
+            x0 = plane + 0.3 if tail else plane - 0.3 - t
+            return [(x0, y + w * 0.1, zb, t, w * 0.8, hb, color)], None
+        y0 = plane + 0.3 if face == "right" else plane - 0.3 - t
+        return [(x + l * 0.1, y0, zb, l * 0.8, t, hb, color)], None
+
+    return [], f"Unknown securement type: {kind}"
+
+
+class Trailer3DView(QWidget):
+    """
+    Rotatable 3D view of the loaded trailer (software-rendered with QPainter).
+    In a securement tool mode, clicking a crate face adds a load bar / strap /
+    airbag against that face; Remove mode deletes the clicked item.
+    """
+    securement_changed = pyqtSignal()
+
+    PRESETS = {                      # (yaw°, pitch°)
+        "3/4 View": (-40.0, 28.0),
+        "Top":      (0.0, 89.5),
+        "Side":     (-90.0, 0.0),
+        "Rear":     (0.0, 6.0),
+    }
+    TOOL_HINTS = {
+        "rotate":   "Drag: rotate  ·  Right-drag: pan  ·  Wheel: zoom  ·  Double-click: reset",
+        "load_bar": "Load Bar: click the nose or tail face of a crate  ·  drag still rotates",
+        "strap":    "Strap: click a crate's nose/tail face (across) or top (over the top)",
+        "airbag":   "Airbag: click a crate face next to a gap (side gap to wall, or between rows)",
+        "remove":   "Remove: click a load bar, strap or airbag to delete it",
+    }
+    CLICK_SLOP = 4   # px of mouse movement still treated as a click
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.plan: Optional[LoadPlan] = None
+        self.securement: list = []
+        self.tool = "rotate"
+        self.setMinimumSize(320, 300)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
+        self._last_mouse = None
+        self._press_pos = None
+        self._dragged = False
+        self._drag_button = None
+        self._fit_focal = None
+        self._pick: list = []        # [(QPolygonF, tag)] in paint order
+        self._hover = None           # (QPolygonF, tag) under the cursor
+        self._message = ("", None)   # (text, QColor) feedback line
+        self.print_mode = False      # True when rendering into a PDF: no hints/overlay
+        self.reset_view()
+
+    def set_plan(self, plan: Optional[LoadPlan]):
+        self.plan = plan
+        self.update()
+
+    def set_securement(self, items: list):
+        self.securement = items
+        self.update()
+
+    def set_tool(self, tool: str):
+        self.tool = tool
+        self._hover = None
+        self._message = ("", None)
+        self.setCursor(Qt.CursorShape.ArrowCursor if tool == "rotate"
+                       else Qt.CursorShape.CrossCursor)
+        self.update()
+
+    def set_preset(self, name: str):
+        self.yaw, self.pitch = self.PRESETS[name]
+        self.zoom = 1.0
+        self.target = [TRAILER["interior_length_in"] / 2,
+                       TRAILER["interior_width_in"] / 2,
+                       TRAILER["interior_height_in"] / 2]
+        self._fit_focal = None   # re-fit the trailer to the window for this angle
+        self.update()
+
+    def reset_view(self):
+        self.set_preset("3/4 View")
+
+    def resizeEvent(self, event):
+        self._fit_focal = None
+        super().resizeEvent(event)
+
+    # ── Securement editing ───────────────────────────────────────────────────
+    def add_securement(self, kind: str, piece_id: int, face: str) -> bool:
+        if face == "bottom":
+            face = "top"
+        if kind == "load_bar" and face not in ("nose", "tail"):
+            face = "tail"
+        elif kind == "strap" and face in ("left", "right"):
+            face = "top"
+        elif kind == "airbag" and face == "top":
+            self._message = ("Airbags go in gaps — click a side, nose or tail face.",
+                             QColor("#c0392b"))
+            return False
+
+        same = [it for it in self.securement if it["kind"] == kind
+                and it["piece_id"] == piece_id and it["face"] == face]
+        limit = MAX_STRAPS_PER_FACE if kind == "strap" else 1
+        if len(same) >= limit:
+            self._message = (f"Already {limit} straps on that face." if limit > 1
+                             else "That item is already there.", QColor("#c0392b"))
+            return False
+        used = {it.get("n", 0) for it in same}
+        item = {"kind": kind, "piece_id": piece_id, "face": face,
+                "n": min(set(range(limit)) - used)}
+        boxes = _crate_boxes(self.plan) if self.plan else []
+        trial = self.securement + [item]
+        parts, err = securement_parts(item, boxes, trial)
+        if err:
+            self._message = (err, QColor("#c0392b"))
+            return False
+        for other in self.securement:
+            other_parts, _ = securement_parts(other, boxes, trial)
+            if any(_boxes_overlap(a, b) for a in parts for b in other_parts):
+                self._message = (f"That would overlap an existing "
+                                 f"{SECUREMENT_KINDS[other['kind']].lower()}.",
+                                 QColor("#c0392b"))
+                return False
+
+        self.securement.append(item)
+        label = next((b[0].crate_label for b in boxes if b[0].piece_id == piece_id), "")
+        nth = " (2nd strap on this face)" if kind == "strap" and same else ""
+        self._message = (f"Added {SECUREMENT_KINDS[kind].lower()} — {label} {face}{nth}",
+                         QColor("#27ae60"))
+        self.securement_changed.emit()
+        return True
+
+    def unfit_indices(self) -> list:
+        """Indices of this truck's securement items that don't fit the current layout."""
+        if not self.plan:
+            return []
+        boxes = _crate_boxes(self.plan)
+        ids = {b[0].piece_id for b in boxes}
+        return [i for i, it in enumerate(self.securement)
+                if it["piece_id"] in ids and securement_parts(it, boxes, self.securement)[1]]
+
+    def remove_unfit(self) -> int:
+        bad = self.unfit_indices()
+        for i in reversed(bad):
+            self.securement.pop(i)
+        if bad:
+            self._message = (f"Removed {len(bad)} hidden item(s)", QColor("#27ae60"))
+            self.securement_changed.emit()
+        self.update()
+        return len(bad)
+
+    def remove_securement(self, index: int):
+        if 0 <= index < len(self.securement):
+            item = self.securement.pop(index)
+            self._message = (f"Removed {SECUREMENT_KINDS[item['kind']].lower()}",
+                             QColor("#27ae60"))
+            self.securement_changed.emit()
+
+    def _tag_at(self, pos):
+        """Topmost picked face under `pos`: (QPolygonF, tag) or None."""
+        for poly, tag in reversed(self._pick):
+            if poly.containsPoint(pos, Qt.FillRule.OddEvenFill):
+                return poly, tag
+        return None
+
+    def _hover_target(self, pos):
+        """What a click at `pos` would act on in the current tool mode."""
+        if self.tool == "rotate":
+            return None
+        hit = self._tag_at(pos)
+        if not hit:
+            return None
+        want = "item" if self.tool == "remove" else "crate"
+        return hit if hit[1][0] == want else None
+
+    def _click(self, pos):
+        target = self._hover_target(pos)
+        if target is None:
+            if self.tool == "remove":
+                self._message = ("Click directly on a load bar, strap or airbag.", QColor("#777"))
+            else:
+                self._message = ("Click on a crate face.", QColor("#777"))
+        elif self.tool == "remove":
+            self.remove_securement(target[1][1])
+        else:
+            _, pid, face = target[1]
+            self.add_securement(self.tool, pid, face)
+        self.update()
+        self._hover = self._hover_target(pos)
+
+    # ── Camera ───────────────────────────────────────────────────────────────
+    def _camera(self):
+        L, W, H = (TRAILER["interior_length_in"], TRAILER["interior_width_in"],
+                   TRAILER["interior_height_in"])
+        diag = math.sqrt(L * L + W * W + H * H)
+        base_d = diag * 2.2
+        dist = base_d / self.zoom
+        yaw, pitch = math.radians(self.yaw), math.radians(self.pitch)
+        off = (math.cos(pitch) * math.cos(yaw),
+               math.cos(pitch) * math.sin(yaw),
+               math.sin(pitch))
+        cam = [self.target[i] + dist * off[i] for i in range(3)]
+        fwd = [-o for o in off]
+        # right = fwd × up(Z); up = right × fwd
+        right = [fwd[1], -fwd[0], 0.0]
+        rn = math.hypot(right[0], right[1]) or 1e-9
+        right = [right[0] / rn, right[1] / rn, 0.0]
+        up = [right[1] * fwd[2] - right[2] * fwd[1],
+              right[2] * fwd[0] - right[0] * fwd[2],
+              right[0] * fwd[1] - right[1] * fwd[0]]
+        if self._fit_focal is None:
+            self._fit_focal = self._compute_fit(cam, fwd, right, up)
+        return cam, fwd, right, up, self._fit_focal
+
+    def _compute_fit(self, cam, fwd, right, up) -> float:
+        """Focal length that makes the whole trailer fill ~90% of the widget."""
+        L, W, H = (TRAILER["interior_length_in"], TRAILER["interior_width_in"],
+                   TRAILER["interior_height_in"])
+        xs, ys = [], []
+        for pt in [(x, y, z) for x in (0, L) for y in (0, W) for z in (0, H)]:
+            d = [pt[i] - cam[i] for i in range(3)]
+            zc = sum(d[i] * fwd[i] for i in range(3))
+            if zc < 1.0:
+                continue
+            xs.append(sum(d[i] * right[i] for i in range(3)) / zc)
+            ys.append(sum(d[i] * up[i] for i in range(3)) / zc)
+        if not xs:
+            return float(min(self.width(), self.height()))
+        # The view is centred on the trailer, so fit the larger half-extent each way
+        half_w = max(abs(min(xs)), abs(max(xs))) or 1e-6
+        half_h = max(abs(min(ys)), abs(max(ys))) or 1e-6
+        return 0.45 * min(self.width() / half_w, (self.height() - 40) / half_h)
+
+    def _project(self, pt, cam_data):
+        cam, fwd, right, up, focal = cam_data
+        d = [pt[0] - cam[0], pt[1] - cam[1], pt[2] - cam[2]]
+        zc = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2]
+        if zc < 1.0:
+            return None
+        xc = d[0] * right[0] + d[1] * right[1] + d[2] * right[2]
+        yc = d[0] * up[0] + d[1] * up[1] + d[2] * up[2]
+        return QPointF(self.width() / 2 + focal * xc / zc,
+                       self.height() / 2 - focal * yc / zc)
+
+    def _poly(self, pts, cam_data):
+        out = [self._project(p, cam_data) for p in pts]
+        return None if any(q is None for q in out) else out
+
+    # ── Mouse: left-drag rotate, right/middle-drag pan, wheel zoom, click = tool ─
+    def mousePressEvent(self, event):
+        self._last_mouse = event.position()
+        self._press_pos = event.position()
+        self._dragged = False
+        self._drag_button = event.button()
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        if self._last_mouse is None:
+            # No button held — just track what a click would hit
+            hover = self._hover_target(pos)
+            if (hover and hover[1]) != (self._hover and self._hover[1]):
+                self._hover = hover
+                self.update()
             return
+        if not self._dragged:
+            if (abs(pos.x() - self._press_pos.x()) + abs(pos.y() - self._press_pos.y())
+                    < self.CLICK_SLOP):
+                return
+            self._dragged = True
+            self._hover = None
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        dx, dy = pos.x() - self._last_mouse.x(), pos.y() - self._last_mouse.y()
+        self._last_mouse = pos
+        if self._drag_button == Qt.MouseButton.LeftButton:
+            self.yaw = (self.yaw - dx * 0.4) % 360
+            self.pitch = max(-10.0, min(89.5, self.pitch + dy * 0.4))
+        else:
+            cam, fwd, right, up, focal = self._camera()
+            dist = math.dist(cam, self.target)
+            scale = dist / focal
+            for i in range(3):
+                self.target[i] += (-dx * right[i] + dy * up[i]) * scale
+        self.update()
 
-        slots = self.plan.slots
-        rows  = sorted(set(s.row for s in slots))
-        n_rows = len(rows)
-        if not n_rows:
-            return
+    def mouseReleaseEvent(self, event):
+        was_click = (not self._dragged and self._drag_button == Qt.MouseButton.LeftButton)
+        self._last_mouse = None
+        self._press_pos = None
+        self._drag_button = None
+        self._dragged = False
+        self.setCursor(Qt.CursorShape.ArrowCursor if self.tool == "rotate"
+                       else Qt.CursorShape.CrossCursor)
+        if was_click and self.tool != "rotate":
+            self._click(event.position())
 
-        W, H = self.width(), self.height()
-        ML, MR, MT, MB = 52, 16, 30, 36   # margins: left (ruler), right, top, bottom (row labels)
+    def mouseDoubleClickEvent(self, event):
+        if self.tool == "rotate":
+            self.reset_view()
 
-        interior_h  = TRAILER["interior_height_in"]
-        interior_len = TRAILER["interior_length_in"]
+    def leaveEvent(self, event):
+        if self._hover:
+            self._hover = None
+            self.update()
 
-        draw_x = ML
-        draw_y = MT
-        draw_w = W - ML - MR
-        draw_h = H - MT - MB
+    def wheelEvent(self, event):
+        steps = event.angleDelta().y() / 120
+        self.zoom = max(0.5, min(2.5, self.zoom * (1.15 ** steps)))
+        self.update()
 
-        h_scale = draw_h / interior_h
+    # ── Drawing ──────────────────────────────────────────────────────────────
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#fafafa"))
+        self._draw(painter)
 
-        slot_map = {}
-        for s in slots:
-            if s.piece:
-                slot_map[(s.row, s.col, s.tier)] = s
+    def _draw_solid(self, painter, cd, x0, y0, z0, x1, y1, z1, base: QColor, tag):
+        """Draw the camera-facing faces of an axis-aligned box and record them for picking."""
+        cam = cd[0]
+        light = (0.35, -0.45, 0.82)
+        faces = [
+            ((-1, 0, 0), [(x0, y0, z0), (x0, y1, z0), (x0, y1, z1), (x0, y0, z1)]),
+            ((1, 0, 0),  [(x1, y0, z0), (x1, y0, z1), (x1, y1, z1), (x1, y1, z0)]),
+            ((0, -1, 0), [(x0, y0, z0), (x0, y0, z1), (x1, y0, z1), (x1, y0, z0)]),
+            ((0, 1, 0),  [(x0, y1, z0), (x1, y1, z0), (x1, y1, z1), (x0, y1, z1)]),
+            ((0, 0, -1), [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0)]),
+            ((0, 0, 1),  [(x0, y0, z1), (x0, y1, z1), (x1, y1, z1), (x1, y0, z1)]),
+        ]
+        for n, pts in faces:
+            fc = pts[0]
+            to_cam = (cam[0] - fc[0], cam[1] - fc[1], cam[2] - fc[2])
+            if n[0] * to_cam[0] + n[1] * to_cam[1] + n[2] * to_cam[2] <= 0:
+                continue  # back face
+            poly = self._poly(pts, cd)
+            if not poly:
+                continue
+            shade = 0.55 + 0.45 * max(0.0, n[0] * light[0] + n[1] * light[1] + n[2] * light[2])
+            painter.setBrush(QBrush(QColor(int(base.red() * shade), int(base.green() * shade),
+                                           int(base.blue() * shade), base.alpha())))
+            painter.setPen(QPen(QColor("#222"), 0.8))
+            painter.drawPolygon(poly)
+            if tag is not None:
+                face_tag = tag + (FACE_OF_NORMAL[n],) if tag[0] == "crate" else tag
+                self._pick.append((QPolygonF(poly), face_tag))
 
-        row_w = draw_w / n_rows
+    _PILLOW_MESH = None
 
-        # Trailer ceiling
-        painter.setPen(QPen(QColor("#444"), 2))
-        painter.drawLine(QPointF(draw_x, draw_y),
-                         QPointF(draw_x + draw_w, draw_y))
-        painter.setFont(QFont("Arial", 7))
-        painter.setPen(QColor("#444"))
-        painter.drawText(QRectF(draw_x, draw_y - 14, 120, 13),
-                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                         f"Ceiling {interior_h}\"")
+    @classmethod
+    def _pillow_mesh(cls):
+        """Unit superellipsoid quads (flat faces, rounded edges). It is convex,
+        so back-face culling alone gives the correct drawing order."""
+        if cls._PILLOW_MESH is None:
+            e, NU, NV = 0.45, 8, 16
+
+            def sp(t):
+                return math.copysign(abs(t) ** e, t)
+
+            def pt(i, j):
+                uu = -math.pi / 2 + math.pi * i / NU
+                vv = -math.pi + 2 * math.pi * j / NV
+                return (sp(math.cos(uu)) * sp(math.cos(vv)),
+                        sp(math.cos(uu)) * sp(math.sin(vv)),
+                        sp(math.sin(uu)))
+            cls._PILLOW_MESH = [(pt(i, j), pt(i, j + 1), pt(i + 1, j + 1), pt(i + 1, j))
+                                for i in range(NU) for j in range(NV)]
+        return cls._PILLOW_MESH
+
+    def _draw_pillow(self, painter, cd, x0, y0, z0, x1, y1, z1, base: QColor, tag):
+        """Airbag: a puffy rounded slab filling the box (x0..x1, y0..y1, z0..z1)."""
+        cam = cd[0]
+        c = ((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2)
+        half = ((x1 - x0) / 2, (y1 - y0) / 2, (z1 - z0) / 2)
+        light = (0.35, -0.45, 0.82)
+        for quad in self._pillow_mesh():
+            pts = [tuple(c[k] + half[k] * q[k] for k in range(3)) for q in quad]
+            a, b, d = pts[0], pts[1], pts[3]
+            if math.dist(a, b) < 1e-6:     # degenerate edge at the poles
+                b = pts[2]
+            e1 = [b[k] - a[k] for k in range(3)]
+            e2 = [d[k] - a[k] for k in range(3)]
+            n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                 e1[0] * e2[1] - e1[1] * e2[0]]
+            qc = [sum(p[k] for p in pts) / 4 for k in range(3)]
+            if sum(n[k] * (qc[k] - c[k]) for k in range(3)) < 0:
+                n = [-v for v in n]           # make it point outward
+            nl = math.sqrt(sum(v * v for v in n)) or 1e-9
+            n = [v / nl for v in n]
+            if sum(n[k] * (cam[k] - qc[k]) for k in range(3)) <= 0:
+                continue  # back face
+            poly = self._poly(pts, cd)
+            if not poly:
+                continue
+            shade = 0.6 + 0.4 * max(0.0, sum(n[k] * light[k] for k in range(3)))
+            col = QColor(int(base.red() * shade), int(base.green() * shade),
+                         int(base.blue() * shade), base.alpha())
+            painter.setBrush(QBrush(col))
+            painter.setPen(QPen(col, 0.6))   # same-colour pen hides mesh seams
+            painter.drawPolygon(poly)
+            if tag is not None:
+                self._pick.append((QPolygonF(poly), tag))
+
+    def _draw(self, painter: QPainter):
+        L, W, H = (TRAILER["interior_length_in"], TRAILER["interior_width_in"],
+                   TRAILER["interior_height_in"])
+        cd = self._camera()
+        cam = cd[0]
+        self._pick = []
 
         # Floor
-        floor_y = draw_y + draw_h
-        painter.setPen(QPen(QColor("#444"), 2))
-        painter.drawLine(QPointF(draw_x, floor_y),
-                         QPointF(draw_x + draw_w, floor_y))
+        floor = self._poly([(0, 0, 0), (L, 0, 0), (L, W, 0), (0, W, 0)], cd)
+        if floor:
+            painter.setPen(QPen(QColor("#888"), 1))
+            painter.setBrush(QBrush(QColor("#ebe6d8")))
+            painter.drawPolygon(floor)
 
-        # Height ruler
-        painter.setPen(QPen(QColor("#bbb"), 1))
-        for h_mark in range(0, interior_h + 1, 12):
-            y_mark = floor_y - h_mark * h_scale
-            painter.drawLine(QPointF(draw_x - 6, y_mark), QPointF(draw_x, y_mark))
-            painter.setFont(QFont("Arial", 6))
-            painter.setPen(QColor("#666"))
-            painter.drawText(QRectF(draw_x - ML, y_mark - 7, ML - 8, 14),
-                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                             f"{h_mark}\"")
-            painter.setPen(QPen(QColor("#bbb"), 1))
+        # Nose wall (light fill so the front of the trailer reads clearly)
+        nose = self._poly([(0, 0, 0), (0, W, 0), (0, W, H), (0, 0, H)], cd)
+        if nose:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(68, 68, 68, 28)))
+            painter.drawPolygon(nose)
 
-        font_lbl = QFont("Arial", 6, QFont.Weight.Bold)
-        font_sm  = QFont("Arial", 5)
-        GAP = 1
+        # Axle reference lines on the floor
+        for depth, label, color in [(36, "Drive Axles", "#e67e00"),
+                                    (TRAILER["tandem_from_nose_in"], "Trailer Axles", "#c0392b")]:
+            seg = self._poly([(depth, 0, 0.2), (depth, W, 0.2)], cd)
+            if seg:
+                painter.setPen(QPen(QColor(color), 1.5, Qt.PenStyle.DashLine))
+                painter.drawLine(seg[0], seg[1])
+                painter.setFont(QFont("Arial", 7))
+                painter.setPen(QColor(color))
+                painter.drawText(seg[1] + QPointF(4, 0), label)
 
-        for r_pos, r in enumerate(rows):
-            x0 = draw_x + r_pos * row_w
+        # Trailer frame edges
+        corners = [(x, y, z) for x in (0, L) for y in (0, W) for z in (0, H)]
+        painter.setPen(QPen(QColor("#666"), 1.2))
+        for i, a in enumerate(corners):
+            for b in corners[i + 1:]:
+                if sum(1 for k in range(3) if a[k] != b[k]) == 1:
+                    seg = self._poly([a, b], cd)
+                    if seg:
+                        painter.drawLine(seg[0], seg[1])
 
-            # Collect the two cols (or just col=0 for center)
-            drawn_center = False
-            for c in range(2):
-                bot = slot_map.get((r, c, 0))
-                top = slot_map.get((r, c, 1))
+        for pt, text in [((0, W / 2, H + 8), "NOSE"), ((L, W / 2, H + 8), "DOORS")]:
+            q = self._project(pt, cd)
+            if q:
+                painter.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+                painter.setPen(QColor("#333"))
+                painter.drawText(QRectF(q.x() - 40, q.y() - 14, 80, 14),
+                                 Qt.AlignmentFlag.AlignCenter, text)
 
-                if bot and bot.is_center:
-                    if drawn_center:
-                        continue
-                    drawn_center = True
-                    cell_x = x0 + GAP
-                    cell_w = row_w - GAP * 2
-                elif bot:
-                    cell_x = x0 + c * (row_w / 2) + GAP
-                    cell_w = row_w / 2 - GAP * 2
-                else:
-                    continue
-
-                if bot and bot.piece:
-                    bot_h_px = bot.piece.height_in * h_scale
-                    bot_rect = QRectF(cell_x, floor_y - bot_h_px, cell_w, bot_h_px)
-                    painter.setBrush(QBrush(TEAL_LIGHT))
-                    painter.setPen(QPen(TEAL_DARK, 1))
-                    painter.drawRect(bot_rect)
-
-                    painter.setFont(font_lbl)
-                    painter.setPen(TEAL_DARK)
-                    painter.drawText(bot_rect.adjusted(1, 1, -1, -1),
-                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-                                     bot.piece.crate_label)
-                    painter.setFont(font_sm)
-                    painter.drawText(bot_rect.adjusted(1, 1, -1, -1),
-                                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
-                                     f"{bot.piece.height_in:.0f}\"")
-
-                    if top and top.piece:
-                        top_h_px = top.piece.height_in * h_scale
-                        top_rect = QRectF(cell_x, floor_y - bot_h_px - top_h_px,
-                                          cell_w, top_h_px)
-                        painter.setBrush(QBrush(TAN))
-                        painter.setPen(QPen(QColor("#8B6914"), 1))
-                        painter.drawRect(top_rect)
-
-                        painter.setFont(font_lbl)
-                        painter.setPen(QColor("#fff"))
-                        painter.drawText(top_rect.adjusted(1, 1, -1, -1),
-                                         Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-                                         top.piece.crate_label)
-                        painter.setFont(font_sm)
-                        painter.drawText(top_rect.adjusted(1, 1, -1, -1),
-                                         Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom,
-                                         f"{top.piece.height_in:.0f}\"")
-
-                        # Red outline if combined height exceeds interior
-                        if bot.piece.height_in + top.piece.height_in > interior_h:
-                            painter.setBrush(Qt.BrushStyle.NoBrush)
-                            painter.setPen(QPen(QColor("#c0392b"), 2))
-                            painter.drawRect(QRectF(cell_x, floor_y - (bot_h_px + top_h_px),
-                                                    cell_w, bot_h_px + top_h_px))
-
-            # Row label below floor
-            painter.setFont(font_sm)
+        if not self.plan or not self.plan.slots:
             painter.setPen(QColor("#555"))
-            painter.drawText(QRectF(x0, floor_y + 3, row_w, MB - 4),
-                             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-                             f"R{r+1}")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             "No load plan — press Calculate.")
+            self._draw_overlay(painter, 0)
+            return
 
-        # Nose / Tail labels
-        painter.setFont(QFont("Arial", 7, QFont.Weight.Bold))
-        painter.setPen(QColor("#333"))
-        painter.drawText(QRectF(draw_x, draw_y, 40, draw_h),
-                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, "NOSE▶")
-        painter.drawText(QRectF(draw_x + draw_w - 40, draw_y, 40, draw_h),
-                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "◀TAIL")
+        # Solids to draw: crates (with labels) and securement parts
+        boxes = _crate_boxes(self.plan)
+        multi = len(plan_stops(self.plan)) > 1
+        solids = []   # (centre, (x0,y0,z0,x1,y1,z1), color, tag, label)
+        GAP = 0.6     # small inset so neighbouring crates show a seam
+        for piece, x, y, z, l, w, h, tier in boxes:
+            solids.append(((x + l / 2, y + w / 2, z + h / 2),
+                           (x + GAP, y + GAP, z + GAP, x + l - GAP, y + w - GAP, z + h - GAP),
+                           QColor(CRATE_COLORS[(piece.piece_id - 1) % len(CRATE_COLORS)]),
+                           ("crate", piece.piece_id),
+                           piece.crate_label + (" ▲" if tier == 1 else "")
+                           + (f" · S{piece.stop}" if multi else "")))
+        labels = {sd[3]: sd[4] for sd in solids}
+        solids = [sd[:4] + ("box",) for sd in solids]
+        n_unfit = 0
+        for idx, item in enumerate(self.securement):
+            parts, err = securement_parts(item, boxes, self.securement)
+            if err:
+                n_unfit += 1
+            for x, y, z, l, w, h, color, shape in parts:
+                solids.append(((x + l / 2, y + w / 2, z + h / 2),
+                               (x, y, z, x + l, y + w, z + h), color, ("item", idx), shape))
 
-        # Legend
-        painter.setBrush(QBrush(TEAL_LIGHT))
-        painter.setPen(QPen(TEAL_DARK, 1))
-        painter.drawRect(QRectF(draw_x, draw_y + 2, 10, 8))
-        painter.setFont(QFont("Arial", 6))
-        painter.setPen(QColor("#333"))
-        painter.drawText(QRectF(draw_x + 13, draw_y, 80, 12),
+        # Painter's algorithm: farthest solid first
+        solids.sort(key=lambda s: -math.dist(cam, s[0]))
+        for centre, (x0, y0, z0, x1, y1, z1), color, tag, shape in solids:
+            if shape == "pillow":
+                self._draw_pillow(painter, cd, x0, y0, z0, x1, y1, z1, color, tag)
+            else:
+                self._draw_solid(painter, cd, x0, y0, z0, x1, y1, z1, color, tag)
+            label = labels.get(tag) if tag[0] == "crate" else None
+            if label:   # drawn now so nearer solids cover it
+                c = self._project(centre, cd)
+                if c:
+                    painter.setFont(QFont("Arial", 7, QFont.Weight.Bold))
+                    painter.setPen(Qt.GlobalColor.white)
+                    painter.drawText(QRectF(c.x() - 45, c.y() - 9, 90, 18),
+                                     Qt.AlignmentFlag.AlignCenter, label)
+
+        # Hover highlight for the current tool
+        if self._hover:
+            painter.setBrush(QBrush(QColor(255, 255, 255, 60)))
+            painter.setPen(QPen(QColor("#c0392b") if self.tool == "remove"
+                                else QColor("#f1c40f"), 3))
+            painter.drawPolygon(self._hover[0])
+
+        self._draw_overlay(painter, n_unfit)
+
+    def _draw_overlay(self, painter: QPainter, n_unfit: int):
+        if self.print_mode:
+            return
+        painter.setFont(QFont("Arial", 7))
+        painter.setPen(QColor("#777"))
+        painter.drawText(QRectF(8, self.height() - 18, self.width() - 16, 16),
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                         "Floor level")
-        painter.setBrush(QBrush(TAN))
-        painter.setPen(QPen(QColor("#8B6914"), 1))
-        painter.drawRect(QRectF(draw_x + 80, draw_y + 2, 10, 8))
-        painter.setPen(QColor("#333"))
-        painter.drawText(QRectF(draw_x + 93, draw_y, 80, 12),
-                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                         "Stacked")
+                         self.TOOL_HINTS[self.tool])
+        lines = []
+        if self._message[0]:
+            lines.append(self._message)
+        if n_unfit:
+            lines.append((f"⚠ {n_unfit} securement item(s) don't fit the current plan "
+                          f"and are hidden — click Remove Hidden to clear them.", QColor("#c0392b")))
+        painter.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+        for i, (text, color) in enumerate(lines):
+            painter.setPen(color)
+            painter.drawText(QRectF(8, 6 + i * 16, self.width() - 16, 16),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+
+
+def _draw_3d_snapshot(painter: QPainter, rect: QRectF, plan: LoadPlan,
+                      securement: list, yaw: float, pitch: float):
+    """Render the 3D view at a fixed angle into `rect` (vector output, e.g. a PDF)."""
+    view = Trailer3DView()
+    view.print_mode = True
+    view.resize(int(rect.width()), int(rect.height()))
+    view.set_plan(plan)
+    view.set_securement(securement or [])
+    view.yaw, view.pitch = yaw, pitch
+    view._fit_focal = None
+    painter.save()
+    painter.translate(rect.topLeft())
+    painter.setClipRect(QRectF(0, 0, rect.width(), rect.height()))
+    view._draw(painter)
+    painter.restore()
+    view.deleteLater()
+
+
+# ── Zoomable container for the Top / Side views ───────────────────────────────
+class ZoomScrollArea(QScrollArea):
+    """
+    Hosts a view that draws to fit its own size. Zooming enlarges the view
+    beyond the viewport and the scroll bars take over. Ctrl+wheel zooms about
+    the cursor; right-drag pans.
+    """
+    zoom_changed = pyqtSignal(float)
+    MIN_ZOOM, MAX_ZOOM = 1.0, 6.0
+
+    def __init__(self, view: QWidget, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setWidget(view)
+        self.zoom = 1.0
+        self._pan_last = None
+        view.installEventFilter(self)
+
+    def set_zoom(self, zoom: float, anchor: Optional[QPointF] = None):
+        zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, zoom))
+        view = self.widget()
+        hb, vb = self.horizontalScrollBar(), self.verticalScrollBar()
+        centre_x = False
+        if anchor is None:
+            anchor = QPointF(self.viewport().width() / 2, self.viewport().height() / 2)
+            # Views can name the x they care about (e.g. the trailer, not the notes);
+            # button zooms then keep that x centred in the window
+            focus_x = getattr(view, "zoom_focus_x", None)
+            if focus_x is not None:
+                anchor.setX(focus_x - hb.value())
+                centre_x = True
+        # Keep the point under the anchor fixed while the view grows/shrinks
+        fx = (hb.value() + anchor.x()) / max(1, view.width())
+        fy = (vb.value() + anchor.y()) / max(1, view.height())
+        self.zoom = zoom
+        self._apply_zoom()
+        # Scroll ranges update lazily; set them now so the anchor can be honoured
+        hb.setRange(0, max(0, view.width() - self.viewport().width()))
+        vb.setRange(0, max(0, view.height() - self.viewport().height()))
+        target_x = self.viewport().width() / 2 if centre_x else anchor.x()
+        hb.setValue(int(fx * view.width() - target_x))
+        vb.setValue(int(fy * view.height() - anchor.y()))
+        self.zoom_changed.emit(zoom)
+
+    def _apply_zoom(self):
+        vp = self.maximumViewportSize()
+        size = QSize(int(vp.width() * self.zoom), int(vp.height() * self.zoom))
+        self.widget().setMinimumSize(size)
+        self.widget().resize(size)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_zoom()
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            steps = event.angleDelta().y() / 120
+            self.set_zoom(self.zoom * (1.2 ** steps), event.position())
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def eventFilter(self, obj, event):
+        et = event.type()
+        if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton:
+            self._pan_last = event.globalPosition()
+            obj.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return True
+        if et == QEvent.Type.MouseMove and self._pan_last is not None:
+            pos = event.globalPosition()
+            self.horizontalScrollBar().setValue(
+                int(self.horizontalScrollBar().value() - (pos.x() - self._pan_last.x())))
+            self.verticalScrollBar().setValue(
+                int(self.verticalScrollBar().value() - (pos.y() - self._pan_last.y())))
+            self._pan_last = pos
+            return True
+        if et == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.RightButton:
+            self._pan_last = None
+            obj.setCursor(Qt.CursorShape.ArrowCursor)
+            return True
+        return super().eventFilter(obj, event)
+
+
+# ── Delivery stops editor ─────────────────────────────────────────────────────
+class StopsDialog(QDialog):
+    """
+    Origin + up to MAX_STOPS delivery stops. Each takes a street address
+    (located online via OpenStreetMap) or GPS coordinates (used as typed —
+    for job sites without an address). Shows the resulting delivery route.
+    """
+
+    def __init__(self, origin: dict, stops: list, use_road: bool, road: Optional[dict],
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Delivery Stops & Route")
+        self.resize(900, 560)
+        self.origin = dict(origin)
+        self.stops = [dict(st) for st in stops]
+        self.road = road
+        self._loading = True
+
+        lay = QVBoxLayout(self)
+        hint = QLabel("Enter a street address <b>or</b> GPS coordinates (e.g. <i>42.9634, -85.6681</i> "
+                      "or a Google Maps link) for the origin and each stop. Coordinates work offline; "
+                      "addresses are looked up online with OpenStreetMap when you click "
+                      "<b>Locate</b>. Delivery order is planned nearest-first from the origin.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#444;")
+        lay.addWidget(hint)
+
+        self.table = QTableWidget(MAX_STOPS + 1, 4)
+        self.table.setHorizontalHeaderLabels(["", "Name", "Address or GPS coordinates", "Location"])
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 120)
+        self.table.setColumnWidth(1, 170)
+        self.table.setColumnWidth(3, 200)
+        self.table.verticalHeader().setVisible(False)
+        for r in range(MAX_STOPS + 1):
+            d = self.origin if r == 0 else self.stops[r - 1]
+            tag = QTableWidgetItem("Origin (ship from)" if r == 0 else f"Stop S{r}")
+            tag.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            if r:
+                tag.setForeground(QColor(STOP_COLORS[(r - 1) % len(STOP_COLORS)]))
+            self.table.setItem(r, 0, tag)
+            self.table.setItem(r, 1, QTableWidgetItem(d.get("name", "")))
+            self.table.setItem(r, 2, QTableWidgetItem(d.get("location", "")))
+            loc = QTableWidgetItem("")
+            loc.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.table.setItem(r, 3, loc)
+            self._show_location(r)
+        self.table.itemChanged.connect(self._cell_changed)
+        lay.addWidget(self.table)
+
+        row = QHBoxLayout()
+        btn_locate = QPushButton("Locate")
+        btn_locate.setToolTip("Read GPS coordinates and look up addresses online (OpenStreetMap)")
+        btn_locate.clicked.connect(self._locate_all)
+        self.chk_road = QCheckBox("Use road distances (online)")
+        self.chk_road.setChecked(use_road)
+        self.chk_road.toggled.connect(self._road_toggled)
+        btn_road = QPushButton("Fetch Road Distances")
+        btn_road.clicked.connect(self._fetch_road)
+        row.addWidget(btn_locate)
+        row.addSpacing(16)
+        row.addWidget(self.chk_road)
+        row.addWidget(btn_road)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self.lbl_route = QLabel()
+        self.lbl_route.setWordWrap(True)
+        self.lbl_route.setStyleSheet("background:#f4f8f7; border:1px solid #cfe3df; padding:6px;")
+        lay.addWidget(self.lbl_route)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+        self._loading = False
+        self._update_route()
+
+    # ── helpers ──────────────────────────────────────────────────────────
+    def _entry(self, r: int) -> dict:
+        return self.origin if r == 0 else self.stops[r - 1]
+
+    def _show_location(self, r: int, status: str = ""):
+        d = self._entry(r)
+        item = self.table.item(r, 3)
+        if d.get("lat") is not None:
+            item.setText(f"✓ {d['lat']:.5f}, {d['lon']:.5f}")
+            item.setForeground(QColor("#1e7b34"))
+        elif d.get("location"):
+            item.setText(status or "not located — click Locate")
+            item.setForeground(QColor("#b03a2e"))
+        else:
+            item.setText("")
+        item.setToolTip(d.get("display", ""))
+
+    def _cell_changed(self, item):
+        if self._loading or item.column() not in (1, 2):
+            return
+        r = item.row()
+        d = self._entry(r)
+        if item.column() == 1:
+            d["name"] = item.text().strip()
+        else:
+            d["location"] = item.text().strip()
+            c = parse_coords(d["location"])
+            d["lat"], d["lon"] = (c if c else (None, None))
+            d["display"] = "GPS coordinates" if c else ""
+            self.road = None                      # locations changed — road table is stale
+            self._loading = True
+            self._show_location(r)
+            self._loading = False
+        self._update_route()
+
+    def _coords(self) -> dict:
+        out = {}
+        if self.origin.get("lat") is not None:
+            out["origin"] = (self.origin["lat"], self.origin["lon"])
+        for i, st in enumerate(self.stops, start=1):
+            if st.get("lat") is not None:
+                out[i] = (st["lat"], st["lon"])
+        return out
+
+    def _dist(self):
+        return shipment_distance_fn(self._coords(), self.chk_road.isChecked(), self.road)
+
+    def _update_route(self):
+        coords = self._coords()
+        used = [i for i, st in enumerate(self.stops, start=1)
+                if st.get("name") or st.get("location")]
+        if not used:
+            self.lbl_route.setText("<i>No stops entered yet.</i>")
+            return
+        dist = self._dist()
+        order = route_order(used, coords, dist)
+        parts, total, prev = [], 0.0, "origin" if "origin" in coords else None
+        for sid in order:
+            nm = self.stops[sid - 1].get("name") or f"Stop S{sid}"
+            leg = ""
+            if prev is not None and sid in coords and prev in coords:
+                miles = dist(prev, sid)
+                total += miles
+                leg = f" <span style='color:#777'>({miles:,.0f} mi)</span>"
+            parts.append(f"<b>S{sid}</b> {nm}{leg}")
+            prev = sid if sid in coords else prev
+        basis = ("road miles" if self.chk_road.isChecked() and self.road else "straight-line miles")
+        head = "Origin → " if "origin" in coords else "<i>(no origin located — ordered by stop #)</i> "
+        missing = [f"S{sid}" for sid in used if sid not in coords]
+        tail = (f"<br><span style='color:#b03a2e'>Not located: {', '.join(missing)} — "
+                f"they're delivered last, in stop-number order.</span>" if missing else "")
+        self.lbl_route.setText(f"<b>Delivery route</b> ({basis}, ≈{total:,.0f} mi):<br>"
+                               f"{head}{' → '.join(parts)}{tail}")
+
+    # ── actions ──────────────────────────────────────────────────────────
+    def _locate_all(self):
+        todo = [r for r in range(MAX_STOPS + 1)
+                if self._entry(r).get("location") and self._entry(r).get("lat") is None]
+        if not todo:
+            self._update_route()
+            return
+        failures = []
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for k, r in enumerate(todo):
+                d = self._entry(r)
+                self._loading = True
+                self.table.item(r, 3).setText("looking up…")
+                self._loading = False
+                QApplication.processEvents()
+                try:
+                    if k:
+                        time.sleep(1.1)           # OpenStreetMap usage policy: ≤ 1 request/sec
+                    hit = geocode_address(d["location"])
+                except Exception as e:
+                    hit, err = None, str(e)
+                else:
+                    err = "address not found"
+                self._loading = True
+                if hit:
+                    d["lat"], d["lon"], d["display"] = hit
+                    self._show_location(r)
+                else:
+                    self._show_location(r, f"⚠ {err}")
+                    failures.append(f"{self.table.item(r, 0).text()}: {err}")
+                self._loading = False
+        finally:
+            self.unsetCursor()
+        self.road = None
+        self._update_route()
+        if failures:
+            QMessageBox.warning(self, "Locate", "Some locations couldn't be found:\n\n" +
+                                "\n".join(failures) +
+                                "\n\nCheck the address, or enter GPS coordinates instead.")
+
+    def _road_toggled(self, on: bool):
+        if on and not self.road:
+            self._fetch_road()
+        self._update_route()
+
+    def _fetch_road(self):
+        coords = self._coords()
+        keys = list(coords)
+        if len(keys) < 2:
+            QMessageBox.information(self, "Road Distances", "Locate the origin and at least one stop first.")
+            self.chk_road.setChecked(False)
+            return
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            matrix = road_distance_matrix([coords[k] for k in keys])
+        except Exception as e:
+            self.unsetCursor()
+            QMessageBox.warning(self, "Road Distances",
+                                f"Couldn't get road distances (are you online?):\n{e}\n\n"
+                                "Straight-line distances will be used.")
+            self.chk_road.setChecked(False)
+            return
+        self.unsetCursor()
+        self.road = {"keys": [str(k) for k in keys], "miles": matrix,
+                     "points": [list(coords[k]) for k in keys]}
+        self.chk_road.setChecked(True)
+        self._update_route()
+
+
+def shipment_distance_fn(coords: dict, use_road: bool, road: Optional[dict]):
+    """dist(a, b) in miles: road table when enabled and current, else straight-line."""
+    table = None
+    if use_road and road:
+        keys = road.get("keys", [])
+        # Only trust the table if every point still matches what was fetched
+        if all(str(k) in keys and
+               list(coords[k]) == road["points"][keys.index(str(k))] for k in coords):
+            table = {(keys[i], keys[j]): road["miles"][i][j]
+                     for i in range(len(keys)) for j in range(len(keys))}
+
+    def dist(a, b):
+        if table is not None and (str(a), str(b)) in table:
+            return table[(str(a), str(b))]
+        return straight_miles(coords[a], coords[b])
+    return dist
+
+
+# ── Ship-separately list ──────────────────────────────────────────────────────
+class ShipSeparatelyDialog(QDialog):
+    """Pieces that ship another way (UPS, hot-shot, …); return any to a truck."""
+
+    def __init__(self, pieces: list, reasons: dict, n_trucks: int, stop_name, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Ship Separately")
+        self.resize(760, 420)
+        self.returned: list = []      # [(piece_id, truck_index)]
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("These pieces aren't on any truck — ship them another way "
+                             "(UPS, hot-shot, …), or select some and return them to a truck."))
+        self.table = QTableWidget(len(pieces), 6)
+        self.table.setHorizontalHeaderLabels(["Crate", "Stop", "L×W×H", "Weight", "Notes", "Why"])
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._ids = []
+        for r, p in enumerate(pieces):
+            self._ids.append(p.piece_id)
+            for c, v in enumerate([p.crate_label, stop_name(p.stop),
+                                   f"{p.length_in:.0f}×{p.width_in:.0f}×{p.height_in:.0f}\"",
+                                   f"{p.weight_lbs:,.0f} lb", p.notes,
+                                   reasons.get(p.piece_id, "didn't fit — your choice")]):
+                self.table.setItem(r, c, QTableWidgetItem(str(v)))
+        lay.addWidget(self.table)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(f"Total: {len(pieces)} pcs, "
+                             f"{sum(p.weight_lbs for p in pieces):,.0f} lb"))
+        row.addStretch()
+        self.cmb = QComboBox()
+        self.cmb.addItems([f"Truck {i + 1}" for i in range(n_trucks)] + ["New truck"])
+        btn = QPushButton("Return Selected to")
+        btn.clicked.connect(self._return)
+        row.addWidget(btn)
+        row.addWidget(self.cmb)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        lay.addLayout(row)
+
+    def _return(self):
+        rows = sorted({i.row() for i in self.table.selectedItems()})
+        if not rows:
+            return
+        self.returned = [(self._ids[r], self.cmb.currentIndex()) for r in rows]
+        self.accept()
+
+
+# ── PDF: whole shipment ───────────────────────────────────────────────────────
+def export_shipment_pdf(entries: list, path: str, securement: list = None,
+                        include_3d: bool = False, ship_other: list = None):
+    """
+    entries: [(plan, info)] one per truck. Each truck gets its floor plan, a side
+    elevation page when stacked/secured, and optionally the 3D page; a final
+    page lists pieces shipping separately.
+    """
+    writer = _pdf_writer(path)
+    painter = QPainter(writer)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    first = True
+
+    def new_page(orientation):
+        nonlocal first
+        writer.setPageOrientation(orientation)
+        if not first:
+            writer.newPage()
+        first = False
+
+    for plan, info in entries:
+        ids = {s.piece.piece_id for s in plan.slots if s.piece}
+        sec = [it for it in (securement or []) if it["piece_id"] in ids]
+        boxes = _crate_boxes(plan)   # leave out items that don't fit this layout (hidden on screen)
+        sec = [it for it in sec if not securement_parts(it, boxes, sec)[1]]
+        new_page(QPageLayout.Orientation.Portrait)
+        _draw_floor_plan(painter, writer.width(), writer.height(), plan, info, sec)
+        if sec or any(s.tier == 1 for s in plan.slots if s.piece):
+            new_page(QPageLayout.Orientation.Landscape)
+            _draw_side_elevation(painter, writer.width(), writer.height(), plan, info, sec)
+        if include_3d:
+            new_page(QPageLayout.Orientation.Landscape)
+            _draw_3d_page(painter, writer.width(), writer.height(), plan, info, sec)
+    if ship_other:
+        new_page(QPageLayout.Orientation.Portrait)
+        _draw_ship_other_page(painter, writer.width(), writer.height(), ship_other,
+                              entries[0][1] if entries else ShipmentInfo())
+    painter.end()
+
+
+def _draw_ship_other_page(painter: QPainter, PW: int, PH: int, rows: list, info: ShipmentInfo):
+    """rows: [(piece, stop_text, reason)]"""
+    M = 72
+    painter.setPen(QColor("#111"))
+    painter.setFont(QFont("Arial", 20, QFont.Weight.Bold))
+    painter.drawText(QRectF(M, M, PW - 2 * M, 44),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                     "Ship Separately (UPS / Hot-Shot)")
+    painter.setFont(QFont("Arial", 10))
+    painter.setPen(QColor("#555"))
+    wt = sum(p.weight_lbs for p, _, _ in rows)
+    painter.drawText(QRectF(M, M + 44, PW - 2 * M, 24),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                     "  |  ".join(x for x in [info.customer or info.shipment_name, info.date,
+                                               f"{len(rows)} pcs, {wt:,.0f} lb"] if x))
+    cols = [("✓", 0.04), ("Crate", 0.13), ("Stop", 0.22), ("L×W×H", 0.14),
+            ("Weight", 0.11), ("Notes", 0.18), ("Why", 0.18)]
+    y, line_h, x0, width = M + 90, 26, M, PW - 2 * M
+    painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+    painter.setPen(TEAL_DARK)
+    cx = x0
+    for name, frac in cols:
+        painter.drawText(QRectF(cx, y, width * frac, line_h),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
+        cx += width * frac
+    painter.drawLine(QPointF(x0, y + line_h), QPointF(x0 + width, y + line_h))
+    painter.setFont(QFont("Arial", 9))
+    for i, (p, stop_text, why) in enumerate(rows):
+        ry = y + line_h * (i + 1)
+        if ry > PH - M - line_h:
+            break
+        if i % 2:
+            painter.fillRect(QRectF(x0, ry, width, line_h), QColor("#f2f9f8"))
+        painter.setPen(QPen(QColor("#555"), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(QRectF(x0 + 4, ry + 7, 12, 12))
+        painter.setPen(QColor("#222"))
+        cx = x0 + width * cols[0][1]
+        for val, (_n, frac) in zip([p.crate_label, stop_text,
+                                    f"{p.length_in:.0f}×{p.width_in:.0f}×{p.height_in:.0f}\"",
+                                    f"{p.weight_lbs:,.0f} lb", p.notes, why], cols[1:]):
+            painter.drawText(QRectF(cx, ry, width * frac - 4, line_h),
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             QFontMetrics(painter.font(), painter.device()).elidedText(
+                                 str(val), Qt.TextElideMode.ElideRight, int(width * frac - 6)))
+            cx += width * frac
+
+
+def export_shipment_labels(entries: list, path: str):
+    """Crate labels for every truck: [(plan, info)]."""
+    writer = _pdf_writer(path)
+    painter = QPainter(writer)
+    first = True
+    for plan, info in entries:
+        seen: set = set()
+        for s in sorted(plan.slots, key=lambda s: (s.row, s.tier, s.col)):
+            if s.piece and s.piece.piece_id not in seen:
+                seen.add(s.piece.piece_id)
+                if not first:
+                    writer.newPage()
+                first = False
+                _draw_crate_label(painter, writer.width(), writer.height(), s, plan, info)
+    painter.end()
+
+
+# ── PDF preview ───────────────────────────────────────────────────────────────
+class PdfPreviewDialog(QDialog):
+    """Shows a generated PDF before it's saved; Save PDF… asks where to keep it."""
+
+    def __init__(self, pdf_path: str, title: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Preview — {title}")
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowMinMaxButtonsHint |
+                            Qt.WindowType.WindowCloseButtonHint)
+        self.resize(900, 1000)
+        self.save_requested = False
+        lay = QVBoxLayout(self)
+
+        # Load from memory so the viewer never holds the temp file open
+        with open(pdf_path, "rb") as f:
+            self._buffer = QBuffer(self)
+            self._buffer.setData(QByteArray(f.read()))
+        self._buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        self.doc = QPdfDocument(self)
+        self.doc.load(self._buffer)
+        self.view = QPdfView(self)
+        self.view.setDocument(self.doc)
+        self.view.setPageMode(QPdfView.PageMode.MultiPage)
+        self.view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+
+        bar = QHBoxLayout()
+        pages = self.doc.pageCount()
+        bar.addWidget(QLabel(f"<b>{title}</b>  ·  {pages} page{'s' if pages != 1 else ''}"))
+        bar.addStretch()
+        for text, mode in (("Fit Width", QPdfView.ZoomMode.FitToWidth),
+                           ("Fit Page", QPdfView.ZoomMode.FitInView)):
+            b = QPushButton(text)
+            b.clicked.connect(lambda _=False, m=mode: self.view.setZoomMode(m))
+            bar.addWidget(b)
+        for text, factor in (("−", 1 / 1.25), ("+", 1.25)):
+            b = QPushButton(text)
+            b.setFixedWidth(36)
+            b.clicked.connect(lambda _=False, f=factor: self._zoom(f))
+            bar.addWidget(b)
+        lay.addLayout(bar)
+        lay.addWidget(self.view)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        btn_save = QPushButton("Save PDF…")
+        btn_save.setDefault(True)
+        btn_save.clicked.connect(self._save)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.reject)
+        btns.addWidget(btn_save)
+        btns.addWidget(btn_close)
+        lay.addLayout(btns)
+
+    def _zoom(self, factor: float):
+        self.view.setZoomMode(QPdfView.ZoomMode.Custom)
+        self.view.setZoomFactor(self.view.zoomFactor() * factor)
+
+    def _save(self):
+        self.save_requested = True
+        self.accept()
+
+    def done(self, result):
+        self.view.setDocument(None)
+        self.doc.close()
+        super().done(result)
+
+
+# ── Excel Template ────────────────────────────────────────────────────────────
+def open_excel_template(parent) -> Optional[str]:
+    """Copy the import template to a new packing list file and open it in Excel.
+
+    Returns the new file's path, or None if cancelled / failed.
+    """
+    if not os.path.exists(TEMPLATE_PATH):
+        try:
+            from make_template import build_template
+            build_template(TEMPLATE_PATH)
+        except Exception as e:
+            QMessageBox.critical(parent, "Template Missing",
+                                 f"Could not create the Excel template:\n{e}")
+            return None
+
+    os.makedirs(PACKING_LIST_DIR, exist_ok=True)
+    default_name = f"Packing List {datetime.date.today():%Y-%m-%d}.xlsx"
+    path, _ = QFileDialog.getSaveFileName(
+        parent, "Save New Packing List As",
+        os.path.join(PACKING_LIST_DIR, default_name), "Excel Files (*.xlsx)")
+    if not path:
+        return None
+    if not path.lower().endswith(".xlsx"):
+        path += ".xlsx"
+
+    try:
+        shutil.copyfile(TEMPLATE_PATH, path)
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as e:
+        QMessageBox.critical(parent, "Open Template Error", str(e))
+        return None
+
+    QMessageBox.information(
+        parent, "Template Opened",
+        "Your new packing list is open in Excel.\n\n"
+        "Replace the sample rows with your pieces (keep row 1 headers),\n"
+        "save and close the file, then click \"Import from Excel…\".")
+    return path
 
 
 # ── Excel Import Dialog ───────────────────────────────────────────────────────
 class ImportDialog(QDialog):
     """Preview packing list from Excel, check/uncheck rows to include/exclude."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, initial_path: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Import Packing List from Excel")
         self.setMinimumSize(820, 520)
         self.pieces: list[FreightPiece] = []
         self.excluded_ids: list[int] = []
+        self._raw_rows = []
+        self.template_path: Optional[str] = None
 
         layout = QVBoxLayout(self)
 
@@ -1535,8 +3636,16 @@ class ImportDialog(QDialog):
         self.path_edit.setReadOnly(True)
         btn_browse = QPushButton("Browse…")
         btn_browse.clicked.connect(self._browse)
+        btn_reload = QPushButton("Reload")
+        btn_reload.setToolTip("Re-read the file after saving changes in Excel")
+        btn_reload.clicked.connect(lambda: self.path_edit.text() and self._load(self.path_edit.text()))
+        btn_template = QPushButton("Open Template…")
+        btn_template.setToolTip("Create a new packing list from the Excel template and open it")
+        btn_template.clicked.connect(self._open_template)
         file_row.addWidget(self.path_edit)
         file_row.addWidget(btn_browse)
+        file_row.addWidget(btn_reload)
+        file_row.addWidget(btn_template)
         layout.addLayout(file_row)
 
         lbl = QLabel("Check rows to include. Uncheck to exclude from the load plan.")
@@ -1544,9 +3653,10 @@ class ImportDialog(QDialog):
         layout.addWidget(lbl)
 
         # Preview table
-        self.table = QTableWidget(0, 10)
+        self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
-            ["✓ Include", "Crate #", "Part Number", "L\"", "W\"", "H\"", "Weight (lbs)", "PCS", "Notes", "Stack?"])
+            ["✓ Include", "Crate #", "Part Number", "L\"", "W\"", "H\"", "Weight (lbs)", "PCS", "Notes",
+             "Stack?", "Stop"])
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1558,12 +3668,25 @@ class ImportDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
+        if initial_path and os.path.exists(initial_path):
+            self.path_edit.setText(initial_path)
+            self._load(initial_path)
+
     def _browse(self):
+        start_dir = PACKING_LIST_DIR if os.path.isdir(PACKING_LIST_DIR) else ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Packing List", "", "Excel Files (*.xlsx *.xls)")
+            self, "Open Packing List", start_dir, "Excel Files (*.xlsx *.xls)")
         if path:
             self.path_edit.setText(path)
             self._load(path)
+
+    def _open_template(self):
+        path = open_excel_template(self)
+        if path:
+            self.template_path = path
+            self.path_edit.setText(path)
+            self.table.setRowCount(0)
+            self._raw_rows = []
 
     def _load(self, path: str):
         if not HAS_OPENPYXL:
@@ -1594,8 +3717,14 @@ class ImportDialog(QDialog):
                 notes     = str(row[9] or "")
                 raw_stk   = row[10] if len(row) > 10 else None
                 stackable = str(raw_stk).strip().upper() not in ("N", "NO", "0", "FALSE") if raw_stk is not None else True
+                try:
+                    stop = int(row[11]) if len(row) > 11 and row[11] not in (None, "") else 1
+                except (TypeError, ValueError):
+                    stop = 1
+                stop = max(1, min(MAX_STOPS, stop))
 
-                self._raw_rows.append((crate_id, part, l_in, w_in, h_in, weight, pcs, notes, stackable))
+                self._raw_rows.append((crate_id, part, l_in, w_in, h_in, weight, pcs, notes,
+                                       stackable, stop))
 
                 r = self.table.rowCount()
                 self.table.insertRow(r)
@@ -1611,7 +3740,7 @@ class ImportDialog(QDialog):
 
                 for col, val in enumerate([crate_id, part, l_in, w_in, h_in,
                                            f"{weight:,.0f}", pcs, notes,
-                                           "Yes" if stackable else "No"], start=1):
+                                           "Yes" if stackable else "No", stop], start=1):
                     item = QTableWidgetItem(str(val))
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     self.table.setItem(r, col, item)
@@ -1624,7 +3753,7 @@ class ImportDialog(QDialog):
         self.excluded_ids = []
 
         for r, raw in enumerate(self._raw_rows):
-            crate_id, part, l_in, w_in, h_in, weight, pcs, notes, stackable = raw
+            crate_id, part, l_in, w_in, h_in, weight, pcs, notes, stackable, stop = raw
             chk_widget = self.table.cellWidget(r, 0)
             chk = chk_widget.findChild(QCheckBox)
             if chk and chk.isChecked():
@@ -1639,6 +3768,7 @@ class ImportDialog(QDialog):
                     pcs=pcs,
                     notes=notes,
                     stackable=stackable,
+                    stop=stop,
                 ))
             else:
                 self.excluded_ids.append(crate_id)
@@ -1666,16 +3796,16 @@ class FreightPopout(QDialog):
         lbl.setStyleSheet("color:#555; font-size:11px; padding:2px 0;")
         layout.addWidget(lbl)
 
-        self.table = QTableWidget(0, 10)
+        self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
             ["✓ Include", "Crate #", "Label", "Part #", 'L"', 'W"', 'H"',
-             "Weight (lbs)", "PCS", "Notes"])
+             "Weight (lbs)", "PCS", "Stop", "Notes"])
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
-        for col, w in [(0, 80), (1, 62), (4, 46), (5, 46), (6, 46), (7, 100), (8, 50)]:
+        self.table.horizontalHeader().setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)
+        for col, w in [(0, 80), (1, 62), (4, 46), (5, 46), (6, 46), (7, 100), (8, 50), (9, 150)]:
             self.table.setColumnWidth(col, w)
         layout.addWidget(self.table)
 
@@ -1711,13 +3841,16 @@ class FreightPopout(QDialog):
             chk_lay.setContentsMargins(0, 0, 0, 0)
             self.table.setCellWidget(r, 0, chk_widget)
 
+            stop_text = getattr(self.parent(), "_stop_text", lambda sid: f"S{sid}")(p.stop)
             for col, val in enumerate([
                 p.piece_id, p.crate_label, p.part_number,
                 f"{p.length_in:.0f}", f"{p.width_in:.0f}", f"{p.height_in:.0f}",
-                f"{p.weight_lbs:,.0f}", str(p.pcs), p.notes or ""
+                f"{p.weight_lbs:,.0f}", str(p.pcs), stop_text, p.notes or ""
             ], start=1):
                 item = QTableWidgetItem(str(val))
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if col == 9:
+                    item.setForeground(QColor(STOP_COLORS[(p.stop - 1) % len(STOP_COLORS)]))
                 self.table.setItem(r, col, item)
 
         self.table.resizeRowsToContents()
@@ -1756,11 +3889,25 @@ class FreightPopout(QDialog):
 class FreightLoaderApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Freight Loader — 53' Dry Van")
+        self.setWindowTitle(f"Freight Loader v{APP_VERSION} — 53' Dry Van")
         self.setMinimumSize(1150, 760)
         self._next_id = 1
         self._plan: Optional[LoadPlan] = None
         self._excluded_ids: list = []
+        self._securement: list = []     # load bars / straps / airbags, shared with 3D view
+        # Shipment: stops with locations, trucks, pieces shipping separately
+        self._origin = {"name": "", "location": "", "lat": None, "lon": None}
+        self._stops = [{"name": "", "location": "", "lat": None, "lon": None}
+                       for _ in range(MAX_STOPS)]
+        self._use_road = False
+        self._road = None
+        self._trucks: list = []          # [{"trailer_num": str, "piece_ids": [..]}]
+        self._ship_other: list = []      # piece IDs shipping another way
+        self._ship_reasons: dict = {}    # piece_id -> why it ships separately
+        self._split_key = None           # {piece_id: stop} when trucks were last split
+        self._plans: list = []           # LoadPlan per truck
+        self._manual: dict = {}          # piece_id -> (x, y) for floor crates moved in the Top View
+        self._cur_truck = 0
         self._current_file: Optional[str] = None
         self._popout: Optional[FreightPopout] = None
         self._build_ui()
@@ -1768,8 +3915,13 @@ class FreightLoaderApp(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        root = QHBoxLayout(central)
-        root.setSpacing(6)
+        root = QVBoxLayout(central)
+        root.setSpacing(2)
+
+        lbl_version = QLabel(f"Freight Loader  v{APP_VERSION}")
+        lbl_version.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_version.setStyleSheet("color:#2a7d6e; font-weight:bold; font-size:12px;")
+        root.addWidget(lbl_version)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(splitter)
@@ -1801,7 +3953,8 @@ class FreightLoaderApp(QMainWindow):
 
         self.f_customer      = QLineEdit(); self.f_customer.setPlaceholderText("Customer name")
         self.f_shipment_name = QLineEdit(); self.f_shipment_name.setPlaceholderText("Shipment / load name")
-        self.f_trailer_num   = QLineEdit(); self.f_trailer_num.setPlaceholderText("Optional")
+        self.f_trailer_num   = QLineEdit(); self.f_trailer_num.setPlaceholderText("Optional (this truck)")
+        self.f_trailer_num.textEdited.connect(self._trailer_edited)
         self.f_bol           = QLineEdit(); self.f_bol.setPlaceholderText("Optional")
         self.f_date          = QLineEdit(datetime.date.today().strftime("%Y-%m-%d"))
 
@@ -1810,24 +3963,43 @@ class FreightLoaderApp(QMainWindow):
         info_form.addRow("Trailer #:",     self.f_trailer_num)
         info_form.addRow("BOL #:",         self.f_bol)
         info_form.addRow("Date:",          self.f_date)
+        self._stop_names = [""] * MAX_STOPS
+        stops_row = QHBoxLayout()
+        btn_stops = QPushButton("Edit Stops…")
+        btn_stops.setToolTip("Names and addresses / GPS coordinates for the origin and stops; "
+                             "plans the delivery route")
+        btn_stops.clicked.connect(self._edit_stops)
+        self.lbl_stops = QLabel("")
+        self.lbl_stops.setStyleSheet("color:#555;")
+        stops_row.addWidget(btn_stops)
+        stops_row.addWidget(self.lbl_stops, 1)
+        info_form.addRow("Delivery Stops:", stops_row)
         ll.addWidget(grp_info)
 
         # ── Freight table ──────────────────────────────────────────────
         grp_freight = QGroupBox("Freight Pieces")
         gl = QVBoxLayout(grp_freight)
 
-        self.table = QTableWidget(0, 11)
+        self.table = QTableWidget(0, 12)
         self.table.setHorizontalHeaderLabels(
-            ["Crate #", "Label", "Part #", 'L"', 'W"', 'H"', "Weight (lbs)", "PCS", "Pos.", "Stack?", "Notes"])
+            ["Crate #", "Label", "Part #", 'L"', 'W"', 'H"', "Weight (lbs)", "PCS", "Pos.", "Stack?",
+             "Notes", "Stop"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         for col, w in [(0,58),(3,46),(4,46),(5,46),(6,88),(7,50),(8,72),(9,56)]:
             self.table.setColumnWidth(col, w)
         self.table.setColumnHidden(10, True)
+        self.table.setColumnWidth(11, 52)
+        self.table.horizontalHeaderItem(11).setToolTip(
+            "Delivery stop ID — set names and addresses / GPS under Edit Stops. "
+            "Delivery order follows the route (by stop # if no locations).")
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         gl.addWidget(self.table)
 
         btn_row = QHBoxLayout()
+        btn_template = QPushButton("Open Excel Template…")
+        btn_template.setToolTip("Create a new packing list from the Excel template, fill it in, then import")
+        btn_template.clicked.connect(self._open_template)
         btn_import = QPushButton("Import from Excel…")
         btn_import.clicked.connect(self._import_excel)
         btn_add    = QPushButton("+ Add Row")
@@ -1839,7 +4011,7 @@ class FreightLoaderApp(QMainWindow):
         btn_popout = QPushButton("↗ Pop Out")
         btn_popout.setToolTip("Open freight list in a larger window to manage include/exclude")
         btn_popout.clicked.connect(self._open_popout)
-        for b in [btn_import, btn_add, btn_del, btn_clear, btn_popout]:
+        for b in [btn_template, btn_import, btn_add, btn_del, btn_clear, btn_popout]:
             btn_row.addWidget(b)
         gl.addLayout(btn_row)
         ll.addWidget(grp_freight)
@@ -1903,40 +4075,215 @@ class FreightLoaderApp(QMainWindow):
 
         # ── Export buttons ─────────────────────────────────────────────
         exp_row = QHBoxLayout()
-        self.btn_plan_pdf  = QPushButton("Export Floor Plan PDF")
-        self.btn_label_pdf = QPushButton("Export Crate Labels PDF")
+        self.btn_plan_pdf  = QPushButton("Export Floor Plan PDF…")
+        self.btn_label_pdf = QPushButton("Export Crate Labels PDF…")
+        self.btn_plan_pdf.setToolTip("Preview the floor plan PDF, then save it")
+        self.btn_label_pdf.setToolTip("Preview the crate labels, then save them")
         for b in [self.btn_plan_pdf, self.btn_label_pdf]:
             b.setEnabled(False)
             exp_row.addWidget(b)
         self.btn_plan_pdf.clicked.connect(self._export_floor_plan)
         self.btn_label_pdf.clicked.connect(self._export_labels)
         ll.addLayout(exp_row)
+        self.chk_pdf_3d = QCheckBox("Include 3D views page in floor plan PDF")
+        self.chk_pdf_3d.setToolTip("Adds a landscape page with the load shown from four 3D angles")
+        ll.addWidget(self.chk_pdf_3d)
 
         splitter.addWidget(left)
 
-        # ══ RIGHT PANEL — tabbed trailer views ═══════════════════════
+        # ══ RIGHT PANEL — truck bar + tabbed trailer views ═══════════
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        truck_row = QHBoxLayout()
+        truck_row.addWidget(QLabel("<b>Truck:</b>"))
+        self.cmb_truck = QComboBox()
+        self.cmb_truck.setMinimumWidth(320)
+        self.cmb_truck.currentIndexChanged.connect(self._select_truck)
+        truck_row.addWidget(self.cmb_truck)
+        btn_resplit = QPushButton("Re-split Trucks")
+        btn_resplit.setToolTip("Re-plan which stops go on which truck (asks when a stop won't fit)")
+        btn_resplit.clicked.connect(lambda: self._calculate(resplit=True))
+        btn_move = QPushButton("Move Stop…")
+        btn_move.setToolTip("Move all of a stop's freight to another truck, a new truck, "
+                            "or ship it separately")
+        btn_move.clicked.connect(self._move_stop)
+        self.btn_other = QPushButton("Ship Separately (0)")
+        self.btn_other.clicked.connect(self._show_ship_other)
+        for b in (btn_resplit, btn_move, self.btn_other):
+            truck_row.addWidget(b)
+        truck_row.addStretch()
+        rl.addLayout(truck_row)
+
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
 
-        # Tab 1 — Top view
-        top_scroll = QScrollArea()
-        top_scroll.setWidgetResizable(True)
+        # Tab 1 — Top view (zoomable)
         self.trailer_view = TrailerView()
-        self.trailer_view.setMinimumHeight(600)
         self.trailer_view.plan_changed.connect(self._on_plan_changed_by_drag)
-        top_scroll.setWidget(self.trailer_view)
-        tabs.addTab(top_scroll, "Top View")
+        btn_reset_moves = QPushButton("Reset Moves")
+        btn_reset_moves.setToolTip("Put crates you dragged on this truck back where the planner placed them")
+        btn_reset_moves.clicked.connect(self._reset_moves)
+        tabs.addTab(self._zoom_tab(self.trailer_view, [btn_reset_moves],
+                                   "Drag crate: shift  ·  Ctrl+drag: swap  ·  "), "Top View")
 
-        # Tab 2 — Side elevation
+        # Tab 2 — Side elevation (zoomable)
         self.side_view = SideElevationView()
-        tabs.addTab(self.side_view, "Side View")
+        tabs.addTab(self._zoom_tab(self.side_view), "Side View")
 
-        splitter.addWidget(tabs)
+        # Tab 3 — Rotatable 3D view
+        view3d_tab = QWidget()
+        v3l = QVBoxLayout(view3d_tab)
+        v3l.setContentsMargins(4, 4, 4, 4)
+        preset_row = QHBoxLayout()
+        self.view_3d = Trailer3DView()
+        for name in Trailer3DView.PRESETS:
+            b = QPushButton(name)
+            b.clicked.connect(lambda _=False, n=name: self.view_3d.set_preset(n))
+            preset_row.addWidget(b)
+        btn_reset3d = QPushButton("Reset")
+        btn_reset3d.clicked.connect(self.view_3d.reset_view)
+        preset_row.addWidget(btn_reset3d)
+        preset_row.addStretch()
+        v3l.addLayout(preset_row)
+
+        tool_row = QHBoxLayout()
+        tool_row.addWidget(QLabel("Securement:"))
+        self._tool_group = QButtonGroup(self)
+        for tool, text in [("rotate", "Rotate"), ("load_bar", "+ Load Bar"),
+                           ("strap", "+ Strap"), ("airbag", "+ Airbag"), ("remove", "Remove")]:
+            b = QPushButton(text)
+            b.setCheckable(True)
+            b.setChecked(tool == "rotate")
+            b.clicked.connect(lambda _=False, t=tool: self.view_3d.set_tool(t))
+            self._tool_group.addButton(b)
+            tool_row.addWidget(b)
+        btn_clear_sec = QPushButton("Clear All")
+        btn_clear_sec.setToolTip("Remove all load bars, straps and airbags")
+        btn_clear_sec.clicked.connect(self._clear_securement)
+        tool_row.addWidget(btn_clear_sec)
+        self.btn_remove_hidden = QPushButton("Remove Hidden")
+        self.btn_remove_hidden.setToolTip("Delete load bars / straps / airbags that no longer fit "
+                                          "this truck's layout (they aren't shown)")
+        self.btn_remove_hidden.setStyleSheet("color:#c0392b;")
+        self.btn_remove_hidden.clicked.connect(lambda: self.view_3d.remove_unfit())
+        self.btn_remove_hidden.setVisible(False)
+        tool_row.addWidget(self.btn_remove_hidden)
+        tool_row.addStretch()
+        self.lbl_securement = QLabel()
+        self.lbl_securement.setStyleSheet("color:#555;")
+        tool_row.addWidget(self.lbl_securement)
+        v3l.addLayout(tool_row)
+
+        self.view_3d.set_securement(self._securement)
+        self.trailer_view.set_securement(self._securement)
+        self.side_view.set_securement(self._securement)
+        self.view_3d.securement_changed.connect(self._on_securement_changed)
+        v3l.addWidget(self.view_3d)
+        tabs.addTab(view3d_tab, "3D View")
+
+        rl.addWidget(tabs)
+        splitter.addWidget(right)
         splitter.setSizes([500, 610])
+
+    def _zoom_tab(self, view: QWidget, extra: list = None, hint_prefix: str = "") -> QWidget:
+        """Wrap a 2D view in a zoomable scroll area with − / Fit / + controls."""
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(4, 4, 4, 4)
+        area = ZoomScrollArea(view)
+        row = QHBoxLayout()
+        lbl = QLabel("100%")
+        lbl.setMinimumWidth(44)
+        for text, tip, fn in [("−", "Zoom out", lambda: area.set_zoom(area.zoom / 1.25)),
+                              ("Fit", "Fit to window", lambda: area.set_zoom(1.0)),
+                              ("+", "Zoom in", lambda: area.set_zoom(area.zoom * 1.25))]:
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.setFixedWidth(44)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addWidget(lbl)
+        for wdg in extra or []:
+            row.addWidget(wdg)
+        hint = QLabel(hint_prefix + "Ctrl+wheel: zoom  ·  Right-drag: pan")
+        hint.setStyleSheet("color:#777;")
+        row.addWidget(hint)
+        row.addStretch()
+        area.zoom_changed.connect(lambda z: lbl.setText(f"{z * 100:.0f}%"))
+        lay.addLayout(row)
+        lay.addWidget(area)
+        return tab
+
+    def _securement_text(self) -> str:
+        """This truck's securement that fits the layout, plus how many items are hidden."""
+        ids = {sl.piece.piece_id for sl in self._plan.slots if sl.piece} if self._plan else set()
+        hidden = set(self.view_3d.unfit_indices()) if self._plan else set()
+        shown = [it for i, it in enumerate(self._securement)
+                 if it["piece_id"] in ids and i not in hidden]
+        text = securement_summary(shown)
+        if hidden:
+            text += f"{' · ' if text else ''}{len(hidden)} hidden"
+        return text
+
+    def _on_securement_changed(self):
+        self.lbl_securement.setText(self._securement_text())
+        n_hidden = len(self.view_3d.unfit_indices())
+        self.btn_remove_hidden.setText(f"Remove Hidden ({n_hidden})")
+        self.btn_remove_hidden.setVisible(n_hidden > 0)
+        self.trailer_view.update()
+        self.side_view.update()
+        if self._plan:
+            self._update_summary(self._plan)
+
+    def _clear_securement(self):
+        if self._securement and QMessageBox.question(
+                self, "Clear Securement", "Remove all load bars, straps and airbags?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                ) != QMessageBox.StandardButton.Yes:
+            return
+        self._securement.clear()
+        self.view_3d.update()
+        self._on_securement_changed()
 
     def _on_plan_changed_by_drag(self):
         if self._plan:
+            for sl in self._plan.slots:
+                if sl.tier == 0 and sl.piece and not (sl.is_center and sl.col == 1):
+                    if sl.x_in is not None:
+                        self._manual[sl.piece.piece_id] = (sl.x_in, sl.y_in)
+                    else:
+                        self._manual.pop(sl.piece.piece_id, None)
             self._update_summary(self._plan)
+            self.side_view.update()
+            self.view_3d.update()
+            self._on_securement_changed()   # moved crates can open or close gaps
+
+    def _reset_moves(self):
+        if not self._plan:
+            return
+        ids = {sl.piece.piece_id for sl in self._plan.slots if sl.piece}
+        if not any(i in self._manual for i in ids):
+            return
+        for i in ids:
+            self._manual.pop(i, None)
+        self._build_plans(self._read_pieces(), silent=True)
+
+    def _apply_manual_moves(self, plan: LoadPlan, truck_no: int):
+        """Re-apply Top View drags to a freshly built plan; reset them if they no longer fit."""
+        moved = [sl for sl in plan.slots if sl.tier == 0 and sl.piece
+                 and not (sl.is_center and sl.col == 1) and sl.piece.piece_id in self._manual]
+        if not moved:
+            return
+        for sl in moved:
+            sl.x_in, sl.y_in = self._manual[sl.piece.piece_id]
+        if _layout_problems(plan.slots):
+            for sl in moved:
+                sl.x_in = sl.y_in = None
+                self._manual.pop(sl.piece.piece_id, None)
+            plan.notices.append(f"Crates you moved on Truck {truck_no} were put back — "
+                                "the load changed and they no longer fit where you placed them.")
+        _refresh_plan_metrics(plan)
 
     def _open_popout(self):
         pieces = self._read_pieces()
@@ -1963,13 +4310,64 @@ class FreightLoaderApp(QMainWindow):
             trailer_num=self.f_trailer_num.text().strip(),
             bol_num=self.f_bol.text().strip(),
             date=self.f_date.text().strip(),
+            stop_names=list(self._stop_names),
         )
 
+    def _refresh_stop_label(self):
+        used = [f"S{i + 1}{' ✓' if st.get('lat') is not None else ''}"
+                + (f" {st['name']}" if st.get("name") else "")
+                for i, st in enumerate(self._stops) if st.get("name") or st.get("location")]
+        self.lbl_stops.setText("  ·  ".join(used) if used else "Set a Stop # per piece in the table")
+        self._stop_names = [st.get("name", "") for st in self._stops]
+
+    def _coords(self) -> dict:
+        out = {}
+        if self._origin.get("lat") is not None:
+            out["origin"] = (self._origin["lat"], self._origin["lon"])
+        for i, st in enumerate(self._stops, start=1):
+            if st.get("lat") is not None:
+                out[i] = (st["lat"], st["lon"])
+        return out
+
+    def _route(self, stop_ids) -> list:
+        coords = self._coords()
+        return route_order(sorted(set(stop_ids)), coords,
+                           shipment_distance_fn(coords, self._use_road, self._road))
+
+    def _stop_text(self, sid: int) -> str:
+        name = self._stops[sid - 1].get("name") if 0 < sid <= MAX_STOPS else ""
+        return f"S{sid}" + (f" — {name}" if name else "")
+
+    def _edit_stops(self):
+        dlg = StopsDialog(self._origin, self._stops, self._use_road, self._road, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        moved = ([(d.get("lat"), d.get("lon")) for d in [dlg.origin] + dlg.stops] !=
+                 [(d.get("lat"), d.get("lon")) for d in [self._origin] + self._stops]
+                 or dlg.chk_road.isChecked() != self._use_road)
+        self._origin, self._stops = dlg.origin, dlg.stops
+        self._use_road, self._road = dlg.chk_road.isChecked(), dlg.road
+        self._refresh_stop_label()
+        if self.table.rowCount():
+            # New locations change the route, so trucks are re-split
+            self._calculate(resplit=moved)
+
+    def _open_template(self):
+        path = open_excel_template(self)
+        if path:
+            self._last_packing_list = path
+
     def _import_excel(self):
-        dlg = ImportDialog(self)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.pieces:
+        dlg = ImportDialog(self, getattr(self, "_last_packing_list", ""))
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        if dlg.template_path:
+            self._last_packing_list = dlg.template_path
+        if accepted and dlg.pieces:
             self._load_pieces(dlg.pieces)
             self._excluded_ids = dlg.excluded_ids
+            self._securement.clear()     # items were anchored to the previous crates
+            self._manual.clear()         # so were hand-placed positions
+            self._on_securement_changed()
             if dlg.excluded_ids:
                 self.lbl_status.setText(
                     f"Imported {len(dlg.pieces)} crates. "
@@ -1999,11 +4397,12 @@ class FreightLoaderApp(QMainWindow):
                 placement=placement,
                 stackable=p.stackable,
                 notes=p.notes,
+                stop=p.stop,
             )
 
     def _add_row(self, crate_id=None, label="", part_num="",
                  length=48.0, width=48.0, height=48.0, weight=1000.0, pcs=0,
-                 placement="auto", stackable=True, notes=""):
+                 placement="auto", stackable=True, notes="", stop=1):
         r = self.table.rowCount()
         self.table.insertRow(r)
 
@@ -2049,6 +4448,13 @@ class FreightLoaderApp(QMainWindow):
         notes_item = QTableWidgetItem(notes)
         self.table.setItem(r, 10, notes_item)
 
+        # Col 11: delivery stop
+        stop_combo = QComboBox()
+        stop_combo.addItems([str(i) for i in range(1, MAX_STOPS + 1)])
+        stop_combo.setCurrentIndex(max(1, min(MAX_STOPS, int(stop))) - 1)
+        stop_combo.currentIndexChanged.connect(lambda: self._calculate(silent=True))
+        self.table.setCellWidget(r, 11, stop_combo)
+
     def _remove_row(self):
         rows = sorted(set(i.row() for i in self.table.selectedItems()), reverse=True)
         for r in rows:
@@ -2087,14 +4493,17 @@ class FreightLoaderApp(QMainWindow):
                 stackable = stk_chk.isChecked() if stk_chk else True
                 notes_item = self.table.item(r, 10)
                 notes = notes_item.text() if notes_item else ""
+                stop_combo = self.table.cellWidget(r, 11)
+                stop = int(stop_combo.currentText()) if stop_combo else 1
                 pieces.append(FreightPiece(crate_id, label, part, l_in, w_in, h_in, weight, pcs,
-                                           notes=notes, placement=placement, stackable=stackable))
+                                           notes=notes, placement=placement, stackable=stackable,
+                                           stop=stop))
             except (ValueError, AttributeError) as e:
                 QMessageBox.warning(self, "Input Error", f"Row {r+1}: {e}")
                 return []
         return pieces
 
-    def _calculate(self, silent: bool = False):
+    def _calculate(self, silent: bool = False, resplit: bool = False):
         pieces = self._read_pieces()
         if not pieces:
             return
@@ -2103,24 +4512,241 @@ class FreightLoaderApp(QMainWindow):
         TRAILER["drive_limit"]   = self._limit_fields["drive"].value()
         TRAILER["trailer_limit"] = self._limit_fields["trailer"].value()
 
+        active = [pc for pc in pieces if pc.piece_id not in self._excluded_ids]
+        key = {pc.piece_id: pc.stop for pc in active}
+        stale = resplit or self._split_key != key or not self._trucks
+        if stale and not silent:
+            # The split may stop to ask about a stop; don't leave the old plan's status up
+            self.lbl_status.setText("<span style='color:#555'>Splitting freight into trucks…</span>")
+            QApplication.processEvents()
+            self._split_trucks(active)
+            self._split_key = key
+        elif stale:
+            self._quick_assign(active)   # no dialogs while editing; Calculate re-splits
+        self._build_plans(pieces, silent)
+
+    def _split_trucks(self, active: list):
+        """Assign every active piece to a truck (or ship-separately) along the route."""
+        route = self._route({pc.stop for pc in active})
+        trucks, other, impossible = split_into_trucks(
+            [FreightPiece(**vars(pc)) for pc in active], route, self._ask_overflow)
+        old_trailers = [t.get("trailer_num", "") for t in self._trucks]
+        self._trucks = [{"trailer_num": old_trailers[i] if i < len(old_trailers) else "",
+                         "piece_ids": ids} for i, ids in enumerate(trucks)]
+        self._ship_reasons = {pc.piece_id: why for pc, why in impossible}
+        self._ship_other = [pc.piece_id for pc, _ in impossible] + other
+        self._cur_truck = 0
+        if impossible:
+            QMessageBox.warning(
+                self, "Can't Go On Any Truck",
+                "These pieces can't go in a 53' van at all and are listed under "
+                "Ship Separately:\n\n" +
+                "\n".join(f"  •  {pc.crate_label} — {why}" for pc, why in impossible))
+
+    def _quick_assign(self, active: list):
+        """Keep existing assignments; put new/changed pieces with their stop's truck."""
+        if not self._trucks:
+            self._trucks = [{"trailer_num": "", "piece_ids": []}]
+        ids = {pc.piece_id for pc in active}
+        for t in self._trucks:
+            t["piece_ids"] = [i for i in t["piece_ids"] if i in ids]
+        self._ship_other = [i for i in self._ship_other if i in ids]
+        stop_of = {pc.piece_id: pc.stop for pc in active}
+        old = self._split_key or {}
+        placed = {i for t in self._trucks for i in t["piece_ids"]} | set(self._ship_other)
+        for pc in active:
+            if pc.piece_id in placed and old.get(pc.piece_id) == pc.stop:
+                continue
+            for t in self._trucks:
+                if pc.piece_id in t["piece_ids"]:
+                    t["piece_ids"].remove(pc.piece_id)
+            if pc.piece_id in self._ship_other:
+                self._ship_other.remove(pc.piece_id)
+            home = next((t for t in self._trucks
+                         if any(stop_of.get(i) == pc.stop for i in t["piece_ids"])),
+                        self._trucks[min(self._cur_truck, len(self._trucks) - 1)])
+            home["piece_ids"].append(pc.piece_id)
+        # _split_key is left alone: only a real split counts, so the next
+        # Calculate still re-splits and asks about stops that don't fit
+
+    def _ask_overflow(self, info: dict) -> str:
+        """User's choice when a stop won't fully fit on the current truck."""
+        sid, t, fit = info["stop"], info["truck"], info["fit"]
+        rem = info["pieces"]
+        rest = len(rem) - fit
+        name = self._stop_text(sid)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(f"{name} doesn't fit on Truck {t}")
+        if fit:
+            box.setText(f"<b>Truck {t}</b> has room for <b>{fit} of {len(rem)}</b> pieces for "
+                        f"<b>{name}</b> ({info['fit_lbs']:,.0f} lb).<br>"
+                        f"<b>{rest}</b> piece(s), {info['rest_lbs']:,.0f} lb, won't fit.")
+        else:
+            box.setText(f"<b>Truck {t}</b> has no room for {name}'s {len(rem)} piece(s) "
+                        f"({info['rest_lbs']:,.0f} lb).")
+        box.setInformativeText("What should happen with this stop?")
+        box.setDetailedText("Won't fit:\n" + "\n".join(
+            f"{pc.crate_label}  {pc.length_in:.0f}×{pc.width_in:.0f}×{pc.height_in:.0f}\"  "
+            f"{pc.weight_lbs:,.0f} lb" for pc in rem[fit:]))
+        choices = {}
+        if not info["truck_empty"]:
+            choices[box.addButton(f"Move all {len(rem)} pcs to a new truck",
+                                  QMessageBox.ButtonRole.AcceptRole)] = "new_truck"
+        else:
+            choices[box.addButton(f"Load {fit}, put the other {rest} on another truck",
+                                  QMessageBox.ButtonRole.AcceptRole)] = "continue"
+        label = (f"Load {fit}, ship the other {rest} separately (UPS / hot-shot)" if fit
+                 else f"Ship all {len(rem)} separately (UPS / hot-shot)")
+        choices[box.addButton(label, QMessageBox.ButtonRole.ActionRole)] = "ship_other"
+        box.setDefaultButton(next(iter(choices)))
+        box.exec()
+        return choices.get(box.clickedButton(), next(iter(choices.values())))
+
+    def _build_plans(self, pieces: list, silent: bool):
         override = self.chk_override.isChecked()
-        plan = plan_load(pieces, override=override, excluded_ids=self._excluded_ids)
+        by_id = {pc.piece_id: pc for pc in pieces if pc.piece_id not in self._excluded_ids}
+        self._plans = []
+        n = len(self._trucks)
+        for i, t in enumerate(self._trucks):
+            tp = [by_id[x] for x in t["piece_ids"] if x in by_id]
+            plan = plan_load(tp, override=override, stop_order=self._route({pc.stop for pc in tp}))
+            plan.stop_names = list(self._stop_names)
+            plan.truck_label = f"Truck {i + 1} of {n}" if n > 1 else ""
+            plan.notices = []
+            self._apply_manual_moves(plan, i + 1)
+            self._plans.append(plan)
+        self._cur_truck = min(self._cur_truck, max(0, n - 1))
 
-        if plan.violations and not override and not silent:
-            msg = "Weight violations detected:\n\n" + "\n".join(plan.violations)
-            msg += "\n\nCheck 'Allow override' to proceed anyway, or adjust the load."
-            QMessageBox.warning(self, "Weight Violations", msg)
-
-        self._plan = plan
-        self.trailer_view.set_plan(plan)
-        self.side_view.set_plan(plan)
-        self._update_summary(plan)
+        if not silent:
+            unfit = [(i + 1, pc, why) for i, pl in enumerate(self._plans)
+                     for pc, why in (pl.unplaced or [])]
+            if unfit:
+                wt = sum(pc.weight_lbs for _, pc, _ in unfit)
+                QMessageBox.warning(
+                    self, "Freight Doesn't Fit",
+                    f"{len(unfit)} piece(s), {wt:,.0f} lb, don't fit on their truck:\n\n" +
+                    "\n".join(f"  •  Truck {t}: {pc.crate_label} ({pc.weight_lbs:,.0f} lb) — {why}"
+                              for t, pc, why in unfit) +
+                    "\n\nUse Re-split Trucks or Move Stop… to rearrange, or ship them separately.")
+            weight_v = [f"Truck {i + 1}: {v}" if n > 1 else v
+                        for i, pl in enumerate(self._plans) for v in pl.violations
+                        if not v.startswith("DOES NOT FIT")]
+            if weight_v and not override:
+                QMessageBox.warning(self, "Weight Violations",
+                                    "Weight violations detected:\n\n" + "\n".join(weight_v) +
+                                    "\n\nCheck 'Allow override' to proceed anyway, or adjust the load.")
+        self._refresh_truck_bar()
+        self._select_truck(self._cur_truck)
         self.btn_plan_pdf.setEnabled(True)
         self.btn_label_pdf.setEnabled(True)
+
+    def _refresh_truck_bar(self):
+        self.cmb_truck.blockSignals(True)
+        self.cmb_truck.clear()
+        for i, pl in enumerate(self._plans):
+            pcs = {sl.piece.piece_id: sl.piece for sl in pl.slots if sl.piece}
+            stops = ", ".join(f"S{sid}" for sid in plan_stops(pl))
+            self.cmb_truck.addItem(f"Truck {i + 1} of {len(self._plans)}  ·  {stops or '—'}  ·  "
+                                   f"{len(pcs)} pcs  ·  {sum(x.weight_lbs for x in pcs.values()):,.0f} lb")
+        self.cmb_truck.setCurrentIndex(self._cur_truck)
+        self.cmb_truck.blockSignals(False)
+        self.btn_other.setText(f"Ship Separately ({len(self._ship_other)})")
+
+    def _select_truck(self, idx: int):
+        if not self._plans or idx < 0:
+            return
+        self._cur_truck = idx
+        plan = self._plans[idx]
+        self._plan = plan
+        self.f_trailer_num.setText(self._trucks[idx].get("trailer_num", ""))
+        self.trailer_view.set_plan(plan)
+        self.side_view.set_plan(plan)
+        self.view_3d.set_plan(plan)
+        self._update_summary(plan)
+        self._on_securement_changed()
+
+    def _trailer_edited(self, text: str):
+        if self._trucks and self._cur_truck < len(self._trucks):
+            self._trucks[self._cur_truck]["trailer_num"] = text.strip()
+
+    def _move_stop(self):
+        pieces = [pc for pc in self._read_pieces() if pc.piece_id not in self._excluded_ids]
+        stops = sorted({pc.stop for pc in pieces})
+        if not stops:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Move Stop")
+        form = QFormLayout(dlg)
+        cmb_stop = QComboBox()
+        for sid in stops:
+            cmb_stop.addItem(f"{self._stop_text(sid)}  ({sum(1 for pc in pieces if pc.stop == sid)} pcs)", sid)
+        cmb_dest = QComboBox()
+        for i in range(len(self._trucks)):
+            cmb_dest.addItem(f"Truck {i + 1}", i)
+        cmb_dest.addItem("New truck", "new")
+        cmb_dest.addItem("Ship separately (UPS / hot-shot)", "other")
+        form.addRow("Stop:", cmb_stop)
+        form.addRow("Move all of its pieces to:", cmb_dest)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        sid, dest = cmb_stop.currentData(), cmb_dest.currentData()
+        ids = [pc.piece_id for pc in pieces if pc.stop == sid]
+        self._move_pieces(ids, dest)
+
+    def _move_pieces(self, ids: list, dest):
+        """dest: truck index, "new" or "other"."""
+        for t in self._trucks:
+            t["piece_ids"] = [i for i in t["piece_ids"] if i not in ids]
+        self._ship_other = [i for i in self._ship_other if i not in ids]
+        if dest == "other":
+            self._ship_other += ids
+            for i in ids:
+                self._ship_reasons.setdefault(i, "moved here by you")
+        else:
+            if dest == "new" or dest >= len(self._trucks):
+                self._trucks.append({"trailer_num": "", "piece_ids": []})
+                dest = len(self._trucks) - 1
+            self._trucks[dest]["piece_ids"] += ids
+            for i in ids:
+                self._ship_reasons.pop(i, None)
+            self._cur_truck = dest
+        self._trucks = [t for t in self._trucks if t["piece_ids"]] or \
+            [{"trailer_num": "", "piece_ids": []}]
+        self._cur_truck = min(self._cur_truck, len(self._trucks) - 1)
+        self._build_plans(self._read_pieces(), silent=False)
+
+    def _show_ship_other(self):
+        by_id = {pc.piece_id: pc for pc in self._read_pieces()}
+        pcs = [by_id[i] for i in self._ship_other if i in by_id]
+        if not pcs:
+            QMessageBox.information(self, "Ship Separately", "Every piece is on a truck.")
+            return
+        dlg = ShipSeparatelyDialog(pcs, self._ship_reasons, len(self._trucks), self._stop_text, self)
+        dlg.exec()
+        if dlg.returned:
+            dest = dlg.returned[0][1]
+            self._move_pieces([pid for pid, _ in dlg.returned],
+                              "new" if dest >= len(self._trucks) else dest)
+
+    def _shipment_dict(self) -> dict:
+        return {"origin": self._origin, "stops": self._stops, "use_road": self._use_road,
+                "road": self._road, "trucks": self._trucks, "ship_other": self._ship_other,
+                "ship_reasons": {str(k): v for k, v in self._ship_reasons.items()},
+                "split_key": {str(k): v for k, v in (self._split_key or {}).items()},
+                "manual": {str(k): list(v) for k, v in self._manual.items()}}
 
     def _update_summary(self, plan: LoadPlan):
         aw = plan.axle_weights
         rows_html = ""
+        if len(self._plans) > 1:
+            rows_html += (f"<tr><td colspan='3'><b style='color:#1f4e79'>"
+                          f"{getattr(plan, 'truck_label', '')}</b></td></tr>")
         for key, label, lim_key in [
             ("steer",   "Steer",          "steer_limit"),
             ("drive",   "Drive",          "drive_limit"),
@@ -2140,11 +4766,13 @@ class FreightLoaderApp(QMainWindow):
         rows_html += (f"<tr><td><b>Freight Gross:</b></td>"
                       f"<td align='right'>{fg:,} lbs</td><td></td></tr>")
 
-        # Side weights
-        left_w  = sum((s.piece.weight_lbs / 2 if s.is_center else s.piece.weight_lbs)
-                       for s in plan.slots if s.piece and s.col == 0)
-        right_w = sum((s.piece.weight_lbs / 2 if s.is_center else s.piece.weight_lbs)
-                       for s in plan.slots if s.piece and s.col == 1)
+        # Side weights: split the cargo by its lateral centre of gravity
+        W_in = TRAILER["interior_width_in"]
+        boxes = _crate_boxes(plan)
+        total = sum(b[0].weight_lbs for b in boxes) or 1.0
+        cg_off = sum(b[0].weight_lbs * (b[2] + b[5] / 2 - W_in / 2) for b in boxes) / total
+        left_w = round(total * (0.5 - cg_off / W_in))
+        right_w = round(total - left_w)
         diff    = abs(left_w - right_w)
         heavier = "Left" if left_w > right_w else "Right"
         diff_color = "#c0392b" if diff > 2000 else "#e67e22" if diff > 500 else "#27ae60"
@@ -2157,6 +4785,17 @@ class FreightLoaderApp(QMainWindow):
             f"<td align='right'><span style='color:{diff_color}'>{heavier} heavier</span></td>"
             f"</tr>"
         )
+        if plan.unplaced:
+            nl_wt = sum(p.weight_lbs for p, _ in plan.unplaced)
+            names = [p.crate_label for p, _ in plan.unplaced]
+            shown = ", ".join(names[:8]) + (f" +{len(names) - 8} more" if len(names) > 8 else "")
+            rows_html += (
+                f"<tr><td colspan='3'><hr style='margin:2px'></td></tr>"
+                f"<tr><td><b style='color:#c0392b'>NOT LOADED:</b></td>"
+                f"<td align='right' style='color:#c0392b'>{len(plan.unplaced)} pc, {nl_wt:,.0f} lbs</td>"
+                f"<td align='right' style='color:#c0392b'>"
+                f"{shown}</td></tr>"
+            )
         if self._plan:
             n_stacked = sum(1 for s in self._plan.slots if s.tier == 1 and s.piece)
             if n_stacked:
@@ -2169,16 +4808,56 @@ class FreightLoaderApp(QMainWindow):
                     f"<td align='right'>{n_stacked} crate(s)</td>"
                     f"<td align='right' style='color:#8B6914'>{stacked_labels}</td></tr>"
                 )
+        stops = plan_stops(plan)
+        if len(stops) > 1:
+            rows_html += "<tr><td colspan='3'><hr style='margin:2px'></td></tr>"
+            for st in stops:
+                pcs = [sl.piece for sl in plan.slots if sl.piece and sl.piece.stop == st
+                       and not (sl.is_center and sl.col == 1)]
+                color = STOP_COLORS[(st - 1) % len(STOP_COLORS)]
+                rows_html += (f"<tr><td><b style='color:{color}'>{stop_label(plan, st)}"
+                              f"{' (doors)' if st == stops[0] else ''}:</b></td>"
+                              f"<td align='right'>{len(pcs)} pc</td>"
+                              f"<td align='right'>{sum(pc.weight_lbs for pc in pcs):,.0f} lbs</td></tr>")
+            for delivered, steer, drive, trailer in plan.stop_axles or []:
+                bad = (drive > TRAILER["drive_limit"] or trailer > TRAILER["trailer_limit"]
+                       or steer > TRAILER["steer_limit"])
+                c = "#c0392b" if bad else "#555"
+                rows_html += (f"<tr><td style='color:{c}'>After S{delivered}:</td>"
+                              f"<td colspan='2' align='right' style='color:{c}'>"
+                              f"Drive {drive:,} · Trailer {trailer:,}</td></tr>")
+        sec_text = self._securement_text()
+        if sec_text:
+            rows_html += (
+                f"<tr><td colspan='3'><hr style='margin:2px'></td></tr>"
+                f"<tr><td><b>Securement:</b></td>"
+                f"<td colspan='2' align='right'>{sec_text}</td></tr>"
+            )
+        if len(self._plans) > 1 or self._ship_other:
+            by_id = {pc.piece_id: pc for pc in self._read_pieces()}
+            other_wt = sum(by_id[i].weight_lbs for i in self._ship_other if i in by_id)
+            rows_html += (f"<tr><td colspan='3'><hr style='margin:2px'></td></tr>"
+                          f"<tr><td><b>Shipment:</b></td><td colspan='2' align='right'>"
+                          f"{len(self._plans)} truck(s)"
+                          + (f" · <span style='color:#b03a2e'>{len(self._ship_other)} pcs, "
+                             f"{other_wt:,.0f} lb ship separately</span>" if self._ship_other else "")
+                          + "</td></tr>")
         self.lbl_summary.setText(f"<table>{rows_html}</table>")
 
         if plan.violations:
             v_html = "<br>".join(f"<span style='color:red'>⚠ {v}</span>" for v in plan.violations)
             if plan.override:
                 v_html += "<br><i>Override active.</i>"
-            self.lbl_status.setText(v_html)
         else:
-            self.lbl_status.setText(
-                "<span style='color:green'>✓ All axle weights within legal limits.</span>")
+            v_html = "<span style='color:green'>✓ All axle weights within legal limits.</span>"
+        moved = sum(1 for sl in plan.slots if sl.tier == 0 and sl.x_in is not None
+                    and not (sl.is_center and sl.col == 1))
+        if moved:
+            v_html += (f"<br><span style='color:#555'>{moved} crate(s) positioned by hand — "
+                       "Reset Moves (Top View) puts them back.</span>")
+        for note in getattr(plan, "notices", []):
+            v_html += f"<br><span style='color:#7a5c12'>ⓘ {note}</span>"
+        self.lbl_status.setText(v_html)
 
     # ── File: New / Open / Save ───────────────────────────────────────────────
     def _new_plan(self):
@@ -2190,10 +4869,22 @@ class FreightLoaderApp(QMainWindow):
         self._next_id = 1
         self._plan = None
         self._excluded_ids = []
+        self._securement.clear()
+        self.lbl_securement.setText("")
         self._current_file = None
         for f in [self.f_customer, self.f_shipment_name, self.f_trailer_num, self.f_bol]:
             f.clear()
         self.f_date.setText(datetime.date.today().strftime("%Y-%m-%d"))
+        self._origin = {"name": "", "location": "", "lat": None, "lon": None}
+        self._stops = [{"name": "", "location": "", "lat": None, "lon": None}
+                       for _ in range(MAX_STOPS)]
+        self._use_road, self._road = False, None
+        self._trucks, self._ship_other, self._ship_reasons = [], [], {}
+        self._split_key, self._plans, self._cur_truck = None, [], 0
+        self._manual = {}
+        self.cmb_truck.clear()
+        self.btn_other.setText("Ship Separately (0)")
+        self._refresh_stop_label()
         for key, default in [("steer", 12000), ("drive", 34000), ("trailer", 34000)]:
             self._limit_fields[key].setValue(default)
         self.chk_override.setChecked(False)
@@ -2201,17 +4892,18 @@ class FreightLoaderApp(QMainWindow):
         self.lbl_status.setText("No plan calculated.")
         self.trailer_view.set_plan(None)
         self.side_view.set_plan(None)
+        self.view_3d.set_plan(None)
         self.btn_plan_pdf.setEnabled(False)
         self.btn_label_pdf.setEnabled(False)
         self._set_title()
 
     def _open_plan(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Load Plan", SAVE_DIR, "Load Plan Files (*.json)")
+            self, "Open Load Plan", self._save_dir(), "Load Plan Files (*.json)")
         if not path:
             return
         try:
-            pieces, info, limits, excluded_ids, override = load_plan_json(path)
+            pieces, info, limits, excluded_ids, override, securement, shipment = load_plan_json(path)
         except Exception as e:
             QMessageBox.critical(self, "Open Failed", str(e))
             return
@@ -2222,6 +4914,21 @@ class FreightLoaderApp(QMainWindow):
         self.f_trailer_num.setText(info.trailer_num)
         self.f_bol.setText(info.bol_num)
         self.f_date.setText(info.date)
+        blank = {"name": "", "location": "", "lat": None, "lon": None}
+        self._origin = dict(blank, **shipment.get("origin", {}))
+        saved_stops = shipment.get("stops") or [dict(blank, name=n) for n in info.stop_names]
+        self._stops = [dict(blank, **(saved_stops[i] if i < len(saved_stops) else {}))
+                       for i in range(MAX_STOPS)]
+        self._use_road = bool(shipment.get("use_road", False))
+        self._road = shipment.get("road")
+        self._trucks = shipment.get("trucks", [])
+        self._ship_other = list(shipment.get("ship_other", []))
+        self._ship_reasons = {int(k): v for k, v in shipment.get("ship_reasons", {}).items()}
+        self._manual = {int(k): tuple(v) for k, v in shipment.get("manual", {}).items()}
+        sk = shipment.get("split_key")
+        self._split_key = {int(k): v for k, v in sk.items()} if sk else None
+        self._cur_truck = 0
+        self._refresh_stop_label()
 
         # Populate axle limits
         for key in ("steer", "drive", "trailer"):
@@ -2232,6 +4939,8 @@ class FreightLoaderApp(QMainWindow):
         # Populate freight table
         self._load_pieces(pieces)
         self._excluded_ids = excluded_ids
+        self._securement[:] = securement
+        self._on_securement_changed()
 
         # Recalculate and display
         self._current_file = path
@@ -2248,7 +4957,7 @@ class FreightLoaderApp(QMainWindow):
         info = self._get_shipment_info()
         default_name = make_base_filename(info) + ".json"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Load Plan", os.path.join(SAVE_DIR, default_name),
+            self, "Save Load Plan", os.path.join(self._save_dir(), default_name),
             "Load Plan Files (*.json)")
         if path:
             self._write_plan(path)
@@ -2263,7 +4972,9 @@ class FreightLoaderApp(QMainWindow):
         limits = {k: self._limit_fields[k].value() for k in ("steer", "drive", "trailer")}
         try:
             save_plan_json(pieces, info, limits, self._excluded_ids,
-                           self.chk_override.isChecked(), path)
+                           self.chk_override.isChecked(), path, self._securement,
+                           self._shipment_dict())
+            self._remember_dir(path)
             self.lbl_status.setText(
                 self.lbl_status.text() +
                 f"<br><span style='color:#555'>Saved: {os.path.basename(path)}</span>")
@@ -2272,38 +4983,93 @@ class FreightLoaderApp(QMainWindow):
 
     def _set_title(self):
         name = os.path.basename(self._current_file) if self._current_file else "Unsaved"
-        self.setWindowTitle(f"Freight Loader — {name}")
+        self.setWindowTitle(f"Freight Loader v{APP_VERSION} — {name}")
 
     # ── PDF exports ───────────────────────────────────────────────────────────
+    # ── Save folder (remembered between sessions) ────────────────────────────
+    def _save_dir(self) -> str:
+        """Folder of the user's last save, or Load Plans if none (or it's gone)."""
+        last = QSettings("FreightLoader", "FreightLoader").value("last_save_dir", "")
+        return last if last and os.path.isdir(last) else LOAD_PLANS_DIR
+
+    def _remember_dir(self, path: str):
+        QSettings("FreightLoader", "FreightLoader").setValue("last_save_dir",
+                                                             os.path.dirname(path))
+
+    def _preview_and_save(self, title: str, default_name: str, build):
+        """Build the PDF into a temp file, preview it, then save where the user picks."""
+        fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="freight_loader_")
+        os.close(fd)
+        try:
+            build(tmp)
+            if HAS_QTPDF:
+                dlg = PdfPreviewDialog(tmp, title, self)
+                dlg.exec()
+                if not dlg.save_requested:
+                    return
+            else:   # no PDF module: open the system viewer, then offer to save
+                if sys.platform == "win32":
+                    os.startfile(tmp)
+                if QMessageBox.question(self, title, "Save this PDF?") != \
+                        QMessageBox.StandardButton.Yes:
+                    return
+            path, _ = QFileDialog.getSaveFileName(
+                self, f"Save {title}", os.path.join(self._save_dir(), default_name),
+                "PDF Files (*.pdf)")
+            if not path:
+                return
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+            shutil.copyfile(tmp, path)
+            self._remember_dir(path)
+            QMessageBox.information(self, "Saved", f"{title} saved:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "PDF Error", str(e))
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
     def _export_floor_plan(self):
         if not self._plan:
             return
         info = self._get_shipment_info()
-        default = make_base_filename(info) + "_load_plan.pdf"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Floor Plan PDF", os.path.join(SAVE_DIR, default),
-            "PDF Files (*.pdf)")
-        if path:
-            export_load_plan_pdf(self._plan, info, path)
-            QMessageBox.information(self, "Saved", f"Floor plan saved:\n{path}")
+        by_id = {pc.piece_id: pc for pc in self._read_pieces()}
+        other = [(by_id[i], self._stop_text(by_id[i].stop),
+                  self._ship_reasons.get(i, "didn't fit — ship separately"))
+                 for i in self._ship_other if i in by_id]
+        entries = self._truck_entries(info)
+        self._preview_and_save(
+            "Floor Plan PDF", make_base_filename(info) + "_load_plan.pdf",
+            lambda path: export_shipment_pdf(entries, path, self._securement,
+                                             include_3d=self.chk_pdf_3d.isChecked(),
+                                             ship_other=other))
+
+    def _truck_entries(self, info: ShipmentInfo) -> list:
+        """[(plan, info)] for every truck, each with its own trailer # and truck label."""
+        out = []
+        for i, pl in enumerate(self._plans):
+            ti = ShipmentInfo(**{**vars(info),
+                                 "trailer_num": self._trucks[i].get("trailer_num", ""),
+                                 "truck_label": getattr(pl, "truck_label", "")})
+            out.append((pl, ti))
+        return out or [(self._plan, info)]
 
     def _export_labels(self):
         if not self._plan:
             return
         info = self._get_shipment_info()
-        default = make_base_filename(info) + "_labels.pdf"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Crate Labels PDF", os.path.join(SAVE_DIR, default),
-            "PDF Files (*.pdf)")
-        if path:
-            export_crate_labels_pdf(self._plan, info, path)
-            QMessageBox.information(self, "Saved", f"Crate labels saved:\n{path}")
+        entries = self._truck_entries(info)
+        self._preview_and_save("Crate Labels PDF", make_base_filename(info) + "_labels.pdf",
+                               lambda path: export_shipment_labels(entries, path))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    ensure_folders()
     win = FreightLoaderApp()
     win.show()
     sys.exit(app.exec())
