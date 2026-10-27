@@ -3,7 +3,7 @@ Freight Loader — 53' Dry Van Load Planning Tool
 Imports Excel packing lists, calculates balanced load plans, exports floor plan PDF and crate labels.
 """
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 import sys
 import math
@@ -93,14 +93,35 @@ TRAILER = {
     "interior_length_in": 636,
     "interior_width_in":  98,
     "interior_height_in": 110,
-    "tandem_from_nose_in": 492,   # trailer tandem center (~41 ft from kingpin)
-    "steer_tare":  11000,
-    "drive_tare":   9000,
     "steer_limit": 12000,
     "drive_limit": 34000,
     "trailer_limit": 34000,
     "gross_limit":  80000,
 }
+
+# ── Tractor and trailer running gear (Truck & Trailer… dialog) ───────────────
+# Empty weights are typical for a sleeper tractor and a 53' dry van; the
+# trailer body's weight sits at its centre of gravity, the slider (axles,
+# wheels, brakes) moves with the tandem. Positions are in inches.
+RIG_DEFAULTS = {
+    "steer_tare":        10800,   # tractor alone (bobtail), steer axle
+    "drive_tare":         8700,   # tractor alone, drive tandem
+    "wheelbase_in":        230,   # steer axle to drive tandem centre
+    "fw_min_in":             0,   # fifth wheel ahead of drive tandem centre: slide range
+    "fw_max_in":            24,
+    "fw_step_in":            2,
+    "fw_home_in":           12,   # usual position; auto stays here unless moving helps
+    "kingpin_in":           36,   # kingpin behind the trailer nose
+    "trailer_tare":      14500,   # empty trailer
+    "slider_tare":        3000,   #   of which the sliding tandem assembly
+    "trailer_cg_in":       270,   # empty body's centre of gravity behind the nose
+    "tandem_min_in":       420,   # trailer tandem centre behind kingpin: slide range
+    "tandem_max_in":       540,
+    "tandem_step_in":        6,   # slider hole spacing
+    "tandem_spread_in":     49,   # front to rear trailer axle
+    "kpra_max_in":         480,   # kingpin to rear axle legal max (40' — CA; many states 41'); 0 = none
+}
+RIG = dict(RIG_DEFAULTS)
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -155,6 +176,8 @@ class LoadPlan:
     stop_axles: list = None      # [(stop just delivered, steer, drive, trailer)] for remaining load
     stop_names: list = None      # display names for stops 1..MAX_STOPS (set by the UI)
     stop_order: list = None      # stop IDs in delivery order (first delivered = at the doors)
+    rig: dict = None             # {"fw_in", "tandem_in"}: fifth wheel and trailer tandem positions
+    rig_auto: bool = True        # positions chosen by the planner (False = set by the user)
 
 
 # ── Algorithm ─────────────────────────────────────────────────────────────────
@@ -300,13 +323,73 @@ def _pack_columns(pieces: list) -> tuple:
     return columns, True
 
 
-def _axles_for(total: float, moment: float) -> tuple:
-    """(steer, drive, trailer) for a cargo total and moment about the kingpin."""
-    trailer = moment / TRAILER["tandem_from_nose_in"]
-    pin = total - trailer
-    steer = max(TRAILER["steer_tare"] - round(pin * 0.05), TRAILER["steer_tare"] - 2500)
-    drive = TRAILER["drive_tare"] + round(pin * 1.05)
-    return steer, drive, trailer
+# ── Axle weights ──────────────────────────────────────────────────────────────
+# Two beams. The trailer rests on the kingpin and its tandem centre and carries
+# the freight plus its own body; the slider's weight sits straight on the
+# tandem. The kingpin load rides the fifth wheel, which sits fw_in ahead of
+# the drive tandem centre, so it splits between drive and steer by lever arm:
+# sliding the fifth wheel forward moves weight onto the steer axle, sliding
+# the trailer tandem back moves weight from the trailer axles onto the drives.
+def _rear_axle_ok(tandem_in: float) -> bool:
+    """Kingpin-to-rear-axle distance within the legal limit (if one is set)."""
+    return (not RIG["kpra_max_in"]
+            or tandem_in + RIG["tandem_spread_in"] / 2 <= RIG["kpra_max_in"] + FIT_TOLERANCE_IN)
+
+
+def rig_positions(legal_only: bool = True) -> tuple:
+    """(fifth wheel notches, tandem holes) in inches, from RIG."""
+    fw = [RIG["fw_min_in"] + k * RIG["fw_step_in"]
+          for k in range(int((RIG["fw_max_in"] - RIG["fw_min_in"]) / RIG["fw_step_in"]) + 1)]
+    holes = [RIG["tandem_min_in"] + k * RIG["tandem_step_in"]
+             for k in range(int((RIG["tandem_max_in"] - RIG["tandem_min_in"]) / RIG["tandem_step_in"]) + 1)]
+    if not legal_only:
+        return fw, holes
+    return fw, [t for t in holes if _rear_axle_ok(t)] or holes[:1]
+
+
+def default_rig() -> dict:
+    """Usual fifth wheel spot, tandem as far back as the kingpin-to-rear-axle limit allows."""
+    fw, holes = rig_positions()
+    return {"fw_in": min(fw, key=lambda f: abs(f - RIG["fw_home_in"])), "tandem_in": holes[-1]}
+
+
+def rig_tare() -> float:
+    """Empty tractor + trailer weight."""
+    return RIG["steer_tare"] + RIG["drive_tare"] + RIG["trailer_tare"]
+
+
+def max_payload() -> float:
+    """Freight weight that brings the rig to the gross limit."""
+    return TRAILER["gross_limit"] - rig_tare()
+
+
+def axle_marks(plan: Optional["LoadPlan"]) -> list:
+    """[(inches from nose, label, colour, kind)] for the kingpin, drive and trailer tandem."""
+    rig = plan.rig if plan and plan.rig else default_rig()
+    kp = RIG["kingpin_in"]
+    return [(kp, "Kingpin", "#666666", "kingpin"),
+            (kp + rig["fw_in"], "Drive axles", "#e67e00", "drive"),
+            (kp + rig["tandem_in"], "Trailer axles", "#c0392b", "tandem")]
+
+
+def rig_text(rig: dict) -> str:
+    """'5th wheel 12" ahead of drives · Tandem 450" behind kingpin (rear axle 39'7")'."""
+    rear = rig["tandem_in"] + RIG["tandem_spread_in"] / 2
+    return (f"5th wheel {rig['fw_in']:.0f}\" ahead of drives  ·  Tandem {rig['tandem_in']:.0f}\" "
+            f"behind kingpin (rear axle {int(rear // 12)}'{rear % 12:.0f}\")")
+
+
+def _axles_for(total: float, moment: float, rig: dict) -> tuple:
+    """(steer, drive, trailer) for freight `total` lb with `moment` (lb·in about the nose)."""
+    kp, span = RIG["kingpin_in"], rig["tandem_in"]
+    body = RIG["trailer_tare"] - RIG["slider_tare"]
+    about_kp = moment - total * kp + body * (RIG["trailer_cg_in"] - kp)
+    on_tandem = about_kp / span
+    pin = total + body - on_tandem
+    wb = RIG["wheelbase_in"]
+    steer = RIG["steer_tare"] + pin * rig["fw_in"] / wb
+    drive = RIG["drive_tare"] + pin * (wb - rig["fw_in"]) / wb
+    return steer, drive, on_tandem + RIG["slider_tare"]
 
 
 def _overload(steer: float, drive: float, trailer: float) -> float:
@@ -314,29 +397,73 @@ def _overload(steer: float, drive: float, trailer: float) -> float:
             + max(0, trailer - TRAILER["trailer_limit"]))
 
 
-def _order_score(rows: list, order: list) -> float:
+AUTO_RIG_COMFORT = 0.90   # axles under 90% of their limit don't need the rig moved
+
+
+def auto_rig(loads: list) -> dict:
     """
-    Lower is better: axle overload dominates (full load, and what remains after
-    each delivery stop), then drive/trailer imbalance of the full load.
-    rows[i] = (depth, weight, inner_moment, stop).
+    Fifth wheel and tandem positions for loads [(total, moment)] — the full
+    load first, then what remains after each delivery. Keeps every axle legal
+    if possible; when drive or trailer tandem is above AUTO_RIG_COMFORT of its
+    limit, slides to bring the heavier one down; otherwise leaves the fifth
+    wheel at its usual spot and the tandem as far back as allowed.
+    """
+    fw_opts, holes = rig_positions()
+    best = None
+    for t in holes:
+        for f in fw_opts:
+            rig = {"fw_in": f, "tandem_in": t}
+            over = 0.0
+            for total, moment in loads:
+                over += _overload(*_axles_for(total, moment, rig))
+            _s, drive, trailer = _axles_for(*loads[0], rig)
+            peak = max(drive / TRAILER["drive_limit"], trailer / TRAILER["trailer_limit"])
+            key = (round(over), round(max(0.0, peak - AUTO_RIG_COMFORT) * 200),
+                   abs(f - RIG["fw_home_in"]), -t)
+            if best is None or key < best[0]:
+                best = (key, rig)
+    return best[1]
+
+
+def _order_loads(rows: list, order: list) -> list:
+    """
+    [(total, moment about the nose)] for rows laid nose→tail in `order`: the
+    full load, then what remains after each delivery.
+    rows[i] = (depth, weight, inner_moment, stop, stacked).
     """
     start = 0.0
     by_stop = {}                      # stop -> [weight, moment]
     for i in order:
-        depth, weight, inner, stop = rows[i]
+        depth, weight, inner, stop, _stacked = rows[i]
         acc = by_stop.setdefault(stop, [0.0, 0.0])
         acc[0] += weight
         acc[1] += weight * start + inner
         start += depth
-    total = sum(a[0] for a in by_stop.values())
-    moment = sum(a[1] for a in by_stop.values())
-    steer, drive, trailer = _axles_for(total, moment)
-    over = _overload(steer, drive, trailer)
-    for delivered in sorted(by_stop)[:-1]:
-        rem = [a for st, a in by_stop.items() if st > delivered]
-        over += _overload(*_axles_for(sum(a[0] for a in rem), sum(a[1] for a in rem)))
+    out = []
+    for delivered in [None] + sorted(by_stop)[:-1]:
+        rem = [a for st, a in by_stop.items() if delivered is None or st > delivered]
+        out.append((sum(a[0] for a in rem), sum(a[1] for a in rem)))
+    return out
+
+
+def _order_score(rows: list, order: list, rig: dict) -> float:
+    """
+    Lower is better: axle overload dominates (full load, and what remains after
+    each delivery stop), then drive/trailer imbalance of the full load.
+    """
+    loads = _order_loads(rows, order)
+    steer, drive, trailer = _axles_for(*loads[0], rig)
+    over = sum(_overload(*_axles_for(t, m, rig)) for t, m in loads)
     balance = abs(drive / TRAILER["drive_limit"] - trailer / TRAILER["trailer_limit"])
     return over * 10 + balance * 10_000
+
+
+def _order_overload(rows: list, order: list, rig: dict, auto: bool) -> float:
+    """Pounds over any axle limit for this order, with the rig slid (auto) or fixed."""
+    loads = _order_loads(rows, order)
+    if auto:
+        rig = auto_rig(loads)
+    return sum(_overload(*_axles_for(t, m, rig)) for t, m in loads)
 
 
 def _zone_ok(rows: list, order: list) -> bool:
@@ -344,32 +471,43 @@ def _zone_ok(rows: list, order: list) -> bool:
     return all(rows[order[k]][3] >= rows[order[k + 1]][3] for k in range(len(order) - 1))
 
 
-def _balanced_order(rows: list) -> list:
-    """Row order nose→tail: zones by stop, heavy rows mid-zone, then swaps/moves."""
-    n = len(rows)
-    if n < 2:
-        return list(range(n))
-    order = []
-    for stop in sorted({r[3] for r in rows}, reverse=True):
-        zone = [i for i in range(n) if rows[i][3] == stop]
-        by_weight = sorted(zone, key=lambda i: rows[i][1], reverse=True)
-        m = len(zone)
-        mid = m // 2
-        slots = [mid]
-        lo, hi = mid - 1, mid + 1
-        while lo >= 0 or hi < m:
-            if hi < m:
-                slots.append(hi)
-                hi += 1
-            if lo >= 0:
-                slots.append(lo)
-                lo -= 1
-        placed = [None] * m
-        for dest, idx in zip(slots, by_weight):
-            placed[dest] = idx
-        order += placed
+def _stack_block_zone(rows: list, zone: list, front: int) -> list:
+    """
+    One stop zone nose→doors: `front` single rows, the block of stacked rows,
+    then the remaining singles. Heaviest rows sit next to / in the middle of
+    the block.
+    """
+    singles = sorted((i for i in zone if not rows[i][4]), key=lambda i: rows[i][1], reverse=True)
+    doubles = sorted((i for i in zone if rows[i][4]), key=lambda i: rows[i][1], reverse=True)
+    back = len(singles) - front
+    # Single positions nearest the block first (ties: nose side)
+    spots = sorted([("f", k) for k in range(front)] + [("b", k) for k in range(back)],
+                   key=lambda sp: (front - sp[1] if sp[0] == "f" else sp[1] + 1, sp[0] == "b"))
+    front_rows, back_rows = [None] * front, [None] * back
+    for (side, k), idx in zip(spots, singles):
+        (front_rows if side == "f" else back_rows)[k] = idx
+    # Doubles: heaviest in the middle of the block
+    m = len(doubles)
+    mid_out = sorted(range(m), key=lambda k: (abs(k - (m - 1) / 2), k))
+    block = [None] * m
+    for k, idx in zip(mid_out, doubles):
+        block[k] = idx
+    return front_rows + block + back_rows
 
-    best = _order_score(rows, order)
+
+def _improve_order(rows: list, order: list, rig: dict, keep_pattern: bool) -> list:
+    """
+    Swaps and moves within each stop zone while they improve _order_score.
+    keep_pattern: only changes that leave every stacked row where it is in the
+    single / double pattern (so the stack block stays together and in place).
+    """
+    n = len(order)
+    pattern = [rows[i][4] for i in order]
+
+    def ok(cand):
+        return _zone_ok(rows, cand) and (not keep_pattern or
+                                         all(rows[i][4] == pt for i, pt in zip(cand, pattern)))
+    best = _order_score(rows, order, rig)
     for _ in range(50):
         improved = False
         for i in range(n):
@@ -378,7 +516,9 @@ def _balanced_order(rows: list) -> list:
                     continue   # rows only trade places within their stop's zone
                 cand = order[:]
                 cand[i], cand[j] = cand[j], cand[i]
-                sc = _order_score(rows, cand)
+                if not ok(cand):
+                    continue
+                sc = _order_score(rows, cand, rig)
                 if sc < best - 1e-9:
                     order, best, improved = cand, sc, True
         for i in range(n):
@@ -387,13 +527,64 @@ def _balanced_order(rows: list) -> list:
                     continue
                 cand = order[:]
                 cand.insert(j, cand.pop(i))
-                if not _zone_ok(rows, cand):
+                if not ok(cand):
                     continue
-                sc = _order_score(rows, cand)
+                sc = _order_score(rows, cand, rig)
                 if sc < best - 1e-9:
                     order, best, improved = cand, sc, True
         if not improved:
             break
+    return order
+
+
+def _balanced_order(rows: list, rig: dict, auto: bool = True) -> list:
+    """
+    Row order nose→tail, the way a loader would do it. Zones by stop (last
+    stop at the nose). In each zone the stacked rows form one block in the
+    middle; with an odd number of single rows the extra one goes behind the
+    block (e.g. 12 rows, 3 doubles: 4 singles, 3 doubles, 5 singles). Rows
+    then trade places among singles / among doubles to even out the axles.
+    If that isn't legal (with the rig slid when `auto`), the block moves the
+    fewest rows needed; failing that, stacks may split up wherever the axles
+    need them.
+    """
+    n = len(rows)
+    if n < 2:
+        return list(range(n))
+    zones = [[i for i in range(n) if rows[i][3] == stop]
+             for stop in sorted({r[3] for r in rows}, reverse=True)]
+    singles = [sum(1 for i in z if not rows[i][4]) for z in zones]
+    preferred = [s // 2 for s in singles]
+
+    def build(fronts):
+        order = []
+        for z, f in zip(zones, fronts):
+            order += _stack_block_zone(rows, z, f)
+        return _improve_order(rows, order, rig, keep_pattern=True)
+
+    fronts = list(preferred)
+    order = build(fronts)
+    over = _order_overload(rows, order, rig, auto)
+    if over > 0:
+        # Slide one zone's block at a time, nearest positions first (nose side on ties)
+        improved = True
+        while improved and over > 0:
+            improved = False
+            for zi in range(len(zones)):
+                for f in sorted(range(singles[zi] + 1), key=lambda f: (abs(f - preferred[zi]), f)):
+                    if f == fronts[zi]:
+                        continue
+                    trial = fronts[:zi] + [f] + fronts[zi + 1:]
+                    cand = build(trial)
+                    c_over = _order_overload(rows, cand, rig, auto)
+                    if c_over < over - 0.5:
+                        fronts, order, over, improved = trial, cand, c_over, True
+                        break
+    if over > 0:
+        # Still overweight with the block anywhere: let the stacks split up
+        cand = _improve_order(rows, order, rig, keep_pattern=False)
+        if _order_overload(rows, cand, rig, auto) < over - 0.5:
+            order = cand
     return order
 
 
@@ -414,18 +605,20 @@ def _relayout_rows(slots: list) -> float:
 
 
 def plan_load(pieces: list, override: bool = False, excluded_ids: list = None,
-              stop_order: list = None) -> LoadPlan:
+              stop_order: list = None, rig: dict = None) -> LoadPlan:
     """
     Build a load plan that fits the trailer, stacks only as needed and keeps
     axle and side-to-side weight balanced. Pieces that won't fit are listed in
-    LoadPlan.unplaced and called out in the violations.
+    LoadPlan.unplaced and called out in the violations. `rig` fixes the fifth
+    wheel and tandem positions; None lets the planner place them.
     """
     excluded_ids = excluded_ids or []
     L, W, H = (TRAILER["interior_length_in"], TRAILER["interior_width_in"],
                TRAILER["interior_height_in"])
     active = [p for p in pieces if p.piece_id not in excluded_ids]
     if not active:
-        return LoadPlan([], {}, [], 0.0, override, excluded_ids, [], [])
+        return LoadPlan([], {}, [], 0.0, override, excluded_ids, [], [],
+                        rig=dict(rig or default_rig()), rig_auto=rig is None)
 
     # Delivery order: the given route order, then any other stops by ID
     rank = {sid: i + 1 for i, sid in enumerate(stop_order or [])}
@@ -472,8 +665,9 @@ def plan_load(pieces: list, override: bool = False, excluded_ids: list = None,
 
     rows = _floor_rows(columns)
     row_stats = [(max(c.length for c in r), sum(c.weight for c in r),
-                  sum(c.moment_in_row for c in r), _row_stop(r)) for r in rows]
-    order = _balanced_order(row_stats)
+                  sum(c.moment_in_row for c in r), _row_stop(r),
+                  any(c.top is not None for c in r)) for r in rows]
+    order = _balanced_order(row_stats, rig or default_rig(), auto=rig is None)
 
     # Choose each row's walls to balance left/right weight, then build slots nose→tail
     ordered_rows = [rows[ri] for ri in order]
@@ -502,19 +696,11 @@ def plan_load(pieces: list, override: bool = False, excluded_ids: list = None,
                                             row_start_in=cursor, tier=1))
         cursor += max(c.length for c in row)
 
-    axle_weights, violations = _calc_axle_weights(slots, override)
-    stop_axles = _stop_axles(slots)
-    for delivered, steer, drive, trailer in stop_axles:
-        for name, val, lim in (("STEER", steer, "steer_limit"), ("DRIVE", drive, "drive_limit"),
-                               ("TRAILER TANDEM", trailer, "trailer_limit")):
-            if val > TRAILER[lim]:
-                violations.append(f"AFTER STOP {delivered} DELIVERY: {name} {val:,.0f} lb > "
-                                  f"{TRAILER[lim]:,} lb limit")
-    if unplaced:
-        violations.insert(0, _not_fit_message(unplaced))
     order = sorted({p.stop for p in active}, key=lambda sid: rank.get(sid, len(rank) + sid))
-    return LoadPlan(slots, axle_weights, violations, cursor, override, excluded_ids, unplaced,
-                    stop_axles, stop_order=order)
+    plan = LoadPlan(slots, {}, [], cursor, override, excluded_ids, unplaced, [],
+                    stop_order=order, rig=dict(rig) if rig else None, rig_auto=rig is None)
+    _refresh_plan_metrics(plan)
+    return plan
 
 
 # Row side states: LEFT = heavier column / wall-hugging crate on the left wall,
@@ -657,22 +843,27 @@ def _balance_sides(rows: list) -> list:
     return apply(choice)
 
 
-def _stop_axles(slots: list) -> list:
-    """Axle weights of the load left on the trailer after each delivery but the last."""
-    stop_of = {s.piece.seq: s.piece.stop for s in slots if s.piece}
+def _freight_loads(slots: list) -> list:
+    """
+    [(stop delivered or None, total lb, moment lb·in about the nose)]: the full
+    load first, then the load left on the trailer after each delivery but the last.
+    """
     x_of = {b[0].piece_id: b[1] for b in _slot_boxes(slots)}   # honours manual moves
+    pieces = [s.piece for s in slots if s.piece and not (s.is_center and s.col == 1)]
+    stop_of = {p.seq: p.stop for p in pieces}
     out = []
-    for delivered in sorted(stop_of)[:-1]:
-        total = moment = 0.0
-        for s in slots:
-            if s.piece is None or s.piece.seq <= delivered or (s.is_center and s.col == 1):
-                continue
-            total += s.piece.weight_lbs
-            moment += s.piece.weight_lbs * (x_of.get(s.piece.piece_id, s.row_start_in)
-                                            + s.piece.length_in / 2)
-        steer, drive, trailer = _axles_for(total, moment)
-        out.append((stop_of[delivered], round(steer), round(drive), round(trailer)))
+    for delivered in [0] + sorted(stop_of)[:-1]:
+        rest = [p for p in pieces if p.seq > delivered]
+        out.append((stop_of.get(delivered),
+                    sum(p.weight_lbs for p in rest),
+                    sum(p.weight_lbs * (x_of[p.piece_id] + p.length_in / 2) for p in rest)))
     return out
+
+
+def _stop_axles(slots: list, rig: dict) -> list:
+    """[(stop just delivered, steer, drive, trailer)] for the load left after each delivery."""
+    return [(stop, *(round(v) for v in _axles_for(total, moment, rig)))
+            for stop, total, moment in _freight_loads(slots)[1:]]
 
 
 def plan_stops(plan: Optional[LoadPlan]) -> list:
@@ -700,50 +891,23 @@ def _not_fit_message(unplaced: list) -> str:
     return (f"DOES NOT FIT: {len(unplaced)} piece(s), {wt:,.0f} lb not loaded — {labels}")
 
 
-def _calc_axle_weights(slots: list, override: bool) -> tuple:
+def _calc_axle_weights(slots: list, override: bool, rig: dict) -> tuple:
     """
-    Beam model: trailer kingpin (nose=0) and trailer tandem as two supports.
-    Trailer tandem reaction = Σ(weight × center_from_nose) / tandem_position.
-    Pin weight goes to tractor 5th wheel → split between drive and steer axles.
-    Tier=1 (stacked) pieces share the same floor position as tier=0 — their moment
-    arms are calculated independently, which is physically correct.
+    Axle weights of the loaded rig (see _axles_for) with the fifth wheel and
+    tandem at `rig`, plus weight and stacked-height violations. Stacked pieces
+    count at their own centre, like floor pieces.
     """
-    tandem_pos = TRAILER["tandem_from_nose_in"]
     trailer_h  = TRAILER["interior_height_in"]
-    total_cargo = 0.0
-    moment = 0.0
-
-    # Build a map for height-clearance checks: (row, col) -> [tier0_piece, tier1_piece]
-    stack_map: dict = {}
-    x_of = {b[0].piece_id: b[1] for b in _slot_boxes(slots)}   # honours manual moves
-    for slot in slots:
-        if slot.piece is None:
-            continue
-        if slot.is_center and slot.col == 1:
-            continue  # center piece already counted via col=0
-        key = (slot.row, slot.col)
-        stack_map.setdefault(key, {})[slot.tier] = slot.piece
-        center = x_of.get(slot.piece.piece_id, slot.row_start_in) + slot.piece.length_in / 2.0
-        total_cargo += slot.piece.weight_lbs
-        moment += slot.piece.weight_lbs * center
-
+    _stop, total_cargo, moment = _freight_loads(slots)[0]
     if total_cargo == 0:
         return {}, []
-
-    trailer_rxn = moment / tandem_pos
-    pin_weight  = total_cargo - trailer_rxn
-
-    steer_weight = TRAILER["steer_tare"] - round(pin_weight * 0.05)
-    steer_weight = max(steer_weight, TRAILER["steer_tare"] - 2500)
-    drive_weight  = TRAILER["drive_tare"] + round(pin_weight * 1.05)
-    truck_gross = steer_weight + drive_weight + round(trailer_rxn)
-
+    steer, drive, trailer = _axles_for(total_cargo, moment, rig)
     aw = {
-        "steer":        round(steer_weight),
-        "drive":        round(drive_weight),
-        "trailer":      round(trailer_rxn),
+        "steer":         round(steer),
+        "drive":         round(drive),
+        "trailer":       round(trailer),
+        "gross":         round(steer + drive + trailer),
         "freight_gross": round(total_cargo),
-        "pin":          round(pin_weight),
     }
 
     v = []
@@ -753,9 +917,13 @@ def _calc_axle_weights(slots: list, override: bool) -> tuple:
         v.append(f"DRIVE {aw['drive']:,} lb > {TRAILER['drive_limit']:,} lb limit")
     if aw["trailer"] > TRAILER["trailer_limit"]:
         v.append(f"TRAILER TANDEM {aw['trailer']:,} lb > {TRAILER['trailer_limit']:,} lb limit")
-    if truck_gross   > TRAILER["gross_limit"]:
-        v.append(f"GROSS {truck_gross:,} lb > {TRAILER['gross_limit']:,} lb limit")
+    if aw["gross"]   > TRAILER["gross_limit"]:
+        v.append(f"GROSS {aw['gross']:,} lb > {TRAILER['gross_limit']:,} lb limit")
 
+    stack_map: dict = {}   # (row, col) -> {tier: piece}
+    for slot in slots:
+        if slot.piece and not (slot.is_center and slot.col == 1):
+            stack_map.setdefault((slot.row, slot.col), {})[slot.tier] = slot.piece
     # Height clearance check for stacked positions
     for (row, col), tiers in stack_map.items():
         if 0 in tiers and 1 in tiers:
@@ -775,7 +943,6 @@ def _calc_axle_weights(slots: list, override: bool) -> tuple:
 # freight is split into trucks along that route, one stop per truck where
 # possible. When a stop won't fit the user chooses: move the whole stop to a
 # new truck, or load what fits and ship the rest another way.
-MAX_PAYLOAD_LBS = 45_000          # legal freight weight for a 53' van at 80,000 lb gross
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_TABLE_URL = "https://router.project-osrm.org/table/v1/driving/"
 HTTP_USER_AGENT = "FreightLoader/1.0 (desktop load planner)"
@@ -901,14 +1068,14 @@ def physically_loadable(p: FreightPiece) -> Optional[str]:
         return f"wider than trailer ({p.width_in:.0f}\" > {W}\")"
     if p.height_in > H:
         return f"taller than trailer ({p.height_in:.0f}\" > {H}\")"
-    if p.weight_lbs > MAX_PAYLOAD_LBS:
+    if p.weight_lbs > max_payload():
         return f"heavier than a truck can legally carry ({p.weight_lbs:,.0f} lb)"
     return None
 
 
 def fits_one_truck(pieces: list, stop_rank: dict) -> bool:
     """True if `pieces` fit one trailer by floor space (with stacking) and payload."""
-    if sum(p.weight_lbs for p in pieces) > MAX_PAYLOAD_LBS:
+    if sum(p.weight_lbs for p in pieces) > max_payload():
         return False
     for p in pieces:
         _normalize_placement(p)
@@ -1154,8 +1321,9 @@ def _draw_top_plan(painter: QPainter, rect: QRectF, plan: Optional[LoadPlan],
                      Qt.AlignmentFlag.AlignRight, "R")
 
     # Axle reference lines (labels right-aligned in the notes column)
-    for depth, label, color in [(36, "Drive axles", "#e67e00"),
-                                (TRAILER["tandem_from_nose_in"], "Trailer axles", "#c0392b")]:
+    for depth, label, color, kind in axle_marks(plan):
+        if kind == "kingpin":
+            continue   # 1 ft from the drive line; the side view shows it
         ay = ty + depth * s
         painter.setPen(QPen(QColor(color), 1.2 * u, Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(tx, ay), QPointF(tx + tw, ay))
@@ -1358,13 +1526,15 @@ def _draw_top_plan(painter: QPainter, rect: QRectF, plan: Optional[LoadPlan],
 
 
 def _draw_side_plan(painter: QPainter, rect: QRectF, plan: Optional[LoadPlan],
-                    securement: list = None, u: float = 1.0):
+                    securement: list = None, u: float = 1.0, geom: dict = None):
     """
     To-scale side elevation seen from the left wall (nose at left), same
-    geometry as the 3D view's Side preset. Shared by the Side View tab and the PDF.
+    geometry as the 3D view's Side preset, with the kingpin, drive and trailer
+    axles under the floor. Shared by the Side View tab and the PDF; `geom`
+    receives the scale so the view can map mouse drags to inches.
     """
     L, H = TRAILER["interior_length_in"], TRAILER["interior_height_in"]
-    ML, MT, MB = 38 * u, 22 * u, 36 * u
+    ML, MT, MB = 38 * u, 22 * u, 52 * u
     s = min((rect.width() - ML - 10 * u) / L, (rect.height() - MT - MB) / H)
     ox = rect.x() + ML
     spare = rect.height() - MT - MB - H * s
@@ -1400,21 +1570,45 @@ def _draw_side_plan(painter: QPainter, rect: QRectF, plan: Optional[LoadPlan],
     for xm in range(0, L + 1, 60):
         xx = ox + xm * s
         painter.setPen(QPen(QColor("#bbb"), u))
-        painter.drawLine(QPointF(xx, floor_y + 15 * u), QPointF(xx, floor_y + 20 * u))
+        painter.drawLine(QPointF(xx, floor_y + 31 * u), QPointF(xx, floor_y + 36 * u))
         painter.setPen(QColor("#666"))
-        painter.drawText(QRectF(xx - 20 * u, floor_y + 20 * u, 40 * u, 12 * u), center,
+        painter.drawText(QRectF(xx - 20 * u, floor_y + 36 * u, 40 * u, 12 * u), center,
                          f"{xm // 12}'")
 
-    # Axle markers
-    for depth, label, color in [(36, "Drive", "#e67e00"),
-                                (TRAILER["tandem_from_nose_in"], "Trailer axles", "#c0392b")]:
+    # Kingpin, drive and trailer axles: dashed line, wheels under the floor, weight
+    if geom is not None:
+        geom.update(ox=ox, s=s, top_y=top_y, floor_y=floor_y)
+    aw = plan.axle_weights if plan else {}
+    wheel_y, wheel_r = floor_y + 22 * u, 6.5 * u
+    for depth, label, color, kind in axle_marks(plan):
         xx = ox + depth * s
+        if kind == "kingpin":
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(color)))
+            painter.drawPolygon(QPolygonF([QPointF(xx, floor_y + 2 * u), QPointF(xx - 4 * u, floor_y + 9 * u),
+                                           QPointF(xx + 4 * u, floor_y + 9 * u)]))
+            continue
         painter.setPen(QPen(QColor(color), 1.0 * u, Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(xx, top_y), QPointF(xx, floor_y))
-        painter.setFont(QFont("Arial", 6))
-        painter.setPen(QColor(color))
-        painter.drawText(QRectF(xx + 2 * u, top_y + 1 * u, 80 * u, 10 * u),
-                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, label)
+        spread = RIG["tandem_spread_in"] if kind == "tandem" else 52   # tractor tandem ≈ 52"
+        painter.setPen(QPen(QColor("#222"), 1.0 * u))
+        painter.setBrush(QBrush(QColor(color)))
+        for dx in (-spread / 2, spread / 2):
+            painter.drawEllipse(QPointF(xx + dx * s, wheel_y), wheel_r, wheel_r)
+        weight = aw.get("drive" if kind == "drive" else "trailer")
+        over = weight is not None and weight > TRAILER["drive_limit" if kind == "drive" else "trailer_limit"]
+        painter.setFont(QFont("Arial", 6, QFont.Weight.Bold if over else QFont.Weight.Normal))
+        painter.setPen(QColor("#c0392b" if over else color))
+        painter.drawText(QRectF(xx + 2 * u, top_y + 1 * u, 90 * u, 20 * u),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                         label + (f"\n{weight:,} lb" if weight is not None else ""))
+    if aw:
+        over = aw["steer"] > TRAILER["steer_limit"]
+        painter.setFont(QFont("Arial", 6, QFont.Weight.Bold if over else QFont.Weight.Normal))
+        painter.setPen(QColor("#c0392b" if over else "#2a7d6e"))
+        painter.drawText(QRectF(rect.x(), wheel_y - 12 * u, ML - 2 * u, 24 * u),
+                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                         f"◀ Steer\n{aw['steer']:,}")
 
     if not plan or not plan.slots:
         return
@@ -1620,7 +1814,7 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
                          f"Securement: {sec}")
     painter.setPen(QColor("#555"))
     note = (f"Load strictly R1 to R{n_rows} in order.  "
-            "Weigh loaded trailer on a certified scale and adjust tandem slide as needed before transport.")
+            "Weights are estimates — weigh on a certified scale before transport.")
     painter.drawText(QRectF(M, tail_y + 40, PW - 2 * M, 34),
                      Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap, note)
 
@@ -1631,10 +1825,14 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
                   f"Steer: {aw.get('steer', 0):,} lb  |  "
                   f"Drive: {aw.get('drive', 0):,} lb  |  "
                   f"Trailer: {aw.get('trailer', 0):,} lb  |  "
-                  f"Freight Gross: {aw.get('freight_gross', 0):,} lb")
+                  f"Gross: {aw.get('gross', 0):,} lb  (freight {aw.get('freight_gross', 0):,})")
         painter.setPen(TEAL_DARK)
         painter.drawText(QRectF(M, PH - M - 16, PW - 2 * M, 16),
                          Qt.AlignmentFlag.AlignHCenter, aw_str)
+        if plan.rig:
+            painter.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+            painter.drawText(QRectF(M, PH - M - 34, PW - 2 * M, 16),
+                             Qt.AlignmentFlag.AlignHCenter, f"Set {rig_text(plan.rig)}")
 
 
 def _draw_side_elevation(painter: QPainter, PW: int, PH: int,
@@ -2237,14 +2435,65 @@ class TrailerView(QWidget):
 
 # ── Side Elevation View widget ────────────────────────────────────────────────
 class SideElevationView(QWidget):
-    """Live to-scale side elevation, nose at left, viewed from the left wall."""
+    """
+    Live to-scale side elevation, nose at left, viewed from the left wall.
+    Drag the drive or trailer axles to slide the fifth wheel / tandem; they
+    snap to the notches and holes in RIG and emit rig_moved while dragging.
+    """
+    rig_moved = pyqtSignal(dict)   # {"fw_in", "tandem_in"}
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.plan: Optional[LoadPlan] = None
         self.securement: list = []
+        self._geom = {}
+        self._drag = None          # "drive" / "tandem" while an axle is being dragged
+        self.setMouseTracking(True)
         self.setMinimumSize(320, 200)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def _axle_at(self, pos) -> Optional[str]:
+        g = self._geom
+        if not g or not self.plan or not self.plan.slots:
+            return None
+        if not g["top_y"] <= pos.y() <= g["floor_y"] + 32:
+            return None
+        for depth, _label, _color, kind in axle_marks(self.plan):
+            if kind != "kingpin" and abs(pos.x() - (g["ox"] + depth * g["s"])) <= 8:
+                return kind
+        return None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag = self._axle_at(event.position())
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        if self._drag:
+            inches = (pos.x() - self._geom["ox"]) / self._geom["s"] - RIG["kingpin_in"]
+            fw_opts, holes = rig_positions(legal_only=False)
+            rig = dict(self.plan.rig)
+            if self._drag == "drive":
+                rig["fw_in"] = min(fw_opts, key=lambda f: abs(f - inches))
+            else:
+                rig["tandem_in"] = min(holes, key=lambda t: abs(t - inches))
+            if rig != self.plan.rig:
+                self.rig_moved.emit(rig)
+            QToolTip.showText(event.globalPosition().toPoint(), rig_text(rig), self)
+            return
+        kind = self._axle_at(pos)
+        self.setCursor(Qt.CursorShape.SizeHorCursor if kind else Qt.CursorShape.ArrowCursor)
+        if kind:
+            QToolTip.showText(event.globalPosition().toPoint(),
+                              "Drag to slide the " + ("fifth wheel" if kind == "drive" else "trailer tandem"),
+                              self)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag = None
+        super().mouseReleaseEvent(event)
 
     def set_plan(self, plan: Optional[LoadPlan]):
         self.plan = plan
@@ -2258,7 +2507,7 @@ class SideElevationView(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         _draw_side_plan(painter, QRectF(self.rect()).adjusted(8, 8, -8, -8),
-                        self.plan, self.securement)
+                        self.plan, self.securement, geom=self._geom)
         if not self.plan or not self.plan.slots:
             painter.setPen(QColor("#555"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
@@ -2339,8 +2588,15 @@ def _refresh_plan_metrics(plan: LoadPlan):
     """Recompute length, axle weights and violations from where crates actually sit."""
     boxes = _crate_boxes(plan)
     plan.total_length_used_in = max((b[1] + b[4] for b in boxes if b[7] == 0), default=0.0)
-    plan.axle_weights, violations = _calc_axle_weights(plan.slots, plan.override)
-    plan.stop_axles = _stop_axles(plan.slots)
+    if plan.rig_auto or not plan.rig:
+        loads = [(t, m) for _s, t, m in _freight_loads(plan.slots)]
+        plan.rig = auto_rig(loads) if loads[0][0] else default_rig()
+    plan.axle_weights, violations = _calc_axle_weights(plan.slots, plan.override, plan.rig)
+    if not _rear_axle_ok(plan.rig["tandem_in"]):
+        rear, lim = plan.rig["tandem_in"] + RIG["tandem_spread_in"] / 2, RIG["kpra_max_in"]
+        violations.append(f"KINGPIN TO REAR AXLE {int(rear // 12)}'{rear % 12:.0f}\" > "
+                          f"{int(lim // 12)}'{lim % 12:.0f}\" limit — slide the tandem forward")
+    plan.stop_axles = _stop_axles(plan.slots, plan.rig)
     for delivered, steer, drive, trailer in plan.stop_axles:
         for name, val, lim in (("STEER", steer, "steer_limit"), ("DRIVE", drive, "drive_limit"),
                                ("TRAILER TANDEM", trailer, "trailer_limit")):
@@ -2902,8 +3158,9 @@ class Trailer3DView(QWidget):
             painter.drawPolygon(nose)
 
         # Axle reference lines on the floor
-        for depth, label, color in [(36, "Drive Axles", "#e67e00"),
-                                    (TRAILER["tandem_from_nose_in"], "Trailer Axles", "#c0392b")]:
+        for depth, label, color, kind in axle_marks(self.plan):
+            if kind == "kingpin":
+                continue
             seg = self._poly([(depth, 0, 0.2), (depth, W, 0.2)], cd)
             if seg:
                 painter.setPen(QPen(QColor(color), 1.5, Qt.PenStyle.DashLine))
@@ -3886,6 +4143,111 @@ class FreightPopout(QDialog):
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
+# ── Truck & Trailer settings ─────────────────────────────────────────────────
+RIG_FIELDS = [   # (key, label, unit, max, step, tooltip)
+    ("steer_tare", "Tractor steer axle, empty", "lb", 20000, 100,
+     "Steer axle weight of the tractor alone (bobtail scale ticket)"),
+    ("drive_tare", "Tractor drive axles, empty", "lb", 30000, 100,
+     "Drive tandem weight of the tractor alone"),
+    ("wheelbase_in", "Tractor wheelbase", "in", 400, 1,
+     "Steer axle to the centre of the drive tandem"),
+    ("fw_min_in", "5th wheel slide: most rearward", "in", 60, 1,
+     "Fifth wheel position ahead of the drive tandem centre"),
+    ("fw_max_in", "5th wheel slide: most forward", "in", 60, 1, ""),
+    ("fw_step_in", "5th wheel notch spacing", "in", 12, 1, ""),
+    ("fw_home_in", "5th wheel usual position", "in", 60, 1,
+     "Where the planner leaves it unless moving it keeps an axle legal"),
+    ("trailer_tare", "Trailer empty weight", "lb", 30000, 100, ""),
+    ("slider_tare", "  of which sliding tandem assembly", "lb", 10000, 100,
+     "Axles, wheels, brakes and slider box — this weight moves with the tandem"),
+    ("trailer_cg_in", "Empty trailer body balance point", "in", 636, 1,
+     "Centre of gravity of the empty body (without the slider), measured from the nose"),
+    ("kingpin_in", "Kingpin behind the nose", "in", 120, 1, ""),
+    ("tandem_min_in", "Tandem slide: most forward", "in", 636, 1,
+     "Trailer tandem centre behind the kingpin"),
+    ("tandem_max_in", "Tandem slide: most rearward", "in", 636, 1, ""),
+    ("tandem_step_in", "Tandem hole spacing", "in", 24, 1, ""),
+    ("tandem_spread_in", "Trailer axle spread", "in", 120, 1, "Front trailer axle to rear trailer axle"),
+    ("kpra_max_in", "Kingpin to rear axle limit", "in", 720, 1,
+     "Legal maximum, kingpin to the centre of the rear trailer axle: 480\" (40') in "
+     "California, 492\" (41') in many states. 0 = no limit."),
+]
+
+
+def load_rig_settings():
+    """Truck & Trailer settings saved by the dialog (RIG_DEFAULTS if none)."""
+    try:
+        saved = json.loads(QSettings("FreightLoader", "FreightLoader").value("rig", "") or "{}")
+    except ValueError:
+        saved = {}
+    RIG.clear()
+    RIG.update(RIG_DEFAULTS)
+    RIG.update({k: v for k, v in saved.items() if k in RIG_DEFAULTS})
+
+
+class RigDialog(QDialog):
+    """Edit the tractor / trailer weights, dimensions and slide ranges in RIG."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Truck & Trailer")
+        form = QFormLayout(self)
+        intro = QLabel("Empty weights and slide ranges used for axle weights. Defaults are "
+                       "typical for a sleeper tractor and a 53' dry van — enter your own scale "
+                       "tickets and measurements for better estimates.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#555;")
+        form.addRow(intro)
+        self._spins = {}
+        for key, label, unit, top, step, tip in RIG_FIELDS:
+            spin = QSpinBox()
+            spin.setRange(0, top)
+            spin.setSingleStep(step)
+            spin.setSuffix(f" {unit}")
+            spin.setGroupSeparatorShown(True)
+            spin.setValue(int(RIG[key]))
+            spin.setToolTip(tip)
+            self._spins[key] = spin
+            form.addRow(label + ":", spin)
+        self._lbl_payload = QLabel()
+        form.addRow("Legal payload at gross limit:", self._lbl_payload)
+        for key in ("steer_tare", "drive_tare", "trailer_tare"):
+            self._spins[key].valueChanged.connect(self._update_payload)
+        self._update_payload()
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel |
+                                QDialogButtonBox.StandardButton.RestoreDefaults)
+        btns.accepted.connect(self._accept)
+        btns.rejected.connect(self.reject)
+        btns.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(
+            lambda: [self._spins[k].setValue(RIG_DEFAULTS[k]) for k in self._spins])
+        form.addRow(btns)
+
+    def _update_payload(self):
+        tare = sum(self._spins[k].value() for k in ("steer_tare", "drive_tare", "trailer_tare"))
+        self._lbl_payload.setText(f"{TRAILER['gross_limit'] - tare:,} lb  (empty rig {tare:,} lb)")
+
+    def _accept(self):
+        v = {k: sp.value() for k, sp in self._spins.items()}
+        problems = []
+        if v["fw_min_in"] > v["fw_max_in"] or v["tandem_min_in"] > v["tandem_max_in"]:
+            problems.append("A slide range's first value is past its second.")
+        if not v["fw_step_in"] or not v["tandem_step_in"]:
+            problems.append("Notch and hole spacing must be at least 1\".")
+        if v["slider_tare"] > v["trailer_tare"]:
+            problems.append("The sliding tandem can't weigh more than the whole trailer.")
+        if v["fw_max_in"] >= v["wheelbase_in"]:
+            problems.append("The fifth wheel must sit behind the steer axle.")
+        if not v["tandem_min_in"]:
+            problems.append("The trailer tandem must sit behind the kingpin.")
+        if problems:
+            QMessageBox.warning(self, "Truck & Trailer", "\n".join(problems))
+            return
+        RIG.update(v)
+        QSettings("FreightLoader", "FreightLoader").setValue("rig", json.dumps(RIG))
+        self.accept()
+
+
 class FreightLoaderApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3911,6 +4273,7 @@ class FreightLoaderApp(QMainWindow):
         self._current_file: Optional[str] = None
         self._popout: Optional[FreightPopout] = None
         self._build_ui()
+        self._sync_rig_controls(None)
 
     def _build_ui(self):
         central = QWidget()
@@ -4024,6 +4387,7 @@ class FreightLoaderApp(QMainWindow):
             ("steer",   "Steer",   12000),
             ("drive",   "Drive",   34000),
             ("trailer", "Trailer", 34000),
+            ("gross",   "Gross",   80000),
         ]:
             vb = QVBoxLayout()
             vb.addWidget(QLabel(label, alignment=Qt.AlignmentFlag.AlignCenter))
@@ -4115,6 +4479,37 @@ class FreightLoaderApp(QMainWindow):
         truck_row.addStretch()
         rl.addLayout(truck_row)
 
+        rig_row = QHBoxLayout()
+        rig_row.addWidget(QLabel("<b>Axles:</b>"))
+        self.spin_fw = QSpinBox()
+        self.spin_fw.setSuffix("\"")
+        self.spin_fw.setToolTip("Fifth wheel position ahead of the drive tandem centre — "
+                                "forward puts more weight on the steer axle")
+        self.spin_tandem = QSpinBox()
+        self.spin_tandem.setSuffix("\"")
+        self.spin_tandem.setToolTip("Trailer tandem centre behind the kingpin — "
+                                    "back puts more weight on the drive axles")
+        for text, spin in (("5th wheel", self.spin_fw), ("Tandem", self.spin_tandem)):
+            lbl = QLabel(text)
+            lbl.setToolTip(spin.toolTip())
+            rig_row.addWidget(lbl)
+            rig_row.addWidget(spin)
+        self.spin_fw.valueChanged.connect(self._rig_spin_changed)
+        self.spin_tandem.valueChanged.connect(self._rig_spin_changed)
+        self.btn_rig_auto = QPushButton("Auto")
+        self.btn_rig_auto.setToolTip("Let the planner place the fifth wheel and tandem for this truck")
+        self.btn_rig_auto.clicked.connect(lambda: self._set_rig(None))
+        rig_row.addWidget(self.btn_rig_auto)
+        self.lbl_rig = QLabel()
+        self.lbl_rig.setStyleSheet("color:#555;")
+        rig_row.addWidget(self.lbl_rig)
+        rig_row.addStretch()
+        btn_rig = QPushButton("Truck && Trailer…")
+        btn_rig.setToolTip("Empty weights, wheelbase, slide ranges and the kingpin-to-rear-axle limit")
+        btn_rig.clicked.connect(self._edit_rig)
+        rig_row.addWidget(btn_rig)
+        rl.addLayout(rig_row)
+
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
 
@@ -4129,7 +4524,9 @@ class FreightLoaderApp(QMainWindow):
 
         # Tab 2 — Side elevation (zoomable)
         self.side_view = SideElevationView()
-        tabs.addTab(self._zoom_tab(self.side_view), "Side View")
+        self.side_view.rig_moved.connect(self._set_rig)
+        tabs.addTab(self._zoom_tab(self.side_view, hint_prefix="Drag axles: slide  ·  "),
+                    "Side View")
 
         # Tab 3 — Rotatable 3D view
         view3d_tab = QWidget()
@@ -4254,9 +4651,7 @@ class FreightLoaderApp(QMainWindow):
                         self._manual[sl.piece.piece_id] = (sl.x_in, sl.y_in)
                     else:
                         self._manual.pop(sl.piece.piece_id, None)
-            self._update_summary(self._plan)
-            self.side_view.update()
-            self.view_3d.update()
+            self._show_plan_change()
             self._on_securement_changed()   # moved crates can open or close gaps
 
     def _reset_moves(self):
@@ -4284,6 +4679,65 @@ class FreightLoaderApp(QMainWindow):
             plan.notices.append(f"Crates you moved on Truck {truck_no} were put back — "
                                 "the load changed and they no longer fit where you placed them.")
         _refresh_plan_metrics(plan)
+
+    # ── Fifth wheel / tandem positions ───────────────────────────────────────
+    def _sync_rig_controls(self, plan: Optional[LoadPlan]):
+        """Show `plan`'s positions in the Axles row without triggering a change."""
+        fw_opts, holes = rig_positions(legal_only=False)
+        rig = plan.rig if plan and plan.rig else default_rig()
+        for spin, opts, val in ((self.spin_fw, fw_opts, rig["fw_in"]),
+                                (self.spin_tandem, holes, rig["tandem_in"])):
+            spin.blockSignals(True)
+            spin.setRange(int(min(opts)), int(max(opts)))
+            spin.setSingleStep(int(opts[1] - opts[0]) if len(opts) > 1 else 1)
+            spin.setValue(int(val))
+            spin.blockSignals(False)
+            spin.setEnabled(plan is not None)
+        auto = plan is None or plan.rig_auto
+        self.btn_rig_auto.setEnabled(not auto)
+        rear = rig["tandem_in"] + RIG["tandem_spread_in"] / 2
+        bad = not _rear_axle_ok(rig["tandem_in"])
+        self.lbl_rig.setText(
+            f"<span style='color:{'#c0392b' if bad else '#555'}'>KP→rear axle {int(rear // 12)}'"
+            f"{rear % 12:.0f}\"</span>  ·  " + ("auto" if auto else "<b>set by you</b>"))
+        self.lbl_rig.setToolTip(rig_text(rig))
+
+    def _rig_spin_changed(self):
+        fw_opts, holes = rig_positions(legal_only=False)
+        self._set_rig({"fw_in": min(fw_opts, key=lambda f: abs(f - self.spin_fw.value())),
+                       "tandem_in": min(holes, key=lambda t: abs(t - self.spin_tandem.value()))})
+
+    def _set_rig(self, rig: Optional[dict]):
+        """Fix this truck's fifth wheel / tandem at `rig`, or None to let the planner place them."""
+        if not self._plan or not self._trucks:
+            return
+        truck = self._trucks[self._cur_truck]
+        if rig is None:
+            truck.pop("rig", None)
+        else:
+            truck["rig"] = dict(rig)
+            self._plan.rig = dict(rig)
+        self._plan.rig_auto = rig is None
+        _refresh_plan_metrics(self._plan)
+        self._show_plan_change()
+
+    def _show_plan_change(self):
+        """Redraw after the current plan's metrics changed (axles moved, crates dragged)."""
+        self._sync_rig_controls(self._plan)
+        self._update_summary(self._plan)
+        self.trailer_view.update()
+        self.side_view.update()
+        self.view_3d.update()
+
+    def _edit_rig(self):
+        if RigDialog(self).exec() != QDialog.DialogCode.Accepted:
+            return
+        for t in self._trucks:
+            t.pop("rig", None)    # old positions may not exist on the new slide ranges
+        if self.table.rowCount():
+            self._calculate(silent=True)
+        else:
+            self._sync_rig_controls(None)
 
     def _open_popout(self):
         pieces = self._read_pieces()
@@ -4511,6 +4965,7 @@ class FreightLoaderApp(QMainWindow):
         TRAILER["steer_limit"]   = self._limit_fields["steer"].value()
         TRAILER["drive_limit"]   = self._limit_fields["drive"].value()
         TRAILER["trailer_limit"] = self._limit_fields["trailer"].value()
+        TRAILER["gross_limit"]   = self._limit_fields["gross"].value()
 
         active = [pc for pc in pieces if pc.piece_id not in self._excluded_ids]
         key = {pc.piece_id: pc.stop for pc in active}
@@ -4610,7 +5065,8 @@ class FreightLoaderApp(QMainWindow):
         n = len(self._trucks)
         for i, t in enumerate(self._trucks):
             tp = [by_id[x] for x in t["piece_ids"] if x in by_id]
-            plan = plan_load(tp, override=override, stop_order=self._route({pc.stop for pc in tp}))
+            plan = plan_load(tp, override=override, stop_order=self._route({pc.stop for pc in tp}),
+                             rig=t.get("rig"))
             plan.stop_names = list(self._stop_names)
             plan.truck_label = f"Truck {i + 1} of {n}" if n > 1 else ""
             plan.notices = []
@@ -4663,6 +5119,7 @@ class FreightLoaderApp(QMainWindow):
         self.trailer_view.set_plan(plan)
         self.side_view.set_plan(plan)
         self.view_3d.set_plan(plan)
+        self._sync_rig_controls(plan)
         self._update_summary(plan)
         self._on_securement_changed()
 
@@ -4739,7 +5196,8 @@ class FreightLoaderApp(QMainWindow):
                 "road": self._road, "trucks": self._trucks, "ship_other": self._ship_other,
                 "ship_reasons": {str(k): v for k, v in self._ship_reasons.items()},
                 "split_key": {str(k): v for k, v in (self._split_key or {}).items()},
-                "manual": {str(k): list(v) for k, v in self._manual.items()}}
+                "manual": {str(k): list(v) for k, v in self._manual.items()},
+                "rig_specs": dict(RIG)}
 
     def _update_summary(self, plan: LoadPlan):
         aw = plan.axle_weights
@@ -4761,10 +5219,17 @@ class FreightLoaderApp(QMainWindow):
                           f"<td align='right'><span style='color:{color}'>{val:,} lbs</span></td>"
                           f"<td align='right'>&nbsp;{pct:.0f}% of {limit:,}</td>"
                           f"</tr>")
-        # Freight gross
-        fg = aw.get("freight_gross", 0)
-        rows_html += (f"<tr><td><b>Freight Gross:</b></td>"
-                      f"<td align='right'>{fg:,} lbs</td><td></td></tr>")
+        gross, glim = aw.get("gross", 0), TRAILER["gross_limit"]
+        rows_html += (f"<tr><td><b>Gross:</b></td>"
+                      f"<td align='right'><span style='color:{'#c0392b' if gross > glim else '#27ae60'}'>"
+                      f"{gross:,} lbs</span></td>"
+                      f"<td align='right'>&nbsp;{gross / glim * 100 if glim else 0:.0f}% of {glim:,}</td></tr>")
+        rows_html += (f"<tr><td><b>Freight:</b></td>"
+                      f"<td align='right'>{aw.get('freight_gross', 0):,} lbs</td>"
+                      f"<td align='right' style='color:#555'>&nbsp;empty rig {rig_tare():,.0f}</td></tr>")
+        if plan.rig and aw:
+            rows_html += (f"<tr><td colspan='3' style='color:#555'>"
+                          f"{rig_text(plan.rig)}{'' if plan.rig_auto else ' (set by you)'}</td></tr>")
 
         # Side weights: split the cargo by its lateral centre of gravity
         W_in = TRAILER["interior_width_in"]
@@ -4885,7 +5350,8 @@ class FreightLoaderApp(QMainWindow):
         self.cmb_truck.clear()
         self.btn_other.setText("Ship Separately (0)")
         self._refresh_stop_label()
-        for key, default in [("steer", 12000), ("drive", 34000), ("trailer", 34000)]:
+        for key, default in [("steer", 12000), ("drive", 34000), ("trailer", 34000),
+                             ("gross", 80000)]:
             self._limit_fields[key].setValue(default)
         self.chk_override.setChecked(False)
         self.lbl_summary.setText("—")
@@ -4893,6 +5359,8 @@ class FreightLoaderApp(QMainWindow):
         self.trailer_view.set_plan(None)
         self.side_view.set_plan(None)
         self.view_3d.set_plan(None)
+        load_rig_settings()          # an opened plan may have brought its own truck specs
+        self._sync_rig_controls(None)
         self.btn_plan_pdf.setEnabled(False)
         self.btn_label_pdf.setEnabled(False)
         self._set_title()
@@ -4925,13 +5393,18 @@ class FreightLoaderApp(QMainWindow):
         self._ship_other = list(shipment.get("ship_other", []))
         self._ship_reasons = {int(k): v for k, v in shipment.get("ship_reasons", {}).items()}
         self._manual = {int(k): tuple(v) for k, v in shipment.get("manual", {}).items()}
+        specs = shipment.get("rig_specs")
+        if specs:
+            RIG.update({k: v for k, v in specs.items() if k in RIG_DEFAULTS})
+        else:
+            load_rig_settings()
         sk = shipment.get("split_key")
         self._split_key = {int(k): v for k, v in sk.items()} if sk else None
         self._cur_truck = 0
         self._refresh_stop_label()
 
         # Populate axle limits
-        for key in ("steer", "drive", "trailer"):
+        for key in ("steer", "drive", "trailer", "gross"):
             if key in limits:
                 self._limit_fields[key].setValue(limits[key])
         self.chk_override.setChecked(override)
@@ -4969,7 +5442,7 @@ class FreightLoaderApp(QMainWindow):
         if not pieces and self.table.rowCount() > 0:
             return   # parse error already shown by _read_pieces
         info = self._get_shipment_info()
-        limits = {k: self._limit_fields[k].value() for k in ("steer", "drive", "trailer")}
+        limits = {k: self._limit_fields[k].value() for k in ("steer", "drive", "trailer", "gross")}
         try:
             save_plan_json(pieces, info, limits, self._excluded_ids,
                            self.chk_override.isChecked(), path, self._securement,
@@ -5070,6 +5543,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     ensure_folders()
+    load_rig_settings()
     win = FreightLoaderApp()
     win.show()
     sys.exit(app.exec())
