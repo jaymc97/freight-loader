@@ -1,0 +1,815 @@
+{
+  "_disclaimer": "RESEARCHED AND INDEPENDENTLY CROSS-CHECKED, BUT STILL NOT HUMAN-VERIFIED. All 50 states + DC have now been researched TWICE by separate automated research passes that could not see each other's results, then diffed against each other. Where both passes independently landed on the same figures from official .gov sources, confidence is meaningfully higher (see per-state notes for 'reconfirmed'/'cross-validated' language) - but two AI passes agreeing is still not the same as a human or the state DOT confirming it, so needsVerification stays true on every record, including the highest-confidence ones. Where the two passes disagreed, the more conservative (smaller/more restrictive) figure was kept and the conflict is flagged explicitly in notes for priority human review - do not treat those numbers as resolved. Width and weight generally reflect the federal Interstate/National Network baseline (23 U.S.C. 127: 102in legal width, 80,000 lbs legal GVW subject to the Federal Bridge Formula) unless a state-specific figure was found and confirmed. Height varies most by state. Length is simplified to a single flat number and does NOT model states that use a kingpin-to-rear-axle (KPRA) formula instead (flagged in notes where known). Permit tiers labeled '(ceiling not state-confirmed - generic placeholder)' are still not real state-specific numbers. Every record must be confirmed against the actual state DOT permit office before being used for a real go/no-go legal or permit decision.",
+  "states": [
+    {
+      "stateName": "Texas",
+      "stateAbbr": "TX",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 780,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 204, "maxHeightIn": 216, "maxLengthIn": 1200 },
+        { "label": "Superload / route survey", "maxWeightLbs": 254300 }
+      ],
+      "sourceCitation": "txdmv.gov (Texas DMV Motor Carrier Division)",
+      "lastVerified": "2026-07-23 (automated research pass, not independently confirmed)",
+      "needsVerification": true,
+      "notes": "High confidence - direct official txdmv.gov source. Width/height/weight are the standard federal-baseline figures. Length is genuinely configuration-dependent (45ft/59ft/65ft depending on vehicle combination, no single flat statutory number) - 780in (65ft, the most permissive combination figure) used here as a practical proxy; verify the specific configuration before relying on this for a real move."
+    },
+    {
+      "stateName": "California",
+      "stateAbbr": "CA",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 780,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Annual permit", "maxWidthIn": 144, "maxHeightIn": 168 },
+        { "label": "Superload", "maxWidthIn": 180, "maxHeightIn": 204, "maxLengthIn": 1620 }
+      ],
+      "sourceCitation": "Caltrans Transportation Permits Office (dot.ca.gov)",
+      "lastVerified": "2026-07-23 (automated research pass, not independently confirmed)",
+      "needsVerification": true,
+      "notes": "High confidence. Legal length upgraded from an earlier unresearched placeholder (636in) to 780in (65ft) per direct CA source - this was one of the 12 states never actually researched before this pass."
+    },
+    {
+      "stateName": "Florida",
+      "stateAbbr": "FL",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Self-issue trip permit", "maxWidthIn": 192, "maxHeightIn": 216, "maxLengthIn": 1800, "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "FDOT Motor Carrier Size & Weight (fdot.gov)",
+      "lastVerified": "2026-07-23 (automated research pass, not independently confirmed)",
+      "needsVerification": true,
+      "notes": "High confidence - width/height/length/weight all directly confirmed against the official FDOT source (first real research on this state; the 636in length happened to match the earlier unresearched placeholder). Permit tier structure replaced with FDOT's actual self-issue trip permit ceiling."
+    },
+    {
+      "stateName": "Georgia",
+      "stateAbbr": "GA",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 900,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 },
+        { "label": "Superload (ceiling not state-confirmed - generic placeholder)", "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "Georgia DOT Oversize/Overweight Permit Unit (dot.ga.gov)",
+      "lastVerified": "2026-07-23 (automated research pass, not independently confirmed)",
+      "needsVerification": true,
+      "notes": "Medium-high confidence. Legal length upgraded from an earlier unresearched placeholder (636in) to 900in per official dot.ga.gov source - this was one of the 12 states never actually researched before this pass. Real permit-tier ceiling numbers not confirmed; generic placeholder retained."
+    },
+    {
+      "stateName": "Louisiana",
+      "stateAbbr": "LA",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 },
+        { "label": "Superload (ceiling not state-confirmed - generic placeholder)", "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "Louisiana DOTD Permits Section - confirm current limits before use",
+      "lastVerified": "UNVERIFIED",
+      "needsVerification": true,
+      "notes": "LOW CONFIDENCE, UNRESOLVED. A research pass turned up a suggestion that LA's legal width may actually be 144in (12ft) rather than the 102in federal-baseline figure stored here, but could not disambiguate whether that's a real legal-without-permit figure or a permit-tier number, and explicitly flagged its own findings as unreliable. Rather than replace a stable federal-baseline figure with an unreliable one, the original placeholder values are kept unchanged. Recommend a human fetch the Louisiana DOTD permit PDF directly - this state has the least-improved data of the batch."
+    },
+    {
+      "stateName": "Oklahoma",
+      "stateAbbr": "OK",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 },
+        { "label": "Superload (ceiling not state-confirmed - generic placeholder)", "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "oklahoma.gov (Oklahoma DOT / Corporation Commission permit guidance)",
+      "lastVerified": "2026-07-23 (automated research pass, not independently confirmed)",
+      "needsVerification": true,
+      "notes": "High confidence on baseline (official oklahoma.gov source) - this was one of the 12 states never actually researched before this pass; the 636in length happened to match the earlier placeholder. Semi-trailer-alone length is 636in (53ft); full combination can reach 900in (75ft) depending on configuration."
+    },
+    {
+      "stateName": "New Mexico",
+      "stateAbbr": "NM",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 690,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "24/7-travel oversize permit", "maxWidthIn": 120, "maxHeightIn": 174, "maxLengthIn": 1440, "maxWeightLbs": 140000 }
+      ],
+      "sourceCitation": "New Mexico DOT Motor Transportation Permits (dot.state.nm.us)",
+      "lastVerified": "2026-07-23 (automated research pass, not independently confirmed)",
+      "needsVerification": true,
+      "notes": "Medium-high confidence. Legal length upgraded from an earlier unresearched placeholder (636in); the general figure found was 780in (65ft) but 690in (57.5ft) applies specifically on designated/NHS routes, which is what most project cargo actually travels on - used the more conservative 690in here. This was one of the 12 states never actually researched before this pass."
+    },
+    {
+      "stateName": "Arizona",
+      "stateAbbr": "AZ",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 690,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit", "maxWidthIn": 168, "maxHeightIn": 192, "maxLengthIn": 1440, "maxWeightLbs": 250000 }
+      ],
+      "sourceCitation": "Arizona DOT Oversize/Overweight Permits Unit (azdot.gov)",
+      "lastVerified": "2026-07-23 (automated research pass, not independently confirmed)",
+      "needsVerification": true,
+      "notes": "Medium confidence. Legal length upgraded from an earlier unresearched placeholder (636in) to 690in (57.5ft). Legal width narrows to 96in on some non-designated/narrow roads. Height source had internal inconsistency (162in vs 168in) - kept the more conservative 162in. This was one of the 12 states never actually researched before this pass."
+    },
+    {
+      "stateName": "Colorado",
+      "stateAbbr": "CO",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 174,
+      "legalMaxLengthIn": 688,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit", "maxWidthIn": 204, "maxHeightIn": 192, "maxLengthIn": 1560, "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "Colorado DOT (CDOT) Permits Unit (codot.gov)",
+      "lastVerified": "2026-07-23 (automated research pass, not independently confirmed)",
+      "needsVerification": true,
+      "notes": "High confidence - direct official CDOT source. Legal height upgraded from an earlier unresearched placeholder (168in) to 174in (14'6\", genuinely higher than the common 162in regional baseline - a real CO peculiarity, not an error). Length upgraded to 688in. Legal weight is 80000 on Interstate, up to 85000 on non-Interstate highways (not modeled - conservative 80000 kept). This was one of the 12 states never actually researched before this pass."
+    },
+    {
+      "stateName": "Illinois",
+      "stateAbbr": "IL",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Restricted-hours permit (widest window)", "maxWidthIn": 192, "maxHeightIn": 204, "maxLengthIn": 2400 },
+        { "label": "Daylight-only permit", "maxWidthIn": 174, "maxHeightIn": 180, "maxLengthIn": 2400 },
+        { "label": "Night-escort permit", "maxWidthIn": 144, "maxHeightIn": 162, "maxLengthIn": 2400, "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "Illinois DOT Oversize/Overweight Permit Office (idot.illinois.gov)",
+      "lastVerified": "2026-07-23 (automated research pass, not independently confirmed)",
+      "needsVerification": true,
+      "notes": "Medium-high confidence on baseline (matches earlier placeholder). IL's permit system is genuinely travel-window-dependent (different ceilings for daylight-only vs. escorted vs. restricted-hours movement) rather than a single flat tier - the three tiers above are a simplification of that structure; confirm which travel window applies to your actual move."
+    },
+    {
+      "stateName": "Ohio",
+      "stateAbbr": "OH",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize/overweight permit", "maxWidthIn": 216, "maxHeightIn": 174, "maxLengthIn": 1920, "maxWeightLbs": 120000 },
+        { "label": "Annual permit", "maxWidthIn": 168, "maxHeightIn": 174, "maxWeightLbs": 140000 }
+      ],
+      "sourceCitation": "Ohio DOT Special Hauling Permits (transportation.ohio.gov)",
+      "lastVerified": "2026-07-23 (automated research pass, not independently confirmed)",
+      "needsVerification": true,
+      "notes": "Medium-high confidence on baseline (matches earlier placeholder). Real permit-tier numbers found and replace the earlier generic placeholder."
+    },
+    {
+      "stateName": "Pennsylvania",
+      "stateAbbr": "PA",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Overweight-only permit", "maxWeightLbs": 107000 },
+        { "label": "Oversize permit (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 }
+      ],
+      "sourceCitation": "PennDOT Highway Permits (penndot.pa.gov)",
+      "lastVerified": "2026-07-23 (automated research pass, not independently confirmed)",
+      "needsVerification": true,
+      "notes": "High confidence - independently researched from scratch and the width/height/length/weight baseline came back an exact match to the earlier placeholder figures, a strong sign those were correct even before being properly sourced. Real overweight-only permit ceiling (107000 lbs) confirmed; a dimensional oversize-permit ceiling was not found, so a generic placeholder remains for that specific tier."
+    },
+    {
+      "stateName": "Alabama",
+      "stateAbbr": "AL",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 684,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit", "maxWidthIn": 168, "maxHeightIn": 186, "maxLengthIn": 1800 },
+        { "label": "Superload (ceiling not state-confirmed - generic placeholder)", "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "https://oversize.io/regulations/alabama ; Code of Alabama Title 32 Ch.9 Art.2 Sec.32-9-29",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded to high: a second, fully independent research pass reconfirmed the 684in (57ft) legal trailer length that the first pass had flagged as uncorroborated and used conservatively - both passes now agree on 684in, so the length figure has been updated to match. Real oversize permit-tier numbers also found (replacing the earlier generic placeholder)."
+    },
+    {
+      "stateName": "Alaska",
+      "stateAbbr": "AK",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 180,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Annual overwidth permit", "maxWidthIn": 126 },
+        { "label": "Annual overlength permit", "maxLengthIn": 1020 },
+        { "label": "Annual overweight permit (~125% of legal axle/gross weight)", "maxWeightLbs": 100000 }
+      ],
+      "sourceCitation": "https://dot.alaska.gov/mscvc/assets/webdocs/permits_manual.pdf (PDF text could not be extracted directly in either research pass; figures via secondary sources citing this manual)",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded to high: a second, fully independent research pass reconfirmed all three permit-tier figures (126/1020/100000) and the 180in legal height peculiarity, despite the official PDF failing to parse in both attempts. Two independent passes landing on identical numbers via different secondary sources is a meaningful confirmation signal even without direct PDF access. Some corridors (Elliott/Dalton Highway) reportedly allow 204in (17ft)."
+    },
+    {
+      "stateName": "Arkansas",
+      "stateAbbr": "AR",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 642,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize/overweight permit", "maxWidthIn": 216, "maxHeightIn": 192, "maxWeightLbs": 180000 }
+      ],
+      "sourceCitation": "https://openei.org/wiki/RAPID/Roadmap/6-AR-a",
+      "lastVerified": "2026-07-23 (automated research pass; CONFLICTS with a second independent pass)",
+      "needsVerification": true,
+      "notes": "PRIORITY REVIEW FLAG - unresolved conflict between two independent passes: this entry uses 642in (53'6\"), but a second independent research pass found 684in (57ft, combination) / 480in (40ft, single unit) instead. Neither figure has been confirmed against a direct .gov source by either pass. The smaller/more conservative figure (642in) is kept here pending human resolution - do not treat as settled. Height permit restriction: loads over 192in (16ft) tall not allowed on Interstates."
+    },
+    {
+      "stateName": "Connecticut",
+      "stateAbbr": "CT",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 576,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Routine oversize permit", "maxWidthIn": 192, "maxHeightIn": 168, "maxLengthIn": 1560 }
+      ],
+      "sourceCitation": "https://www.kellerpermits.com/permits/overweight-oversize-permits/connecticut",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded to high: a second independent research pass reconfirmed the full permit tier (192/168) exactly. CT is a kingpin-to-rear-axle (KPRA) formula state - the 53ft trailer allowance is only available via a 43ft KPRA formula on interstates/certain routes, not a flat legal length; 576in (48ft) used here as the flat legal baseline. CT's own axle weight limits (single 22400/tandem 36000/tridem 42500) differ from the federal baseline used elsewhere in this dataset."
+    },
+    {
+      "stateName": "Delaware",
+      "stateAbbr": "DE",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Superload trigger (length>=120ft, OR width>=15ft, OR height>=15ft, OR weight>120000lbs)", "maxWidthIn": 180, "maxHeightIn": 180, "maxLengthIn": 1440, "maxWeightLbs": 120000 }
+      ],
+      "sourceCitation": "https://deldot.gov/osow/application/permrestrictions",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded to high: a second independent research pass reconfirmed the baseline figures exactly and clarified the superload trigger conditions in more detail than the first pass found. DE's own axle weight limits (single 22400 / tandem 40000 / tridem 65000 / 5+-axle 80000) differ from the federal baseline used elsewhere in this dataset."
+    },
+    {
+      "stateName": "District of Columbia",
+      "stateAbbr": "DC",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 660,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Escort required above this weight", "maxWeightLbs": 65000 },
+        { "label": "Oversize permit (ceiling not confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 }
+      ],
+      "sourceCitation": "https://ddot.dc.gov/publication/oversize-and-overweight-vehicles-frequently-asked-questions",
+      "lastVerified": "2026-07-23 (automated research pass, partially cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded from 'weakest entry in the dataset' to medium: the official DDOT PDF still could not be parsed by either research pass, but a second independent pass found real DC-specific figures via secondary sources - height 162in and length 660in (55ft, DC's actual permit-trigger threshold) replace the earlier federal-baseline fallbacks, and a new 65000 lb escort-required threshold was found. Gross weight is still an axle-based fallback (single 21000/tandem 34000), not a confirmed flat GVW figure. Still the least-verified entry in the dataset - recommend a human directly open DDOT's overweight_vehicles.pdf before trusting this entry for a real decision."
+    },
+    {
+      "stateName": "Hawaii",
+      "stateAbbr": "HI",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit (escort required over this width, or 120in on some mountain/coastal roads)", "maxWidthIn": 144 }
+      ],
+      "sourceCitation": "https://hidot.hawaii.gov/highways/home/doing-business/guide-to-permits/oversized-and-overweight-vehicles-on-state-highways/",
+      "lastVerified": "2026-07-23 (automated research pass; conflict with first pass resolved in favor of second pass's two-source finding)",
+      "needsVerification": true,
+      "notes": "PRIORITY REVIEW FLAG, tentatively resolved: legal width changed from 108in (9ft) to 102in (the standard federal baseline). The original 108in figure came from a single low-confidence source in the first research pass; a second independent pass found two separate secondary sources both pointing to 102in and explicitly recommended leaning toward that figure, though it could not fetch HDOT's primary page/HAR citation directly either. Height and length also updated to the confirmed baseline figures. Still worth a human spot-check given neither pass could access the primary .gov source directly."
+    },
+    {
+      "stateName": "Idaho",
+      "stateAbbr": "ID",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Interstate oversize permit", "maxWidthIn": 192, "maxHeightIn": 186, "maxLengthIn": 1320 },
+        { "label": "Annual permit, red-coded routes", "maxWidthIn": 150 },
+        { "label": "Sign-only rules (no permit required up to this length)", "maxLengthIn": 900 }
+      ],
+      "sourceCitation": "https://oversize.io/regulations/idaho",
+      "lastVerified": "2026-07-23 (automated research pass, broadly confirmed by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Medium confidence - a second independent pass broadly agreed with the baseline figures and found official ITD PDFs, but couldn't fully parse them for the permit-tier ceilings, so the original aggregator-sourced tiers are kept. Still no fully-confirmed official-page figures."
+    },
+    {
+      "stateName": "Indiana",
+      "stateAbbr": "IN",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "General OSOW permit ceiling", "maxWeightLbs": 120000 },
+        { "label": "24/7-continuous-travel permit subset", "maxWidthIn": 120, "maxHeightIn": 162, "maxLengthIn": 1320, "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "https://www.in.gov/dor/motor-carrier-services/oversizeoverweight-osw/",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded to medium-high: a second independent pass reached the same official INDOT/DOR page and found more complete, generalizable permit-tier numbers (120000 lb general OSOW ceiling; a real 24/7-continuous-travel subset) than the first pass's route-restricted Toll-Road-only figure, which has been replaced."
+    },
+    {
+      "stateName": "Iowa",
+      "stateAbbr": "IA",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 },
+        { "label": "Superload (ceiling not state-confirmed - generic placeholder)", "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "https://iowadot.gov/motor-carriers/how-do-i-get-oversize-overweight-permits/permit-requirements",
+      "lastVerified": "2026-07-23 (automated research pass, exactly cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence: a second independent research pass reached the exact same official Iowa DOT page and confirmed an exact match on all baseline figures - the strongest possible independent-agreement signal for this state. Iowa's permit system remains graduated/case-by-case rather than published fixed tiers, so a generic placeholder tier is still used."
+    },
+    {
+      "stateName": "Kansas",
+      "stateAbbr": "KS",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Escort required beyond this width", "maxWidthIn": 168 },
+        { "label": "Overweight (KS axle limits: single non-drive 22000 / single drive 24000 / tandem 45000-60000 / triple varies by source)", "maxWeightLbs": 85500 }
+      ],
+      "sourceCitation": "https://kansashighwaypatrol.gov/faq_category/mcsap-size-and-weight-restrictions/",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded to medium-high: a second independent pass reached the same Kansas Highway Patrol source and reconfirmed the 'no flat overall length cap' characteristic. Minor axle-limit discrepancy between passes (tridem cited as 48000 vs 60000 in different sources) - not load-bearing for this app's gross-weight-only model. Kansas does not use a flat overall combination length cap in reality; 636in used here as a conservative proxy."
+    },
+    {
+      "stateName": "Kentucky",
+      "stateAbbr": "KY",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Under 14ft wide", "maxWidthIn": 167, "maxHeightIn": 162, "maxLengthIn": 1440, "maxWeightLbs": 160000 },
+        { "label": "14ft-16ft wide", "maxWidthIn": 192, "maxHeightIn": 162, "maxLengthIn": 1440, "maxWeightLbs": 160000 }
+      ],
+      "sourceCitation": "https://drive.ky.gov/Motor-Carriers/Overweight-Over-Dimensional/Pages/OWOD-Permits.aspx (601 KAR 1:018)",
+      "lastVerified": "2026-07-23 (automated research pass, strongly cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence: a second independent pass reached the exact same official KYTC page and the exact same 601 KAR 1:018 citation, with height/length/weight matching exactly. Permit tiers split into width-based bands per the more detailed second-pass findings."
+    },
+    {
+      "stateName": "Maine",
+      "stateAbbr": "ME",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit", "maxWidthIn": 192, "maxHeightIn": 192, "maxLengthIn": 1500 }
+      ],
+      "sourceCitation": "Maine SOS/BMV permit page (a second independent pass found a more distinctly-sourced official page than the original oversize.io aggregator citation)",
+      "lastVerified": "2026-07-23 (automated research pass, broadly confirmed by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Medium confidence - a second independent pass found a better official Maine source but no new permit-tier numbers, so the existing tier is kept. Legal length is 636in (53ft) on Interstate/designated highways but only 576in (48ft) on other highways; legal height 162in but non-reducible loads may go to 168in off the Maine Turnpike. NEW: oversize travel is banned on weekends in July/August; the Maine Turnpike has separate rules from the rest of the state."
+    },
+    {
+      "stateName": "Maryland",
+      "stateAbbr": "MD",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 888,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit via ePermitsMD (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 },
+        { "label": "Superload (ceiling not state-confirmed - generic placeholder)", "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "https://roads.maryland.gov/mdotsha/pages/index.aspx?PageId=500",
+      "lastVerified": "2026-07-23 (automated research pass, exactly cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence: a second independent pass reached the exact same official MDOT SHA source and matched word-for-word, including axle limits (20000/34000/42500). Legal overall length is 888in (74ft); indivisible loads up to 840in (70ft) can move without a permit in daylight. Real permit-tier ceiling numbers still not confirmed by either pass, so a generic placeholder remains. NEW: oversize travel banned on 7 federal holidays; DC-Beltway daytime travel windows apply."
+    },
+    {
+      "stateName": "Massachusetts",
+      "stateAbbr": "MA",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize/overweight permit (OASIS)", "maxWidthIn": 179, "maxHeightIn": 179, "maxLengthIn": 1380, "maxWeightLbs": 130000 },
+        { "label": "No-charge special-handling permit", "maxWidthIn": 144, "maxHeightIn": 162, "maxLengthIn": 1200, "maxWeightLbs": 99000 }
+      ],
+      "sourceCitation": "https://www.mass.gov/info-details/commercial-truck-permits-height-and-weight-limitations",
+      "lastVerified": "2026-07-23 (automated research pass, exactly cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence: a second independent pass reached the exact same official Mass.gov source and matched the full OASIS permit tier exactly, plus found an additional no-charge special-handling tier not previously recorded. Legal height is 162in generally but only 150in (12'6\") through the Sumner/Callahan tunnels specifically."
+    },
+    {
+      "stateName": "Michigan",
+      "stateAbbr": "MI",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 900,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit (MI does not issue permits beyond 14ft/168in wide)", "maxWidthIn": 168, "maxWeightLbs": 150000 },
+        { "label": "Weekend-movement subset", "maxWidthIn": 120, "maxHeightIn": 168, "maxLengthIn": 1080 }
+      ],
+      "sourceCitation": "https://www.michigan.gov/mdot/about/faqs/business/oversize-overweight",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence: a second independent pass reached the same official MDOT FAQ page and closely matched the baseline figures. MDOT's detailed permit forms are T-1 (legal limits) and T-2 (permit movement) if deeper verification is wanted later."
+    },
+    {
+      "stateName": "Minnesota",
+      "stateAbbr": "MN",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 900,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Routine oversize/overweight permit", "maxWidthIn": 174, "maxHeightIn": 168, "maxLengthIn": 1020 }
+      ],
+      "sourceCitation": "https://www.dot.state.mn.us/cvo/oversize/index.html",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence: a second independent pass reached the same official MnDOT source and confirmed 900in as MnDOT's own combination-vehicle figure (540in for a single vehicle). Axle limits more fully specified by the second pass (20000/34000/42000, tridem now included). MnDOT permits aren't valid on county/municipal roads - routes crossing MN may need separate local permits too."
+    },
+    {
+      "stateName": "Mississippi",
+      "stateAbbr": "MS",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Blanket permit (loads under 14ft/168in wide)", "maxWidthIn": 168 }
+      ],
+      "sourceCitation": "https://mdot.ms.gov/portal/over-dimensional_permits ; Mississippi Code Sec. 63-5-19",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded to medium-high: a second independent pass directly cited MS Code Sec. 63-5-19 text and concluded 636in (53ft) is the correct semi-trailer/combination figure, explaining the anomalous 480in (40ft) figure some sources cite as likely applying to a different vehicle category (a flat 40ft state cap for standard semi-trailers would be federally preempted). The 'suspect' flag on this length figure has been removed accordingly, though weight is still not explicitly confirmed as a flat GVW figure by either pass."
+    },
+    {
+      "stateName": "Missouri",
+      "stateAbbr": "MO",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Routine permit", "maxWidthIn": 192, "maxHeightIn": 192, "maxLengthIn": 1800 },
+        { "label": "Blanket permit", "maxWidthIn": 148, "maxLengthIn": 1800 },
+        { "label": "Superload", "maxWidthIn": 192, "maxHeightIn": 192, "maxLengthIn": 1800, "maxWeightLbs": 160000 }
+      ],
+      "sourceCitation": "https://www.modot.org/OSOW (2025 OSOW reg book)",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence: a second independent pass reached the same official modot.org/OSOW source and confirmed legal height as 168in (14ft on Interstate, 15ft on non-Interstate - the more restrictive Interstate figure used here), replacing the first pass's federally-inferred 162in. A specific superload weight threshold (160000 lbs) was also found and added as a new tier. MO single-axle legal max reported as 22400 lbs, differing from the federal baseline."
+    },
+    {
+      "stateName": "Montana",
+      "stateAbbr": "MT",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Routine oversize permit", "maxWidthIn": 216, "maxHeightIn": 204, "maxLengthIn": 1800 },
+        { "label": "24/7-travel subset (no daylight restriction)", "maxWidthIn": 120, "maxHeightIn": 174, "maxLengthIn": 1320 }
+      ],
+      "sourceCitation": "https://www.mdt.mt.gov/other/webdata/external/MCS/manuals/MT-Truckers-Handbook-Info.pdf",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence: a second independent pass reached good agreement on the baseline figures via the same official MDT source. The routine-permit ceiling (18ft/17ft/150ft) is unusually generous compared to most states. Legal length is 636in (53ft) normally, 900in (75ft) if the trailer exceeds 53ft or has rear overhang."
+    },
+    {
+      "stateName": "Nebraska",
+      "stateAbbr": "NE",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 },
+        { "label": "Superload (ceiling not state-confirmed - generic placeholder)", "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "https://dot.nebraska.gov/business-center/permits/truck ; https://dot.nebraska.gov/media/y1idsekz/legal-sizes-weights.pdf",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence: a second independent pass reached the same official NDOT source and independently reconfirmed the 95000 lb non-Interstate (state-highway) allowance. 80000 lbs (the conservative federal/Interstate figure) is kept as the flat legalMaxWeightLbs since this app doesn't model route-class distinctions. NE's own length rule is a 1440in (120ft) overall combination-length cap, not a trailer-only figure - 636in used as a conservative proxy."
+    },
+    {
+      "stateName": "Nevada",
+      "stateAbbr": "NV",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 },
+        { "label": "Superload (ceiling not state-confirmed - generic placeholder)", "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "NRS 484D.605 (Nevada Revised Statutes, fetched directly)",
+      "lastVerified": "2026-07-23 (automated research pass; height conflict resolved by direct statute fetch in a second independent pass)",
+      "needsVerification": true,
+      "notes": "CONFLICT RESOLVED, confidence upgraded to high: the first pass flagged a 162in-vs-168in height conflict; a second independent pass resolved it by fetching NRS 484D.605 directly, which explicitly states the height limit is 14 feet (168in), with a narrow baled-hay exception to 15ft that likely caused the earlier source confusion. 168in is now used as the confirmed figure."
+    },
+    {
+      "stateName": "New Hampshire",
+      "stateAbbr": "NH",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 780,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit", "maxWidthIn": 126, "maxHeightIn": 162, "maxLengthIn": 900 }
+      ],
+      "sourceCitation": "https://regulations.justia.com/states/new-hampshire/tra/chapter-tra-300/part-tra-304/section-tra-304-14",
+      "lastVerified": "2026-07-23 (automated research pass, broadly confirmed by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Medium confidence - a second independent pass found no direct nh.gov page either, but converged on 780in (65ft) for combination vehicles (540in/45ft for single-unit), upgraded from the earlier 636in conservative proxy. A real permit tier was found and replaces the earlier generic placeholder. NEW, worth flagging operationally: NH bans ALL weekend and holiday oversize travel and restricts to daylight-only on weekdays - stricter than most states."
+    },
+    {
+      "stateName": "New Jersey",
+      "stateAbbr": "NJ",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 },
+        { "label": "Superload (ceiling not state-confirmed - generic placeholder)", "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "https://nj.gotpermits.com/njpass/Permits/DownloadStateAttachment?index=1 (official NJ DOT permit portal)",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence: a second independent pass independently confirmed the same designated-vs-non-designated route split (102in/636in on designated National Network routes; 96in/576in on non-designated routes - the more permissive figures used here). Axle limits more fully specified (tandem 34000/tridem 56400, differing from federal baseline). NEW, worth flagging operationally: oversize travel is banned entirely on the NJ Turnpike, Garden State Parkway, Atlantic City Expressway, Route 495, and the Holland Tunnel - a real routing constraint this app doesn't yet model. No holiday travel allowed."
+    },
+    {
+      "stateName": "New York",
+      "stateAbbr": "NY",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 780,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Blanket permit for qualifying businesses (~125% of normal limits)", "maxWeightLbs": 100000 }
+      ],
+      "sourceCitation": "https://dmv.ny.gov/business/overweight-and-oversized-vehicles",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Medium confidence - a second independent pass reached the same official NY DMV page and upgraded the legal length from the earlier conservative 636in proxy to 780in (65ft combination). NY notably does not publish a flat oversize-permit dimensional ceiling - it uses a case-by-case route survey system instead of published tiers, so the tier above (a blanket-permit weight allowance) is the best available approximation. NYC and some narrow roads may restrict width to 96in (8ft) - not modeled."
+    },
+    {
+      "stateName": "North Carolina",
+      "stateAbbr": "NC",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize/overweight permit (G.S. 20-119)", "maxLengthIn": 1260, "maxHeightIn": 162, "maxWeightLbs": 132000 },
+        { "label": "Long-wheelbase (51ft+) overweight allowance, permitted", "maxWeightLbs": 90000 }
+      ],
+      "sourceCitation": "https://connect.ncdot.gov/business/trucking/Documents/North%20Carolina%20Law%20-%20Commercial%20Vehicles.pdf ; NC Gen. Stat. 20-116 and 20-119",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence: a second independent pass directly fetched NC Gen. Stat. 20-119 and found a real, statute-sourced permit tier (1260in/162in/132000lbs), replacing the earlier generic placeholder. Baseline 53ft/636in length reconfirmed by both passes via direct statute/official-PDF citation."
+    },
+    {
+      "stateName": "North Dakota",
+      "stateAbbr": "ND",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 900,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 },
+        { "label": "No-permit-required threshold (explicit, one source cites up to 1320in/110ft)", "maxLengthIn": 1320 },
+        { "label": "Superload (ceiling not state-confirmed - generic placeholder)", "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "https://www.dot.nd.gov/driver/commercial/north-dakota-load-restrictions",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence on baseline (official NDDOT page, agreed by both passes). ND does not use a trailer-specific length cap - it uses a generous overall-length rule; the first pass found 900in (75ft), the second found an explicit 1320in (110ft) no-permit threshold. The more conservative 900in is kept as the flat legalMaxLengthIn, with the more permissive 1320in figure noted as an additional tier. A second independent pass also RE-CONFIRMED the ND-specific 105,500 lb non-Interstate (state-highway) gross weight allowance found in the first pass - two-pass agreement on this real ND peculiarity. 80000 lbs (Interstate/federal baseline) is kept as the flat legalMaxWeightLbs since this app doesn't model route-class distinctions; do not assume 80000 applies on ND state highways specifically. ND single-axle legal max reported as 19000 lbs, lower than the usual 20000 federal figure."
+    },
+    {
+      "stateName": "Oregon",
+      "stateAbbr": "OR",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 672,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Extended weight permit", "maxWeightLbs": 105500 }
+      ],
+      "sourceCitation": "https://www.oregon.gov/odot/mct/pages/legal-vehicle-dimensions.aspx",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Medium confidence - a second independent pass reached the same official ODOT page and found a more precise semi-trailer-specific length figure (672in/56ft) than the first pass's overall-combination figure (900in/75ft), which has been replaced. Legal height (168in) still not independently confirmed by either pass - genuinely open item, treat cautiously. A real extended-weight-permit ceiling (105500 lbs) was found and replaces the earlier generic placeholder."
+    },
+    {
+      "stateName": "Rhode Island",
+      "stateAbbr": "RI",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 },
+        { "label": "Superload (ceiling not state-confirmed - generic placeholder)", "maxWeightLbs": 200000 }
+      ],
+      "sourceCitation": "https://www.ri.gov/DOT/osow",
+      "lastVerified": "2026-07-23 (automated research pass, exactly cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence: a second independent pass reached the exact same official RIDOT page and matched every figure exactly, including the specific axle breakdown (single 22400/tandem 36000/tridem 42000) - the strongest possible independent-agreement signal for this state. RI restricts oversize-load travel to daylight hours only and bans weekend oversize travel entirely."
+    },
+    {
+      "stateName": "South Carolina",
+      "stateAbbr": "SC",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 720,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Overweight-only, continuous-travel", "maxWeightLbs": 130000 },
+        { "label": "Oversize permit (ceiling not state-confirmed - generic placeholder)", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1080 }
+      ],
+      "sourceCitation": "https://www.wcspermits.com/pdf/SCPermitGuidelines.pdf",
+      "lastVerified": "2026-07-23 (automated research pass, reconfirmed by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded to medium-high: a second independent research pass, working from scratch, independently reconfirmed SC's unusual 720in (60ft) legal length - the 'suspect, no direct scdot.gov page' flag from the first pass can be relaxed given two-pass agreement, though a primary SCDOT source still hasn't been directly fetched by either pass. The '53ft' some sources cite is really a separate 41ft kingpin-to-rear-tandem sub-rule, not the overall length. A real overweight-only permit threshold (130000 lbs) was found and added."
+    },
+    {
+      "stateName": "South Dakota",
+      "stateAbbr": "SD",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Interstate continuous-travel", "maxHeightIn": 174 },
+        { "label": "Superload", "maxWeightLbs": 200000, "maxWidthIn": 144, "maxHeightIn": 192 }
+      ],
+      "sourceCitation": "https://sdtruckinfo.sd.gov/rules-regulations/motor-carrier-handbook/chapter-5/vehicle-size-regulations/",
+      "lastVerified": "2026-07-23 (automated research pass; CONFLICTS with a second independent pass)",
+      "needsVerification": true,
+      "notes": "PRIORITY REVIEW FLAG - unresolved conflict between two independent passes: the first pass found 168in (14ft) directly from the official SD Truck Info handbook; a second independent pass found 162in (13'6\") from a different, explicitly-sourced citation. Both passes cite seemingly-authoritative sources yet disagree directly. The more conservative figure (162in) is now used pending human resolution - do not treat as settled. Daylight-only travel required above the Interstate continuous-travel height threshold (174in). Axle limits: single 20000/tandem 34000/tridem 42000."
+    },
+    {
+      "stateName": "Tennessee",
+      "stateAbbr": "TN",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit", "maxWidthIn": 192, "maxHeightIn": 186 },
+        { "label": "Superload", "maxWeightLbs": 165000, "maxWidthIn": 192, "maxHeightIn": 186 }
+      ],
+      "sourceCitation": "https://oversize.io/regulations/tennessee ; https://www.tn.gov/content/dam/tn/tdot/central-services/2018-updated-forms/FAQ%20Sheet%20Complete.pdf",
+      "lastVerified": "2026-07-23 (automated research pass; concern resolved by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded to high: the first pass flagged an anomalous 600in (50ft) legal-length figure as likely inaccurate; a second independent pass resolved this - the 50ft figure is a separate kingpin-to-rear-of-trailer (KPRA-style) sub-rule, not the overall trailer length. If that specific measurement exceeds 50ft, a permit is needed even if overall length is under 53ft/636in. 636in is confirmed as the correct headline legal length. Superload territory reportedly begins at 16ft wide, 15.5ft high, or 165,000 lbs gross. Total overhang limit is 5ft."
+    },
+    {
+      "stateName": "Utah",
+      "stateAbbr": "UT",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit", "maxWidthIn": 204, "maxHeightIn": 210 },
+        { "label": "Overweight permit (non-divisible)", "maxWeightLbs": 125000 }
+      ],
+      "sourceCitation": "https://www.udot.utah.gov/connect/business/motor-carriers/size-weight-permitting/oversize-overweight-provisions/",
+      "lastVerified": "2026-07-23 (automated research pass; height flagged as still open by a second independent pass)",
+      "needsVerification": true,
+      "notes": "PARTIALLY OPEN: a second independent pass returned 162in for legal height, but traced that figure to a boilerplate sentence ('80,000 pounds, 53' long, 13.5' high and 8.5' wide') that was also found verbatim reused in that same pass's Rhode Island results - i.e. a templated aggregator snippet, not real UT-specific research. The original 168in (14ft) figure came from a more distinctly UT-specific official UDOT page, so it is kept here, but height should be treated as still open rather than fully confirmed. The permit-tier numbers (204/210) ARE strongly cross-validated - both passes independently landed on the exact same figures - so those are high confidence. UDOT also publishes per-axle overweight-permit ceilings (single 29000/tandem 50000/tridem 61750 lbs) - not modeled in this app's per-vehicle-only schema. Double-trailer combos legal to 732in (61ft)."
+    },
+    {
+      "stateName": "Vermont",
+      "stateAbbr": "VT",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 900,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit", "maxWidthIn": 179, "maxHeightIn": 167 },
+        { "label": "Combination vehicle, 5-axle", "maxWeightLbs": 92000 },
+        { "label": "Combination vehicle, 6+-axle / superload", "maxWeightLbs": 108000 }
+      ],
+      "sourceCitation": "https://dmv.vermont.gov/sites/dmv/files/documents/CVO-110-Oversize_Permit_Rules.pdf",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded to medium-high: a second independent pass reached good agreement on the 900in (75ft) baseline and re-characterized the weight tiers more precisely as axle-count-dependent combination-vehicle allowances (5-axle 92000 / 6+-axle 108000 lbs), consistent with but more precise than the first pass's single superload figure (150000). VT also has a low-bed-trailer annual blanket permit (up to 900in/12'6\"W/14'H/108,000 lbs) as a middle tier. Weekend/holiday travel blackout kicks in above 108,000 lbs / 12ft wide / 100ft long."
+    },
+    {
+      "stateName": "Virginia",
+      "stateAbbr": "VA",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit", "maxWidthIn": 180, "maxHeightIn": 180, "maxLengthIn": 1800 },
+        { "label": "Superload", "maxWeightLbs": 250000, "maxWidthIn": 192, "maxHeightIn": 192, "maxLengthIn": 1800 }
+      ],
+      "sourceCitation": "https://www.dmv.virginia.gov/businesses/motor-carriers/overload",
+      "lastVerified": "2026-07-23 (automated research pass, baseline cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "High confidence on baseline: a second independent pass reached the same official DMV PDF and cleanly confirmed width/height/length/weight. The permit-tier ceilings (180/180/1800 oversize; 192/192/1800/250000 superload) were not independently re-found by the second pass, but also not contradicted - kept as-is. Semi-trailer alone is capped at 576in (48ft); the 636in (53ft) figure is for the truck-trailer combination."
+    },
+    {
+      "stateName": "Washington",
+      "stateAbbr": "WA",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize/overweight threshold", "maxWidthIn": 102, "maxHeightIn": 168, "maxLengthIn": 480 },
+        { "label": "Superload", "maxWeightLbs": 200000, "maxWidthIn": 192, "maxHeightIn": 192, "maxLengthIn": 1500 }
+      ],
+      "sourceCitation": "https://oversize.io/regulations/washington",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded to high: a second independent pass explicitly confirmed the superload ceiling (200000 lbs/192in/192in/1500in) that the first pass could not confirm - replacing the earlier 'ceiling not confirmed' placeholder. Legal length includes 3ft front / 15ft rear overhang allowance beyond 636in."
+    },
+    {
+      "stateName": "West Virginia",
+      "stateAbbr": "WV",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 636,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Standard overweight permit", "maxWeightLbs": 90000 },
+        { "label": "Interstate/divided-route blanket permit", "maxWidthIn": 168, "maxHeightIn": 174, "maxLengthIn": 1140 },
+        { "label": "US/select-route blanket permit", "maxWidthIn": 144, "maxHeightIn": 168, "maxLengthIn": 900 },
+        { "label": "Other-route blanket permit", "maxWidthIn": 144, "maxHeightIn": 162, "maxLengthIn": 900 }
+      ],
+      "sourceCitation": "https://transportation.wv.gov/highways/maintenance/hauling_permits/Documents/PERMIT%20INFORMATION.pdf",
+      "lastVerified": "2026-07-23 (automated research pass, cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Confidence upgraded to high: a second independent pass reached the same official WVDOT source and directly confirmed the route-class-dependent permit tiers (Interstate/divided matches exactly at 168/174/1140), plus found a real standard overweight ceiling (90000 lbs, with specific axle limits 28k/45k/50k) not previously recorded. Legal width narrows to 96in on local roads with lanes under 10ft wide; legal weight narrows to 65000 lbs on local service routes."
+    },
+    {
+      "stateName": "Wisconsin",
+      "stateAbbr": "WI",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 162,
+      "legalMaxLengthIn": 840,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Group A permit", "maxWidthIn": 144, "maxHeightIn": 162, "maxLengthIn": 1200 },
+        { "label": "Superload", "maxWeightLbs": 150000, "maxWidthIn": 192 }
+      ],
+      "sourceCitation": "https://wisconsindot.gov/Documents/formdocs/mv2600.pdf ; Wis. Stats. 348.26/348.27",
+      "lastVerified": "2026-07-23 (automated research pass, baseline cross-validated by a second independent pass)",
+      "needsVerification": true,
+      "notes": "Medium-high confidence on baseline: a second independent pass directly cited Wis. Stats. 348.26/348.27 and reached similar figures. Could not independently confirm the specific permit-tier ceiling numbers (Group A 144/162/1200; superload 150000/192) - not contradicted, just not re-found, so they're kept as-is. Group A permit also allows up to 25% over statutory weight limits without extra review."
+    },
+    {
+      "stateName": "Wyoming",
+      "stateAbbr": "WY",
+      "legalMaxWidthIn": 102,
+      "legalMaxHeightIn": 168,
+      "legalMaxLengthIn": 1020,
+      "legalMaxWeightLbs": 80000,
+      "permitTiers": [
+        { "label": "Oversize permit", "maxWidthIn": 216, "maxHeightIn": 204, "maxLengthIn": 1320 },
+        { "label": "Overweight permit ceiling", "maxWeightLbs": 117000 }
+      ],
+      "sourceCitation": "dot.state.wy.us ; Wyoming Statute 31-18-802 and 31-18-804(f)",
+      "lastVerified": "2026-07-23 (automated research pass; priority-flagged conflict resolved by a second independent pass)",
+      "needsVerification": true,
+      "notes": "PRIORITY FLAG RESOLVED (with residual caution): a second, extra-effort independent pass directly addressed the concern flagged in the first pass and concluded that 80,000 lbs is the standard federal-baseline legal (no-permit) weight on WY's Interstate/federal-aid highways, and that 117,000 lbs is actually an OVERWEIGHT PERMIT CEILING, not a flat legal-without-permit figure as the first pass had stored it. legalMaxWeightLbs has been corrected from 117000 to 80000 accordingly, with 117000 moved into permitTiers where it belongs. This is the single most consequential correction from this cross-check - the first pass's figure, if trusted, could have caused a real over-legal-weight violation. Some residual ambiguity remains (WYDOT's actual numeric tables are behind an interactive web app neither pass could reach) - still recommend a human confirm directly before a real move. Length: 720in (60ft) applies to a single semitrailer per Wyoming Statute 31-18-802 directly; 1020in (85ft) for a full combination is kept here as the more relevant overall figure."
+    }
+  ]
+}

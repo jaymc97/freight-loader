@@ -1,5 +1,5 @@
 """
-Freight Loader — 53' Dry Van Load Planning Tool
+Freight Loader — Load Planning Tool (53' dry van and open-deck trailers)
 Imports Excel packing lists, calculates balanced load plans, exports floor plan PDF and crate labels.
 """
 
@@ -16,13 +16,13 @@ import subprocess
 import itertools
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 SAVE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(SAVE_DIR, "Freight_Loader_Import_Template.xlsx")
 PACKING_LIST_DIR = os.path.join(SAVE_DIR, "Saved Load Templates")   # filled-in Excel packing lists
-LOAD_PLANS_DIR = os.path.join(SAVE_DIR, "Load Plans")                # saved plans (.json) and PDFs
+LOAD_PLANS_DIR = os.path.join(SAVE_DIR, "Load Plans")                # saved plans (.flplan / .json) and PDFs
 OLD_PACKING_LIST_DIR = os.path.join(SAVE_DIR, "Packing Lists")      # name used before v2.0
 
 
@@ -59,14 +59,15 @@ from PyQt6.QtWidgets import (
     QLineEdit, QGroupBox, QSplitter, QScrollArea, QMessageBox,
     QHeaderView, QCheckBox, QSizePolicy, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QAbstractItemView, QFrame, QComboBox, QTabWidget,
-    QButtonGroup, QToolTip
+    QButtonGroup, QToolTip, QTextBrowser, QDoubleSpinBox
 )
 from PyQt6.QtCore import (Qt, QRectF, QPointF, QSize, QEvent, QSettings, QBuffer, QByteArray,
-                          QIODevice, pyqtSignal)
+                          QIODevice, pyqtSignal, QUrl, QTimer, QStandardPaths, QObject)
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QPageLayout, QPageSize, QPdfWriter, QPolygonF,
-    QFontMetrics, QCursor
+    QFontMetrics, QCursor, QTextDocument, QPixmap, QDesktopServices
 )
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 TEAL_DARK  = QColor("#2a7d6e")
@@ -87,22 +88,49 @@ CRATE_COLORS = [
     "#d35400","#2980b9","#7f8c8d","#f39c12","#1abc9c","#e74c3c",
 ]
 
-# ── 53' Dry Van specs ────────────────────────────────────────────────────────
-TRAILER = {
-    "name": "53' Dry Van",
-    "interior_length_in": 636,
-    "interior_width_in":  98,
-    "interior_height_in": 110,
-    "steer_limit": 12000,
-    "drive_limit": 34000,
-    "trailer_limit": 34000,
-    "gross_limit":  80000,
+# ── Trailer types ────────────────────────────────────────────────────────────
+# 53' dry van plus open-deck types (data/trailer_types.json, in preference
+# order). Each truck has its own type; set_trailer_type() switches TRAILER and
+# the trailer half of RIG to it, so the planner, axle math and drawings all
+# work on that truck's trailer. interior_* is the usable cargo space: on open
+# decks interior_height_in is the legal cargo height, and a single piece may
+# overhang it (oversize — needs a permit).
+DATA_DIR = os.path.join(SAVE_DIR, "data")
+TRAILER_TYPES_PATH = os.path.join(DATA_DIR, "trailer_types.json")
+DEFAULT_TRAILER_TYPE = "dry_van_53"
+LEGAL_WIDTH_IN = 102        # 8'6" — federal legal width
+LEGAL_HEIGHT_IN = 162       # 13'6" — the lowest legal height of any state
+LEGAL_TRAILER_IN = 636      # 53' trailer
+_VAN_TYPE = {
+    "id": DEFAULT_TRAILER_TYPE, "name": "53' Dry Van", "enclosed": True,
+    "deck_height_in": 48, "deck_length_in": 636, "deck_width_in": 98, "cargo_height_in": 110,
+    "trailer_length_in": 636, "exterior_height_in": 162,
+    "rig": {"trailer_tare": 14500, "slider_tare": 3000, "trailer_cg_in": 270, "kingpin_in": 36,
+            "tandem_min_in": 420, "tandem_max_in": 540, "tandem_step_in": 6, "tandem_spread_in": 49},
 }
+
+
+def _load_trailer_types() -> dict:
+    """{type id: spec} in preference order; the dry van alone if the file is missing."""
+    try:
+        with open(TRAILER_TYPES_PATH, encoding="utf-8") as f:
+            types = {t["id"]: t for t in json.load(f)["trailerTypes"]}
+    except (OSError, ValueError, KeyError):
+        types = {}
+    types.setdefault(DEFAULT_TRAILER_TYPE, _VAN_TYPE)
+    return types
+
+
+TRAILER_TYPES = _load_trailer_types()
+USER_LIMITS = {"steer_limit": 12000, "drive_limit": 34000,   # DOT Axle Weight Limits fields
+               "trailer_limit": 34000, "gross_limit": 80000}
+TRAILER: dict = {}      # the active trailer type (see set_trailer_type)
 
 # ── Tractor and trailer running gear (Truck & Trailer… dialog) ───────────────
 # Empty weights are typical for a sleeper tractor and a 53' dry van; the
 # trailer body's weight sits at its centre of gravity, the slider (axles,
-# wheels, brakes) moves with the tandem. Positions are in inches.
+# wheels, brakes) moves with the tandem. Positions are in inches. The trailer
+# keys hold the active trailer type's values (RIG_BY_TYPE keeps every type's).
 RIG_DEFAULTS = {
     "steer_tare":        10800,   # tractor alone (bobtail), steer axle
     "drive_tare":         8700,   # tractor alone, drive tandem
@@ -119,9 +147,59 @@ RIG_DEFAULTS = {
     "tandem_max_in":       540,
     "tandem_step_in":        6,   # slider hole spacing
     "tandem_spread_in":     49,   # front to rear trailer axle
-    "kpra_max_in":         480,   # kingpin to rear axle legal max (40' — CA; many states 41'); 0 = none
+    "kpra_max_in":         492,   # kingpin to rear axle legal max (41' — many states; CA 40'); 0 = none
 }
 RIG = dict(RIG_DEFAULTS)
+RIG_TRAILER_KEYS = ("trailer_tare", "slider_tare", "trailer_cg_in", "kingpin_in",
+                    "tandem_min_in", "tandem_max_in", "tandem_step_in", "tandem_spread_in")
+RIG_BY_TYPE = {tid: {k: t["rig"][k] for k in RIG_TRAILER_KEYS} for tid, t in TRAILER_TYPES.items()}
+RIG_BY_TYPE[DEFAULT_TRAILER_TYPE] = {k: RIG_DEFAULTS[k] for k in RIG_TRAILER_KEYS}
+
+
+def set_trailer_type(tid: Optional[str]):
+    """Make `tid` the active trailer: TRAILER and the trailer keys of RIG."""
+    spec = TRAILER_TYPES.get(tid) or TRAILER_TYPES[DEFAULT_TRAILER_TYPE]
+    enclosed = bool(spec.get("enclosed"))
+    TRAILER.clear()
+    TRAILER.update({
+        "id": spec["id"],
+        "name": spec["name"],
+        "enclosed": enclosed,
+        "deck_height_in": spec["deck_height_in"],
+        "interior_length_in": spec["deck_length_in"],
+        "interior_width_in": spec["deck_width_in"],
+        "interior_height_in": spec["cargo_height_in"],
+        "length_in": spec["trailer_length_in"],              # overall, for state length limits
+        "retracted_length_in": spec.get("retracted_length_in"),
+        "exterior_width_in": LEGAL_WIDTH_IN,
+        "exterior_height_in": spec.get("exterior_height_in",
+                                       spec["deck_height_in"] + spec["cargo_height_in"]),
+        "rated_cargo_lbs": spec.get("rated_cargo_lbs"),
+        "kpra_exempt": bool(spec.get("kpra_exempt")),
+        "tridem": "trailer_axle_limit_lbs" in spec,
+    })
+    TRAILER.update(USER_LIMITS)
+    if spec.get("trailer_axle_limit_lbs"):
+        TRAILER["trailer_limit"] = spec["trailer_axle_limit_lbs"]
+    RIG.update(RIG_BY_TYPE[spec["id"]])
+
+
+class trailer_type:
+    """`with trailer_type(tid):` — work on another trailer type, then switch back."""
+
+    def __init__(self, tid: Optional[str]):
+        self.tid = tid
+
+    def __enter__(self):
+        self.prev = TRAILER.get("id")
+        set_trailer_type(self.tid)
+
+    def __exit__(self, *exc):
+        set_trailer_type(self.prev)
+        return False
+
+
+set_trailer_type(DEFAULT_TRAILER_TYPE)
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -330,10 +408,38 @@ def _pack_columns(pieces: list) -> tuple:
 # the drive tandem centre, so it splits between drive and steer by lever arm:
 # sliding the fifth wheel forward moves weight onto the steer axle, sliding
 # the trailer tandem back moves weight from the trailer axles onto the drives.
+CALIFORNIA_KPRA_IN = 480    # California's kingpin-to-rear-axle limit (40')
+_ROUTE_KPRA = [None]        # limit the active truck's route imposes (California), or None
+
+
+def set_route_kpra(limit: Optional[float]):
+    """The active truck's route limit — CALIFORNIA_KPRA_IN when it goes through California."""
+    _ROUTE_KPRA[0] = limit
+
+
+def kpra_limit() -> float:
+    """Kingpin-to-rear-axle limit for the active truck: the Truck & Trailer setting
+    (41' default), or California's 40' when the truck's route goes through it. 0 = none."""
+    lim, route = RIG["kpra_max_in"], _ROUTE_KPRA[0]
+    if route:
+        lim = min(lim, route) if lim else route
+    return lim
+
+
+def kpra_text() -> str:
+    """'41'0"' or '40'0" (California on route)' for messages."""
+    lim = kpra_limit()
+    text = f"{int(lim // 12)}'{lim % 12:.0f}\""
+    if _ROUTE_KPRA[0] and lim == _ROUTE_KPRA[0] and lim < RIG["kpra_max_in"]:
+        text += " (California on the route)"
+    return text
+
+
 def _rear_axle_ok(tandem_in: float) -> bool:
     """Kingpin-to-rear-axle distance within the legal limit (if one is set)."""
-    return (not RIG["kpra_max_in"]
-            or tandem_in + RIG["tandem_spread_in"] / 2 <= RIG["kpra_max_in"] + FIT_TOLERANCE_IN)
+    lim = kpra_limit()
+    return (not lim or TRAILER.get("kpra_exempt")
+            or tandem_in + RIG["tandem_spread_in"] / 2 <= lim + FIT_TOLERANCE_IN)
 
 
 def rig_positions(legal_only: bool = True) -> tuple:
@@ -605,16 +711,101 @@ def _relayout_rows(slots: list) -> float:
 
 
 def plan_load(pieces: list, override: bool = False, excluded_ids: list = None,
-              stop_order: list = None, rig: dict = None) -> LoadPlan:
+              stop_order: list = None, rig: dict = None, spread: bool = False) -> LoadPlan:
     """
     Build a load plan that fits the trailer, stacks only as needed and keeps
     axle and side-to-side weight balanced. Pieces that won't fit are listed in
     LoadPlan.unplaced and called out in the violations. `rig` fixes the fifth
-    wheel and tandem positions; None lets the planner place them.
+    wheel and tandem positions; None lets the planner place them. `spread`
+    (all the freight is entered) lets the planner use the empty floor to get
+    overweight axles legal — see _spread_rows.
     """
+    plan = _plan_rows(pieces, override, excluded_ids, stop_order, rig)
+    if spread and plan_overload(plan) > 0:
+        plan = _spread_rows(plan, pieces, override, excluded_ids, stop_order, rig)
+    return plan
+
+
+def plan_overload(plan: LoadPlan) -> float:
+    """Pounds over the axle limits, at departure and after each delivery."""
+    aw = plan.axle_weights
+    if not aw:
+        return 0.0
+    return _overload(aw["steer"], aw["drive"], aw["trailer"]) + sum(
+        _overload(s, d, t) for _stop, s, d, t in (plan.stop_axles or []))
+
+
+def kpra_hint(plan: LoadPlan) -> Optional[str]:
+    """
+    When axles are over only because the kingpin-to-rear-axle limit keeps the
+    tandem from sliding back: the closest fifth wheel / tandem setting (past
+    the limit) that makes every axle legal, as advice for the user.
+    """
+    if plan_overload(plan) <= 0 or not kpra_limit() or TRAILER.get("kpra_exempt"):
+        return None
+    loads = [(t, m) for _s, t, m in _freight_loads(plan.slots)]
+    fw_opts, holes = rig_positions(legal_only=False)
+    fixes = [(t, f) for t in holes for f in fw_opts
+             if not _rear_axle_ok(t)
+             and sum(_overload(*_axles_for(tot, mom, {"fw_in": f, "tandem_in": t}))
+                     for tot, mom in loads) <= 0]
+    if not fixes:
+        return None
+    t, f = min(fixes, key=lambda tf: (tf[0], abs(tf[1] - RIG["fw_home_in"])))
+    rear = t + RIG["tandem_spread_in"] / 2
+    where = ("California's limit — the route goes through California" if _ROUTE_KPRA[0]
+             and kpra_limit() == _ROUTE_KPRA[0] and kpra_limit() < RIG["kpra_max_in"]
+             else "set in Truck &amp; Trailer…")
+    return (f"Every axle would be legal with the tandem slid back to {t:.0f}\" (rear axle "
+            f"{int(rear // 12)}'{rear % 12:.0f}\" from the kingpin) and the fifth wheel at "
+            f"{f:.0f}\" — past the {kpra_text().split(' (')[0]} kingpin-to-rear-axle limit "
+            f"({where}).")
+
+
+def _spread_rows(plan: LoadPlan, pieces: list, override, excluded_ids, stop_order, rig) -> LoadPlan:
+    """
+    The load packed two-across from the nose leaves axles overweight: break
+    side-by-side rows into single rows centred in the trailer, heaviest rows
+    first, one row at a time, until every axle is legal — the longer load moves
+    weight back off the steer and drive axles. Stops at the fewest single rows
+    that work (or the best it can do), without stacking anything extra.
+    """
+    pairs = {}
+    for s in plan.slots:
+        if s.tier == 0 and s.piece and not s.is_center:
+            pairs.setdefault(s.row, []).append(s.piece.piece_id)
+    weight = {s.piece.piece_id: 0.0 for s in plan.slots if s.piece}
+    for s in plan.slots:
+        if s.piece and not (s.is_center and s.col == 1):
+            bottom = next((b.piece.piece_id for b in plan.slots
+                           if b.tier == 0 and b.row == s.row and b.col == s.col and b.piece), None)
+            if bottom is not None:
+                weight[bottom] += s.piece.weight_lbs
+    rows = sorted((ids for ids in pairs.values() if len(ids) == 2),
+                  key=lambda ids: -sum(weight[i] for i in ids))
+    n_stacked = sum(1 for s in plan.slots if s.tier == 1 and s.piece)
+    best, best_over = plan, plan_overload(plan)
+    forced: set = set()
+    for ids in rows:
+        forced.update(ids)
+        trial = _plan_rows([replace(p, placement="center") if p.piece_id in forced else p
+                            for p in pieces], override, excluded_ids, stop_order, rig)
+        if (len(trial.unplaced or []) > len(plan.unplaced or [])
+                or sum(1 for s in trial.slots if s.tier == 1 and s.piece) > n_stacked):
+            break                        # out of floor — spreading further would need stacks
+        over = plan_overload(trial)
+        if over < best_over - 0.5:
+            best, best_over = trial, over
+        if over <= 0:
+            break
+    return best
+
+
+def _plan_rows(pieces: list, override: bool = False, excluded_ids: list = None,
+               stop_order: list = None, rig: dict = None) -> LoadPlan:
+    """plan_load without spreading: rows packed from the nose."""
     excluded_ids = excluded_ids or []
-    L, W, H = (TRAILER["interior_length_in"], TRAILER["interior_width_in"],
-               TRAILER["interior_height_in"])
+    W = TRAILER["interior_width_in"]
     active = [p for p in pieces if p.piece_id not in excluded_ids]
     if not active:
         return LoadPlan([], {}, [], 0.0, override, excluded_ids, [], [],
@@ -634,12 +825,9 @@ def plan_load(pieces: list, override: bool = False, excluded_ids: list = None,
 
     unplaced, loadable = [], []
     for p in active:
-        if p.length_in > L:
-            unplaced.append((p, f"longer than trailer ({p.length_in:.0f}\" > {L}\")"))
-        elif p.width_in > W:
-            unplaced.append((p, f"wider than trailer ({p.width_in:.0f}\" > {W}\")"))
-        elif p.height_in > H:
-            unplaced.append((p, f"taller than trailer ({p.height_in:.0f}\" > {H}\")"))
+        why = _size_problem(p)
+        if why:
+            unplaced.append((p, why))
         else:
             loadable.append(p)
 
@@ -700,7 +888,47 @@ def plan_load(pieces: list, override: bool = False, excluded_ids: list = None,
     plan = LoadPlan(slots, {}, [], cursor, override, excluded_ids, unplaced, [],
                     stop_order=order, rig=dict(rig) if rig else None, rig_auto=rig is None)
     _refresh_plan_metrics(plan)
+    if not TRAILER["enclosed"] and TRAILER.get("retracted_length_in") is None:
+        _slide_load_back(plan)
     return plan
+
+
+DECK_SLIDE_STEP_IN = 6
+
+
+def _slide_load_back(plan: LoadPlan):
+    """
+    Open decks aren't loaded nose-first like a van: a heavy piece belongs over
+    the axles. If the axles are overloaded (or near their limit) with the load
+    at the front, slide the whole load back along the deck to where they're
+    lightest — the same test auto_rig uses for the fifth wheel and tandem.
+    """
+    def score():
+        aw = plan.axle_weights
+        if not aw:
+            return (0, 0)
+        over = _overload(aw["steer"], aw["drive"], aw["trailer"]) + sum(
+            _overload(s, d, t) for _stop, s, d, t in (plan.stop_axles or []))
+        peak = max(aw["drive"] / TRAILER["drive_limit"], aw["trailer"] / TRAILER["trailer_limit"],
+                   aw["steer"] / TRAILER["steer_limit"])
+        return (round(over), round(max(0.0, peak - AUTO_RIG_COMFORT) * 200))
+
+    room = TRAILER["interior_length_in"] - plan.total_length_used_in
+    base = score()
+    if room < DECK_SLIDE_STEP_IN or base == (0, 0):
+        return
+    best = (base, 0.0)
+    shift = 0.0
+    while shift + DECK_SLIDE_STEP_IN <= room + FIT_TOLERANCE_IN:
+        for s in plan.slots:
+            s.row_start_in += DECK_SLIDE_STEP_IN
+        shift += DECK_SLIDE_STEP_IN
+        _refresh_plan_metrics(plan)
+        if score() < best[0]:
+            best = (score(), shift)
+    for s in plan.slots:
+        s.row_start_in -= shift - best[1]
+    _refresh_plan_metrics(plan)
 
 
 # Row side states: LEFT = heavier column / wall-hugging crate on the left wall,
@@ -975,19 +1203,92 @@ def parse_coords(text: str) -> Optional[tuple]:
     return None
 
 
-def geocode_address(address: str) -> Optional[tuple]:
-    """(lat, lon, display_name) from OpenStreetMap Nominatim, or None. Needs internet."""
-    import urllib.parse
+CENSUS_GEOCODER_URL = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
+APPROX_PREFIX = "≈ ZIP-code area only"   # display text for a ZIP-centre fallback
+_NOMINATIM_LAST = [0.0]                   # time of the last Nominatim request
+
+
+def _http_json(url: str, timeout: float = 20):
     import urllib.request
-    url = NOMINATIM_URL + "?" + urllib.parse.urlencode(
-        {"q": address, "format": "json", "limit": 1, "countrycodes": "us,ca,mx"})
     req = urllib.request.Request(url, headers={"User-Agent": HTTP_USER_AGENT})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        results = json.loads(resp.read().decode("utf-8"))
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _nominatim(params: dict) -> Optional[tuple]:
+    """First Nominatim hit for the search params, or None. Keeps to ≤ 1 request/sec
+    (OpenStreetMap usage policy)."""
+    import urllib.parse
+    wait = _NOMINATIM_LAST[0] + 1.1 - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    try:
+        results = _http_json(NOMINATIM_URL + "?" + urllib.parse.urlencode(
+            dict(params, format="json", limit=1, countrycodes="us,ca,mx")), timeout=15)
+    finally:
+        _NOMINATIM_LAST[0] = time.time()
     if not results:
         return None
     r = results[0]
     return float(r["lat"]), float(r["lon"]), r.get("display_name", "")
+
+
+def _census_geocode(address: str) -> Optional[tuple]:
+    """US street address via the Census Bureau geocoder (knows USPS mailing city
+    names that OpenStreetMap may not), or None."""
+    import urllib.parse
+    data = _http_json(CENSUS_GEOCODER_URL + "?" + urllib.parse.urlencode(
+        {"address": address, "benchmark": "Public_AR_Current", "format": "json"}))
+    matches = data.get("result", {}).get("addressMatches") or []
+    if not matches:
+        return None
+    m = matches[0]
+    return (float(m["coordinates"]["y"]), float(m["coordinates"]["x"]),
+            m.get("matchedAddress", "") + " (US Census)")
+
+
+def geocode_address(address: str) -> Optional[tuple]:
+    """
+    (lat, lon, display_name) for an address, or None. Needs internet.
+    OpenStreetMap needs every word to match its own place names, so a USPS mailing
+    city that differs from the OSM place (e.g. "Flushing, NY" for a Queens address)
+    finds nothing. Tries, in order, stopping at the first hit:
+      1. the address as typed (OpenStreetMap — also finds place names)
+      2. the US Census geocoder (USPS city names)
+      3. OpenStreetMap without the city part
+      4. OpenStreetMap street + ZIP / postal code
+      5. the ZIP code's centre — display starts with APPROX_PREFIX
+    A network failure on the first lookup is raised; later ones are skipped.
+    """
+    address = address.strip()
+    hit = _nominatim({"q": address})
+    if hit:
+        return hit
+    parts = [p.strip() for p in address.split(",") if p.strip()]
+    zm = re.search(r"\b(\d{5})(?:-\d{4})?\b(?!.*\d{5})", address)
+    zip_code = zm.group(1) if zm else None
+    attempts = []
+    if len(parts) >= 2 and any(ch.isdigit() for ch in parts[0]):
+        attempts.append(lambda: _census_geocode(address))
+    if len(parts) >= 3:
+        attempts.append(lambda: _nominatim({"q": ", ".join([parts[0]] + parts[2:])}))
+    if zip_code and len(parts) >= 2:
+        attempts.append(lambda: _nominatim({"street": parts[0], "postalcode": zip_code}))
+    for attempt in attempts:
+        try:
+            hit = attempt()
+        except Exception:
+            hit = None
+        if hit:
+            return hit
+    if zip_code:
+        try:
+            hit = _nominatim({"postalcode": zip_code})
+        except Exception:
+            hit = None
+        if hit:
+            return hit[0], hit[1], f"{APPROX_PREFIX} — {hit[2]}"
+    return None
 
 
 def road_distance_matrix(points: list) -> list:
@@ -1050,6 +1351,209 @@ def route_order(stop_ids: list, coords: dict, dist=None, origin_key="origin") ->
     return path + unlocated
 
 
+# ── Route: states crossed, state size/weight limits, transit time ────────────
+# Each truck's road route (origin → its stops in delivery order) comes from the
+# public OSRM server. The route line is checked against US state boundaries to
+# find every state it passes through, then the rig's overall size and gross
+# weight are compared with each state's legal limits and known permit tiers.
+# State data came from the Cargo Load Planner app: researched, NOT verified —
+# every figure must be confirmed with the state DOT before a real move.
+STATE_REGS_PATH = os.path.join(DATA_DIR, "state_regulations.json")
+STATE_BOUNDS_PATH = os.path.join(DATA_DIR, "us_states_boundaries.geojson")
+OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/driving/"
+HOS_DRIVE_HOURS_PER_DAY = 11.0   # FMCSA hours of service: 11 h driving, then 10 h off
+STATE_MIN_MILES = 0.5            # ignore border "visits" shorter than this (coarse boundaries)
+STATE_DATA_WARNING = ("State limits are researched but not verified — confirm with each "
+                      "state DOT permit office before moving the load.")
+TRANSIT_CAVEAT = ("Drive time is the routing server's road time at normal (car) speeds; "
+                  f"days assume {HOS_DRIVE_HOURS_PER_DAY:.0f} h of driving per day under FMCSA "
+                  "hours-of-service rules. Loading, unloading, traffic, weather and permit "
+                  "travel-time restrictions are not included.")
+
+
+def road_route(points: list) -> dict:
+    """
+    Driving route through (lat, lon) points in order, via the public OSRM server.
+    Returns {"miles", "hours", "leg_miles", "leg_hours", "path"}; path is
+    [(lon, lat)] along the road.
+    """
+    import urllib.request
+    coords = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in points)
+    req = urllib.request.Request(
+        OSRM_ROUTE_URL + coords + "?overview=full&geometries=geojson&steps=false",
+        headers={"User-Agent": HTTP_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if data.get("code") != "Ok" or not data.get("routes"):
+        raise RuntimeError(data.get("message", "no route found"))
+    r = data["routes"][0]
+    return {
+        "miles": r["distance"] / 1609.344,
+        "hours": r["duration"] / 3600,
+        "leg_miles": [leg["distance"] / 1609.344 for leg in r["legs"]],
+        "leg_hours": [leg["duration"] / 3600 for leg in r["legs"]],
+        "path": [tuple(pt) for pt in r["geometry"]["coordinates"]],
+    }
+
+
+_STATE_SHAPES = None   # [(name, [(bbox, rings)])] loaded on first use
+_STATE_REGS = None     # {state name: regulation record}
+
+
+def _state_shapes() -> list:
+    global _STATE_SHAPES
+    if _STATE_SHAPES is None:
+        with open(STATE_BOUNDS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        shapes = []
+        for feat in data["features"]:
+            geom = feat["geometry"]
+            polys = ([geom["coordinates"]] if geom["type"] == "Polygon"
+                     else geom["coordinates"] if geom["type"] == "MultiPolygon" else [])
+            parts = []
+            for rings in polys:
+                xs = [p[0] for p in rings[0]]
+                ys = [p[1] for p in rings[0]]
+                parts.append(((min(xs), min(ys), max(xs), max(ys)), rings))
+            shapes.append((feat["properties"]["name"], parts))
+        _STATE_SHAPES = shapes
+    return _STATE_SHAPES
+
+
+def _in_ring(x: float, y: float, ring: list) -> bool:
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi = ring[i][0], ring[i][1]
+        xj, yj = ring[j][0], ring[j][1]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _shape_contains(parts: list, x: float, y: float) -> bool:
+    for (x0, y0, x1, y1), rings in parts:
+        if x0 <= x <= x1 and y0 <= y <= y1 and _in_ring(x, y, rings[0]) and \
+                not any(_in_ring(x, y, hole) for hole in rings[1:]):
+            return True
+    return False
+
+
+def state_at(lon: float, lat: float) -> Optional[str]:
+    """Name of the US state containing a point, or None."""
+    return next((name for name, parts in _state_shapes() if _shape_contains(parts, lon, lat)), None)
+
+
+def states_crossed(path: list) -> list:
+    """
+    States a road path [(lon, lat)] passes through, in route order. A state
+    only counts once the route covers STATE_MIN_MILES in it, so a road that
+    runs along a (coarsely drawn) border doesn't add a state it never enters.
+    """
+    shapes = _state_shapes()
+    last = None
+    runs = []   # [[state, miles]] consecutive stretches in one state
+    prev_pt = None
+    for x, y in path:
+        state = None
+        if last is not None and _shape_contains(last[1], x, y):
+            state = last
+        else:
+            state = next((s for s in shapes if _shape_contains(s[1], x, y)), None)
+        if state is not None:
+            seg = straight_miles((prev_pt[1], prev_pt[0]), (y, x)) if prev_pt else 0.0
+            if runs and runs[-1][0] == state[0]:
+                runs[-1][1] += seg
+            else:
+                runs.append([state[0], seg])
+            last = state
+        prev_pt = (x, y)
+    out = []
+    for i, (name, miles) in enumerate(runs):
+        ends = i == 0 or i == len(runs) - 1      # origin and destination always count
+        if (miles >= STATE_MIN_MILES or ends) and (not out or out[-1] != name):
+            out.append(name)
+    return out
+
+
+def state_regulations() -> dict:
+    """{state name: record} from data/state_regulations.json."""
+    global _STATE_REGS
+    if _STATE_REGS is None:
+        with open(STATE_REGS_PATH, encoding="utf-8") as f:
+            _STATE_REGS = {s["stateName"]: s for s in json.load(f)["states"]}
+    return _STATE_REGS
+
+
+ROUTE_DIMENSIONS = [   # (vehicle key, regulation suffix, label)
+    ("width_in", "WidthIn", "Width"),
+    ("height_in", "HeightIn", "Height"),
+    ("length_in", "LengthIn", "Length"),
+    ("weight_lbs", "WeightLbs", "Gross weight"),
+]
+
+
+def _dim_text(key: str, value: float) -> str:
+    if key == "weight_lbs":
+        return f"{value:,.0f} lb"
+    return f"{int(value) // 12}'{value % 12:.0f}\""
+
+
+def check_route_compliance(vehicle: dict, states: list) -> dict:
+    """
+    Compare the rig (overall width/height/length in inches, gross lb) with
+    every state on the route. A state's permit ceiling per dimension is its
+    largest permit tier (or the legal limit if no tier lists that dimension).
+    Returns {"status": legal|permit|over|unknown, "states": [per-state
+    {"state", "abbr", "status", "issues"}], "missing": [names]}.
+    """
+    regs = state_regulations()
+    rank = {"legal": 0, "permit": 1, "over": 2}
+    per_state, missing = [], []
+    for name in states:
+        reg = regs.get(name)
+        if reg is None:
+            missing.append(name)
+            continue
+        status, issues = "legal", []
+        for key, suffix, label in ROUTE_DIMENSIONS:
+            value = vehicle.get(key)
+            legal = reg.get("legalMax" + suffix)
+            if value is None or legal is None or value <= legal + 1e-6:
+                continue
+            ceiling = max([legal] + [t["max" + suffix] for t in reg.get("permitTiers", [])
+                                     if t.get("max" + suffix) is not None])
+            if value > ceiling + 1e-6:
+                dim_status = "over"
+                issues.append(f"{label} {_dim_text(key, value)} is over the largest known permit "
+                              f"({_dim_text(key, ceiling)}; legal {_dim_text(key, legal)})")
+            else:
+                dim_status = "permit"
+                issues.append(f"{label} {_dim_text(key, value)} is over the legal "
+                              f"{_dim_text(key, legal)} — permit needed")
+            if rank[dim_status] > rank[status]:
+                status = dim_status
+        per_state.append({"state": name, "abbr": reg.get("stateAbbr", name),
+                          "status": status, "issues": issues,
+                          "notes": reg.get("notes", ""), "source": reg.get("sourceCitation", "")})
+    if per_state:
+        overall = max((s["status"] for s in per_state), key=lambda s: rank[s])
+    else:
+        overall = "unknown"
+    return {"status": overall, "states": per_state, "missing": missing}
+
+
+def transit_days(hours: float) -> int:
+    """Driving days for `hours` of road time at HOS_DRIVE_HOURS_PER_DAY a day."""
+    return max(1, math.ceil(hours / HOS_DRIVE_HOURS_PER_DAY - 1e-9))
+
+
+def route_key(points: list) -> str:
+    """Cache key for a route through (lat, lon) points."""
+    return ";".join(f"{lat:.5f},{lon:.5f}" for lat, lon in points)
+
+
 def _normalize_placement(p: FreightPiece):
     W = TRAILER["interior_width_in"]
     if p.width_in > W * 0.70:
@@ -1058,24 +1562,57 @@ def _normalize_placement(p: FreightPiece):
         p.placement = "center"
 
 
-def physically_loadable(p: FreightPiece) -> Optional[str]:
-    """None if the piece can go in the trailer at all, else the reason it can't."""
+def _size_problem(p: FreightPiece) -> Optional[str]:
+    """Why the piece can't go on the active trailer by size, or None. Open decks
+    take overhanging (oversize) pieces; enclosed trailers don't."""
     L, W, H = (TRAILER["interior_length_in"], TRAILER["interior_width_in"],
                TRAILER["interior_height_in"])
     if p.length_in > L:
-        return f"longer than trailer ({p.length_in:.0f}\" > {L}\")"
-    if p.width_in > W:
-        return f"wider than trailer ({p.width_in:.0f}\" > {W}\")"
-    if p.height_in > H:
-        return f"taller than trailer ({p.height_in:.0f}\" > {H}\")"
-    if p.weight_lbs > max_payload():
-        return f"heavier than a truck can legally carry ({p.weight_lbs:,.0f} lb)"
+        return f"longer than the {TRAILER['name']} deck ({p.length_in:.0f}\" > {L}\")"
+    if TRAILER["enclosed"] and p.width_in > W:
+        return f"wider than the {TRAILER['name']} ({p.width_in:.0f}\" > {W}\")"
+    if TRAILER["enclosed"] and p.height_in > H:
+        return f"taller than the {TRAILER['name']} ({p.height_in:.0f}\" > {H}\")"
     return None
 
 
+def piece_payload_limit() -> float:
+    """Heaviest single piece the active trailer takes: the legal payload, or on an
+    open deck its rated capacity (an indivisible overweight piece — permit needed)."""
+    if TRAILER["enclosed"]:
+        return max_payload()
+    return max(max_payload(), TRAILER.get("rated_cargo_lbs") or 0)
+
+
+def physically_loadable(p: FreightPiece) -> Optional[str]:
+    """None if the piece can go on the active trailer at all, else the reason it can't."""
+    why = _size_problem(p)
+    if why:
+        return why
+    if p.weight_lbs > piece_payload_limit():
+        return f"heavier than a {TRAILER['name']} can carry ({p.weight_lbs:,.0f} lb)"
+    return None
+
+
+def piece_oversize(p: FreightPiece) -> list:
+    """What makes a piece oversize / overweight on the active trailer: ["width", ...]."""
+    out = []
+    if p.width_in > LEGAL_WIDTH_IN:
+        out.append("width")
+    if TRAILER["deck_height_in"] + p.height_in > LEGAL_HEIGHT_IN:
+        out.append("height")
+    if p.length_in > LEGAL_TRAILER_IN:            # only an extendable deck takes these
+        out.append("length")
+    if p.weight_lbs > max_payload():
+        out.append("weight")
+    return out
+
+
 def fits_one_truck(pieces: list, stop_rank: dict) -> bool:
-    """True if `pieces` fit one trailer by floor space (with stacking) and payload."""
-    if sum(p.weight_lbs for p in pieces) > max_payload():
+    """True if `pieces` fit one trailer by floor space (with stacking) and payload.
+    Only a single (indivisible) piece may go over the legal payload."""
+    limit = piece_payload_limit() if len(pieces) == 1 else max_payload()
+    if sum(p.weight_lbs for p in pieces) > limit:
         return False
     for p in pieces:
         _normalize_placement(p)
@@ -1146,6 +1683,82 @@ def split_into_trucks(pieces: list, route: list, decide) -> tuple:
     trucks = [t for t in trucks if t]
     return ([[p.piece_id for p in t] for t in trucks] or [[]],
             [p.piece_id for p in other], impossible)
+
+
+HEAVY_HAUL_REASON = ("too big or heavy for every trailer type here — needs a heavy-haul carrier "
+                     "(multi-axle RGN, perimeter or Schnabel trailer) and superload permits")
+
+
+def best_trailer_for(p: FreightPiece) -> Optional[str]:
+    """
+    Trailer type for a piece that won't go in a dry van: the first type (in
+    preference order) that carries it at legal size and weight, else the one
+    that leaves it least oversize. None if no type can take it at all.
+    """
+    best = None
+    for k, tid in enumerate(TRAILER_TYPES):
+        with trailer_type(tid):
+            if physically_loadable(p):
+                continue
+            over = piece_oversize(p)
+            excess = (max(0.0, p.width_in - LEGAL_WIDTH_IN)
+                      + max(0.0, TRAILER["deck_height_in"] + p.height_in - LEGAL_HEIGHT_IN)
+                      + max(0.0, p.length_in - LEGAL_TRAILER_IN)
+                      + max(0.0, p.weight_lbs - max_payload()) / 100)
+        key = (len(over), round(excess, 1), k)
+        if best is None or key < best[0]:
+            best = (key, tid)
+    return best[1] if best else None
+
+
+def split_shipment(pieces: list, route: list, decide) -> tuple:
+    """
+    Trucks for the whole shipment: freight that goes in a dry van is split as
+    before (split_into_trucks); every other piece goes on the trailer type
+    best_trailer_for picks. A piece that's oversize / overweight on its
+    trailer rides alone — permits are only issued for one indivisible piece.
+    Returns (trucks [(type id, piece IDs)], ship_other IDs, impossible [(piece, reason)]).
+    """
+    with trailer_type(DEFAULT_TRAILER_TYPE):
+        vans, other, rest = split_into_trucks(pieces, route, decide)
+    trucks = [(DEFAULT_TRAILER_TYPE, ids) for ids in vans if ids]
+    groups, impossible = {}, []
+    for p, _why in rest:
+        tid = best_trailer_for(p)
+        if tid is None:
+            impossible.append((p, HEAVY_HAUL_REASON))
+            continue
+        with trailer_type(tid):
+            alone = bool(piece_oversize(p))
+        if alone:
+            trucks.append((tid, [p.piece_id]))
+        else:
+            groups.setdefault(tid, []).append(p)
+    for tid, group in groups.items():
+        offset = len(trucks)
+
+        def decide_here(info, offset=offset):    # number trucks across the whole shipment
+            return decide(dict(info, truck=info["truck"] + offset))
+        with trailer_type(tid):
+            more, o2, imp2 = split_into_trucks(group, route, decide_here)
+        trucks += [(tid, ids) for ids in more if ids]
+        other += o2
+        impossible += imp2
+    return trucks or [(DEFAULT_TRAILER_TYPE, [])], other, impossible
+
+
+def auto_trailer_for(pieces: list) -> str:
+    """Trailer type for a truck's freight: the dry van if it all goes in one, else the
+    type best_trailer_for picks for its hardest piece."""
+    with trailer_type(DEFAULT_TRAILER_TYPE):
+        misfits = [p for p in pieces if physically_loadable(p)]
+    if not misfits:
+        return DEFAULT_TRAILER_TYPE
+    order = list(TRAILER_TYPES)
+    picks = [best_trailer_for(p) for p in misfits]
+    picks = [t for t in picks if t] or [DEFAULT_TRAILER_TYPE]
+    # The pick latest in preference order is the one the hardest piece needs
+    return max(picks, key=order.index)
 
 
 # ── Save / Load plan files ────────────────────────────────────────────────────
@@ -1424,22 +2037,15 @@ def _draw_top_plan(painter: QPainter, rect: QRectF, plan: Optional[LoadPlan],
 
     # ── Row labels + notes ───────────────────────────────────────────────
     fm_font = QFont("Arial", 7)
-    for r_pos, row in enumerate(sorted(set(sl.row for sl in plan.slots))):
-        floor = [sl for sl in plan.slots if sl.row == row and sl.tier == 0 and sl.piece
-                 and not (sl.is_center and sl.col == 1)]
-        if not floor:
-            continue
-        xs = [(box_of[sl.piece.piece_id][1], box_of[sl.piece.piece_id][4]) for sl in floor]
-        start = min(x for x, _ in xs)
-        depth = max(x + l for x, l in xs) - start
-        cy = ty + (start + depth / 2) * s
+    for r_pos, (start, end, floor) in enumerate(visual_rows(plan)):   # where crates actually sit
+        cy = ty + (start + end) / 2 * s
         painter.setFont(QFont("Arial", 7, QFont.Weight.Bold))
         painter.setPen(QColor("#444"))
         painter.drawText(QRectF(rect.x(), cy - 8 * u, LBL - 4 * u, 16 * u),
-                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"R{row + 1}")
+                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"R{r_pos + 1}")
 
         bits, weight, pids = [], 0.0, set()
-        for sl in sorted(floor, key=lambda q: q.col):
+        for sl in floor:
             top = tops.get((sl.row, sl.col))
             weight += sl.piece.weight_lbs + (top.weight_lbs if top else 0)
             pids.add(sl.piece.piece_id)
@@ -1448,11 +2054,10 @@ def _draw_top_plan(painter: QPainter, rect: QRectF, plan: Optional[LoadPlan],
                 bits.append(f"{sl.piece.crate_label} + {top.crate_label} (2-high)")
             else:
                 bits.append(sl.piece.crate_label)
-            if sl.is_center and sl.piece.placement == "alt_center":
-                y_off = box_of[sl.piece.piece_id][2]
-                bits[-1] += (" ← LEFT" if y_off < 0.5 else
-                             " RIGHT →" if y_off + box_of[sl.piece.piece_id][5] > W - 0.5
-                             else " CENTER")
+            if (sl.is_center and sl.piece.placement == "alt_center") or len(floor) == 1:
+                side = crate_side(plan, sl.piece.piece_id)
+                bits[-1] += {"left": " ← LEFT", "right": " RIGHT →",
+                             "center": " CENTER"}.get(side, "")
         sec = securement_summary([it for it in items if it["piece_id"] in pids])
         note = f"{' | '.join(bits)}  ·  {weight:,.0f} lb" + (f"  ·  {sec}" if sec else "")
         if multi:
@@ -1680,14 +2285,9 @@ def _draw_side_plan(painter: QPainter, rect: QRectF, plan: Optional[LoadPlan],
     # Row labels under the floor
     painter.setFont(QFont("Arial", 6))
     painter.setPen(QColor("#555"))
-    for row in sorted(set(sl.row for sl in plan.slots)):
-        floor = [sl for sl in plan.slots if sl.row == row and sl.tier == 0 and sl.piece]
-        if not floor:
-            continue
-        start = floor[0].row_start_in
-        depth = max(sl.piece.length_in for sl in floor)
-        painter.drawText(QRectF(ox + start * s, floor_y + 2 * u, depth * s, 12 * u),
-                         center, f"R{row + 1}")
+    for r_pos, (start, end, _floor) in enumerate(visual_rows(plan)):
+        painter.drawText(QRectF(ox + start * s, floor_y + 2 * u, (end - start) * s, 12 * u),
+                         center, f"R{r_pos + 1}")
 
 
 # ── PDF: Load Plan Floor Plan ─────────────────────────────────────────────────
@@ -1789,12 +2389,21 @@ def _draw_floor_plan(painter: QPainter, PW: int, PH: int,
             0, 0, int(PW - 2 * M), 10_000, int(Qt.TextFlag.TextWordWrap.value), not_loaded).height() + 12
     TAIL_RESERVE = 110 + NOT_LOADED_H            # space for notes at bottom
     plan_top = M + 108
+    oversize = [n.split(" — see ")[0] for n in oversize_notices(plan)]
+    if oversize:
+        painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        painter.setPen(QColor("#b9770e"))
+        text = "⚠ " + "   ·   ".join(oversize)
+        h = painter.fontMetrics().boundingRect(
+            0, 0, int(PW - 2 * M), 10_000, int(Qt.TextFlag.TextWordWrap.value), text).height() + 6
+        painter.drawText(QRectF(M, M + 100, PW - 2 * M, h),
+                         Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap, text)
+        plan_top += h
     _draw_top_plan(painter, QRectF(M, plan_top, PW - 2 * M, PH - M - TAIL_RESERVE - plan_top),
                    plan, securement, u)
 
     # ── Footer notes ───────────────────────────────────────────────────
-    rows = sorted(set(s.row for s in plan.slots))
-    n_rows = len(rows)
+    n_rows = len(visual_rows(plan))
     tail_y = PH - M - TAIL_RESERVE + 8
     if not_loaded:
         painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
@@ -1867,12 +2476,11 @@ def _draw_side_elevation(painter: QPainter, PW: int, PH: int,
 def securement_rows(plan: LoadPlan, securement: list) -> list:
     """One loader-checklist row per securement item, sorted nose to tail."""
     row_of, label_of, start_of = {}, {}, {}
-    for sl in plan.slots:
-        if sl.piece:
-            row_of[sl.piece.piece_id] = sl.row
-            label_of[sl.piece.piece_id] = sl.piece.crate_label
-            start_of[sl.piece.piece_id] = sl.row_start_in
     boxes = _crate_boxes(plan)
+    row_of = visual_row_of(plan)                       # by where crates actually sit
+    for b in boxes:
+        label_of[b[0].piece_id] = b[0].crate_label
+        start_of[b[0].piece_id] = b[1]
     face_text = {"nose": "nose face", "tail": "tail face", "left": "left side",
                  "right": "right side", "top": "over the top"}
     rows = []
@@ -2039,20 +2647,24 @@ def _draw_crate_label(painter: QPainter, PW: int, PH: int,
             | Qt.TextFlag.TextWordWrap,
             slot.piece.notes)
 
-    # Position label
-    row_num = slot.row + 1
-    if slot.is_center:
-        if slot.piece.placement == "alt_center":
-            rows_list = sorted(set(s.row for s in plan.slots))
-            r_pos = rows_list.index(slot.row) if slot.row in rows_list else slot.row
-            direction = "← Load Left" if r_pos % 2 == 0 else "Load Right →"
-            pos_str = f"{direction}   ·   Row {row_num}"
-        else:
-            pos_str = f"Full Width   ·   Row {row_num}"
+    # Position label — row and side from where the crate actually sits (hand moves included)
+    row_num = visual_row_of(plan).get(slot.piece.piece_id, slot.row) + 1
+    base = slot
+    if slot.tier == 1:
+        base = next((s for s in plan.slots if s.tier == 0 and s.piece and s.row == slot.row
+                     and s.col == slot.col), slot)
+    side = crate_side(plan, base.piece.piece_id)
+    if side == "full" or (slot.is_center and slot.piece.placement != "alt_center"
+                          and side == "center"):
+        pos_str = f"Full Width   ·   Row {row_num}"
+    elif slot.is_center and slot.piece.placement == "alt_center" and side != "center":
+        direction = "← Load Left" if side == "left" else "Load Right →"
+        pos_str = f"{direction}   ·   Row {row_num}"
+    elif side == "center":
+        pos_str = f"Centered   ·   Row {row_num}"
     else:
-        side_letter = "A" if slot.col == 0 else "B"
-        side_name   = "Left" if slot.col == 0 else "Right"
-        pos_str = f"Position {side_letter}  ({side_name})   ·   Row {row_num}"
+        side_letter = "A" if side == "left" else "B"
+        pos_str = f"Position {side_letter}  ({side.title()})   ·   Row {row_num}"
     if slot.tier == 1:
         t0_map = {(s.row, s.col): s for s in plan.slots if s.tier == 0}
         bot = t0_map.get((slot.row, slot.col))
@@ -2129,6 +2741,7 @@ def _draw_crate_label(painter: QPainter, PW: int, PH: int,
 
 # ── Live Trailer View widget ──────────────────────────────────────────────────
 SNAP_IN = 2.0      # a dragged crate snaps to a wall or neighbouring edge within this distance
+CENTRE_SNAP_IN = 4.0   # ... and to the trailer's centre line from a little further
 
 
 def _slide_footprint(fp: tuple, target: tuple, obstacles: list) -> tuple:
@@ -2174,7 +2787,8 @@ def _snap_footprint(fp: tuple, pos: tuple, obstacles: list) -> tuple:
     _x0, _y0, l, w = fp
     x, y = pos
     xs = [0.0, L - l] + [v for ox, oy, ol, ow in obstacles for v in (ox + ol, ox - l, ox)]
-    ys = [0.0, W - w] + [v for ox, oy, ol, ow in obstacles for v in (oy + ow, oy - w, oy)]
+    ys = [0.0, W - w, (W - w) / 2] + [v for ox, oy, ol, ow in obstacles   # walls, centre line
+                                      for v in (oy + ow, oy - w, oy)]
 
     def clear(cx, cy):
         return (0 <= cx <= L - l + 0.01 and 0 <= cy <= W - w + 0.01 and
@@ -2184,7 +2798,11 @@ def _snap_footprint(fp: tuple, pos: tuple, obstacles: list) -> tuple:
     if abs(best_x - x) <= SNAP_IN and clear(best_x, y):
         x = best_x
     best_y = min(ys, key=lambda v: abs(v - y))
-    if abs(best_y - y) <= SNAP_IN and clear(x, best_y):
+    centre = (W - w) / 2
+    if abs(centre - y) <= CENTRE_SNAP_IN and abs(centre - y) <= abs(best_y - y) + SNAP_IN \
+            and clear(x, centre):
+        y = centre
+    elif abs(best_y - y) <= SNAP_IN and clear(x, best_y):
         y = best_y
     return x, y
 
@@ -2520,6 +3138,58 @@ def _crate_boxes(plan: LoadPlan) -> list:
     return _slot_boxes(plan.slots)
 
 
+def visual_rows(plan: LoadPlan) -> list:
+    """
+    Floor crates grouped into rows by where they actually sit — crates moved
+    by hand included — nose to doors: [(start in, end in, [floor slots left to
+    right])]. Crates whose lengths overlap share a row; R1 is the first entry.
+    """
+    box = {b[0].piece_id: b for b in _crate_boxes(plan)}
+    floor = sorted((sl for sl in plan.slots if sl.tier == 0 and sl.piece
+                    and not (sl.is_center and sl.col == 1) and sl.piece.piece_id in box),
+                   key=lambda sl: (box[sl.piece.piece_id][1], box[sl.piece.piece_id][2]))
+    rows = []
+    for sl in floor:
+        b = box[sl.piece.piece_id]
+        if rows and b[1] < rows[-1][1] - 0.5:            # overlaps the current row
+            rows[-1][1] = max(rows[-1][1], b[1] + b[4])
+            rows[-1][2].append(sl)
+        else:
+            rows.append([b[1], b[1] + b[4], [sl]])
+    for r in rows:
+        r[2].sort(key=lambda sl: box[sl.piece.piece_id][2])
+    return [tuple(r) for r in rows]
+
+
+def visual_row_of(plan: LoadPlan) -> dict:
+    """{piece_id: row index from the nose (0 = R1)} by where crates sit; tops share their base's row."""
+    out = {}
+    for i, (_s, _e, slots) in enumerate(visual_rows(plan)):
+        for sl in slots:
+            out[sl.piece.piece_id] = i
+    for sl in plan.slots:
+        if sl.tier == 1 and sl.piece:
+            base = next((b for b in plan.slots if b.tier == 0 and b.piece and b.row == sl.row
+                         and b.col == sl.col), None)
+            if base and base.piece.piece_id in out:
+                out[sl.piece.piece_id] = out[base.piece.piece_id]
+    return out
+
+
+def crate_side(plan: LoadPlan, piece_id: int) -> str:
+    """"left" / "right" wall, "center", or "full" (wall to wall), from where the crate sits."""
+    b = next((b for b in _crate_boxes(plan) if b[0].piece_id == piece_id), None)
+    if b is None:
+        return "center"
+    W = TRAILER["interior_width_in"]
+    if b[2] < 0.5 and b[2] + b[5] > W - 0.5:
+        return "full"
+    off = b[2] + b[5] / 2 - W / 2               # crate centre vs trailer centre line
+    if abs(off) <= 3.0:
+        return "center"
+    return "left" if off < 0 else "right"
+
+
 def _slot_boxes(slots: list) -> list:
     """
     World-space boxes for every placed piece: (piece, x, y, z, l, w, h, tier).
@@ -2568,6 +3238,23 @@ def _slot_boxes(slots: list) -> list:
     return boxes
 
 
+def _layout_conflicts(slots: list) -> list:
+    """[(piece_id, other piece_id or None)] for floor crates outside the trailer
+    (other None) or overlapping another floor crate."""
+    L, W = TRAILER["interior_length_in"], TRAILER["interior_width_in"]
+    floor = [b for b in _slot_boxes(slots) if b[7] == 0]
+    out = []
+    for p, x, y, z, l, w, h, _t in floor:
+        if x < -0.01 or y < -0.01 or x + l > L + 0.01 or y + w > W + 0.01:
+            out.append((p.piece_id, None))
+    for i, a in enumerate(floor):
+        for b2 in floor[i + 1:]:
+            if (min(a[1] + a[4], b2[1] + b2[4]) - max(a[1], b2[1]) > 0.01 and
+                    min(a[2] + a[5], b2[2] + b2[5]) - max(a[2], b2[2]) > 0.01):
+                out.append((a[0].piece_id, b2[0].piece_id))
+    return out
+
+
 def _layout_problems(slots: list) -> list:
     """Floor crates outside the trailer or overlapping each other (after manual moves)."""
     L, W = TRAILER["interior_length_in"], TRAILER["interior_width_in"]
@@ -2593,9 +3280,9 @@ def _refresh_plan_metrics(plan: LoadPlan):
         plan.rig = auto_rig(loads) if loads[0][0] else default_rig()
     plan.axle_weights, violations = _calc_axle_weights(plan.slots, plan.override, plan.rig)
     if not _rear_axle_ok(plan.rig["tandem_in"]):
-        rear, lim = plan.rig["tandem_in"] + RIG["tandem_spread_in"] / 2, RIG["kpra_max_in"]
+        rear = plan.rig["tandem_in"] + RIG["tandem_spread_in"] / 2
         violations.append(f"KINGPIN TO REAR AXLE {int(rear // 12)}'{rear % 12:.0f}\" > "
-                          f"{int(lim // 12)}'{lim % 12:.0f}\" limit — slide the tandem forward")
+                          f"{kpra_text()} limit — slide the tandem forward")
     plan.stop_axles = _stop_axles(plan.slots, plan.rig)
     for delivered, steer, drive, trailer in plan.stop_axles:
         for name, val, lim in (("STEER", steer, "steer_limit"), ("DRIVE", drive, "drive_limit"),
@@ -3364,6 +4051,573 @@ class ZoomScrollArea(QScrollArea):
         return super().eventFilter(obj, event)
 
 
+# ── Route map ─────────────────────────────────────────────────────────────────
+# A Web-Mercator map drawn with QPainter: US state outlines (offline, from
+# data/us_states_boundaries.geojson) under OpenStreetMap tiles, cached on disk.
+# RouteMapView holds the maths and drawing; the stops dialog's RouteMapWidget
+# downloads tiles in the background, the PDF route-map page downloads them
+# before drawing. Follows the OSM tile usage policy: identifying User-Agent,
+# at most 2 downloads at a time, local cache, visible credit.
+OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+OSM_CREDIT = "© OpenStreetMap contributors"
+TILE_PX = 256
+TILE_MAX_AGE_S = 30 * 86400        # re-download cached tiles older than this
+TILE_MEM_LIMIT = 400               # tiles kept in memory
+MAP_MIN_ZOOM, MAP_MAX_ZOOM = 3, 18
+MAP_FIT_MAX_ZOOM = 15
+MAP_US_CENTER = (39.5, -98.35)
+ROUTE_LINE_COLORS = ["#1565c0", "#c62828", "#2e7d32", "#6a1b9a", "#ef6c00", "#00838f"]
+PDF_MAP_PX = (1150, 760)           # map image size for the PDF page (scaled to fit)
+PDF_MAP_MAX_TILES = 80
+_ROAD_PATHS: dict = {}             # route_key(points) -> [(lon, lat)] road line (this session)
+_STATE_MERC = None                 # [(bbox, [(fx, fy)])] state outlines in Mercator fractions
+
+
+def _tile_cache_dir() -> str:
+    base = (QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericCacheLocation)
+            or tempfile.gettempdir())
+    return os.path.join(base, "FreightLoader", "map_tiles")
+
+
+def _tile_path(z: int, x: int, y: int) -> str:
+    return os.path.join(_tile_cache_dir(), str(z), str(x), f"{y}.png")
+
+
+def _save_tile(key: tuple, data: bytes):
+    path = _tile_path(*key)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+    except OSError:
+        pass
+
+
+def fetch_tile_sync(z: int, x: int, y: int) -> Optional[QPixmap]:
+    """Download one map tile now (and cache it). Raises on network failure."""
+    import urllib.request
+    req = urllib.request.Request(OSM_TILE_URL.format(z=z, x=x, y=y),
+                                 headers={"User-Agent": HTTP_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = resp.read()
+    pm = QPixmap()
+    if not pm.loadFromData(data):
+        return None
+    _save_tile((z, x, y), data)
+    return pm
+
+
+def _merc(lat: float, lon: float) -> tuple:
+    """(lat, lon) -> Web-Mercator world fractions (x, y), each 0..1."""
+    lat = max(-85.0511, min(85.0511, lat))
+    s = math.sin(math.radians(lat))
+    return (lon + 180.0) / 360.0, 0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)
+
+
+def _state_outlines_merc() -> list:
+    global _STATE_MERC
+    if _STATE_MERC is None:
+        out = []
+        try:
+            for _name, parts in _state_shapes():
+                for _bbox, rings in parts:
+                    pts = [_merc(lat, lon) for lon, lat in rings[0]]
+                    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+                    out.append(((min(xs), min(ys), max(xs), max(ys)), pts))
+        except (OSError, ValueError, KeyError):
+            pass                       # no boundary file — the map just has no outlines
+        _STATE_MERC = out
+    return _STATE_MERC
+
+
+def google_maps_directions_url(points: list) -> str:
+    """Google Maps driving directions through (lat, lon) points in order (max 11 points)."""
+    import urllib.parse
+    fmt = lambda p: f"{p[0]:.6f},{p[1]:.6f}"
+    q = {"api": "1", "origin": fmt(points[0]), "destination": fmt(points[-1]),
+         "travelmode": "driving"}
+    if len(points) > 2:
+        q["waypoints"] = "|".join(fmt(p) for p in points[1:-1])
+    return "https://www.google.com/maps/dir/?" + urllib.parse.urlencode(q)
+
+
+class RouteMapView:
+    """
+    Map maths and drawing for a w×h pixel area. routes: [{"points": [(label, name,
+    lat, lon, color)] in delivery order, "path": [(lon, lat)] road line or None
+    (straight dashed lines), "color": line color}]. Pins with the same label
+    (the shared origin) are drawn once.
+    """
+
+    def __init__(self, w: int, h: int):
+        self.w, self.h = w, h
+        self.routes = []
+        self.z, self.cx, self.cy = 4, 0.0, 0.0   # zoom, world pixel at the centre
+        self.tiles = {}             # (z, x, y) -> QPixmap
+        self.stale = set()          # disk tiles older than TILE_MAX_AGE_S
+        self.center_on(*MAP_US_CENTER, 4)
+
+    def world(self, z=None) -> float:
+        return TILE_PX * (2 ** (self.z if z is None else z))
+
+    def center_on(self, lat, lon, z):
+        self.z = z
+        fx, fy = _merc(lat, lon)
+        self.cx, self.cy = fx * self.world(), fy * self.world()
+
+    def screen(self, fx, fy) -> QPointF:
+        w = self.world()
+        return QPointF(fx * w - self.cx + self.w / 2, fy * w - self.cy + self.h / 2)
+
+    def clamp(self):
+        w = self.world()
+        self.cx = max(0.0, min(w, self.cx))
+        self.cy = max(0.0, min(w, self.cy))
+
+    def pins(self) -> list:
+        seen, out = set(), []
+        for r in self.routes:
+            for pt in r["points"]:
+                if pt[0] not in seen:
+                    seen.add(pt[0])
+                    out.append(pt)
+        return out
+
+    def fit(self, margin: int = 35):
+        """Zoom and centre so every pin is visible."""
+        pins = self.pins()
+        pts = [_merc(p[2], p[3]) for p in pins]
+        if not pts:
+            self.center_on(*MAP_US_CENTER, 4)
+        elif len(pts) == 1:
+            self.center_on(pins[0][2], pins[0][3], 12)
+        else:
+            x0, x1 = min(p[0] for p in pts), max(p[0] for p in pts)
+            y0, y1 = min(p[1] for p in pts), max(p[1] for p in pts)
+            aw, ah = max(self.w - 2 * margin, 100), max(self.h - 2 * margin, 100)
+            z = MAP_FIT_MAX_ZOOM
+            while z > MAP_MIN_ZOOM and ((x1 - x0) * self.world(z) > aw or
+                                        (y1 - y0) * self.world(z) > ah):
+                z -= 1
+            self.z = z
+            self.cx, self.cy = (x0 + x1) / 2 * self.world(), (y0 + y1) / 2 * self.world()
+
+    def zoom_at(self, step: int, px: float, py: float) -> bool:
+        """Zoom one level in/out keeping the point under (px, py) still."""
+        nz = max(MAP_MIN_ZOOM, min(MAP_MAX_ZOOM, self.z + step))
+        if nz == self.z:
+            return False
+        dx, dy = px - self.w / 2, py - self.h / 2
+        scale = 2 ** (nz - self.z)
+        self.cx, self.cy = (self.cx + dx) * scale - dx, (self.cy + dy) * scale - dy
+        self.z = nz
+        self.clamp()
+        return True
+
+    # ── tiles ────────────────────────────────────────────────────────────
+    def visible_tiles(self) -> list:
+        n = 2 ** self.z
+        tx0 = max(0, int((self.cx - self.w / 2) // TILE_PX))
+        tx1 = min(n - 1, int((self.cx + self.w / 2) // TILE_PX))
+        ty0 = max(0, int((self.cy - self.h / 2) // TILE_PX))
+        ty1 = min(n - 1, int((self.cy + self.h / 2) // TILE_PX))
+        return [(self.z, tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
+
+    def tile(self, key: tuple) -> Optional[QPixmap]:
+        """Tile from memory or the disk cache, or None."""
+        pm = self.tiles.get(key)
+        if pm is not None:
+            return pm
+        path = _tile_path(*key)
+        if not os.path.exists(path):
+            return None
+        pm = QPixmap(path)
+        if pm.isNull():
+            return None
+        self.remember(key, pm)
+        try:
+            if time.time() - os.path.getmtime(path) > TILE_MAX_AGE_S:
+                self.stale.add(key)
+        except OSError:
+            pass
+        return pm
+
+    def remember(self, key: tuple, pm: QPixmap):
+        self.tiles[key] = pm
+        if len(self.tiles) > TILE_MEM_LIMIT:
+            for k in list(self.tiles)[:TILE_MEM_LIMIT // 4]:
+                del self.tiles[k]
+
+    # ── drawing ──────────────────────────────────────────────────────────
+    def paint(self, p: QPainter, pin_scale: float = 1.0) -> list:
+        """Draw the map into (0, 0, w, h). Returns the visible tiles that are missing."""
+        p.save()
+        p.setClipRect(QRectF(0, 0, self.w, self.h))
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.fillRect(QRectF(0, 0, self.w, self.h), QColor("#dfe8ec"))
+        self._paint_states(p)
+        missing = self._paint_tiles(p)
+        for r in self.routes:
+            self._paint_route(p, r, pin_scale)
+        self._paint_pins(p, pin_scale)
+        p.restore()
+        return missing
+
+    def _paint_states(self, p):
+        w = self.world()
+        vx0, vx1 = (self.cx - self.w / 2) / w, (self.cx + self.w / 2) / w
+        vy0, vy1 = (self.cy - self.h / 2) / w, (self.cy + self.h / 2) / w
+        p.setPen(QPen(QColor("#9fadb3"), 1))
+        p.setBrush(QColor("#f6f5ef"))
+        for (x0, y0, x1, y1), pts in _state_outlines_merc():
+            if x1 < vx0 or x0 > vx1 or y1 < vy0 or y0 > vy1:
+                continue
+            p.drawPolygon(QPolygonF([self.screen(fx, fy) for fx, fy in pts]))
+
+    def _paint_tiles(self, p) -> list:
+        missing = []
+        for key in self.visible_tiles():
+            z, tx, ty = key
+            rect = QRectF(tx * TILE_PX - self.cx + self.w / 2, ty * TILE_PX - self.cy + self.h / 2,
+                          TILE_PX, TILE_PX)
+            pm = self.tile(key)
+            if pm is not None:
+                p.drawPixmap(rect, pm, QRectF(pm.rect()))
+                continue
+            missing.append(key)
+            for d in range(1, 5):            # stretch a lower-zoom tile meanwhile
+                pz = z - d
+                if pz < 0:
+                    break
+                ppm = self.tiles.get((pz, tx >> d, ty >> d))
+                if ppm is not None:
+                    sub = ppm.width() / (2 ** d)
+                    src = QRectF((tx - ((tx >> d) << d)) * sub,
+                                 (ty - ((ty >> d) << d)) * sub, sub, sub)
+                    p.drawPixmap(rect, ppm, src)
+                    break
+        return missing
+
+    def _paint_route(self, p, route, s):
+        pts = route["points"]
+        if len(pts) < 2:
+            return
+        color = QColor(route.get("color") or ROUTE_LINE_COLORS[0])
+        if route.get("path"):
+            line = QPolygonF([self.screen(*_merc(lat, lon)) for lon, lat in route["path"]])
+            for pen_color, width in ((QColor("white"), 7 * s), (color, 4 * s)):
+                p.setPen(QPen(pen_color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                              Qt.PenJoinStyle.RoundJoin))
+                p.drawPolyline(line)
+        else:
+            line = QPolygonF([self.screen(*_merc(pt[2], pt[3])) for pt in pts])
+            p.setPen(QPen(QColor("white"), 6 * s))
+            p.drawPolyline(line)
+            p.setPen(QPen(color, 3 * s, Qt.PenStyle.DashLine))
+            p.drawPolyline(line)
+
+    def _paint_pins(self, p, s):
+        f = QFont("Arial")
+        f.setPixelSize(max(8, round(10 * s)))
+        f.setBold(True)
+        p.setFont(f)
+        rad = 12 * s
+        for label, _name, lat, lon, color in reversed(self.pins()):   # origin drawn on top
+            c = self.screen(*_merc(lat, lon))
+            r = QRectF(c.x() - rad, c.y() - rad, 2 * rad, 2 * rad)
+            p.setPen(QPen(QColor("white"), 2 * s))
+            p.setBrush(QColor(color))
+            if label == "O":
+                p.drawRoundedRect(r, 4 * s, 4 * s)
+            else:
+                p.drawEllipse(r)
+            p.setPen(QColor("white"))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, label)
+
+    def paint_label(self, p, text: str, corner: str, px: int = 11):
+        """Small white box with text in a corner: tl / tr / bl / br."""
+        f = QFont("Arial")
+        f.setPixelSize(px)
+        p.setFont(f)
+        fm = QFontMetrics(f)
+        w, h = fm.horizontalAdvance(text) + 10, fm.height() + 4
+        x = 4 if corner in ("tl", "bl") else self.w - w - 4
+        y = 4 if corner in ("tl", "tr") else self.h - h - 4
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 215))
+        p.drawRect(QRectF(x, y, w, h))
+        p.setPen(QColor("#333"))
+        p.drawText(QRectF(x, y, w, h), Qt.AlignmentFlag.AlignCenter, text)
+
+
+class RouteMapWidget(QWidget):
+    """
+    Pan/zoom map of the stops dialog's delivery route: pins for the origin and
+    stops, joined by the road route (fetched from OSRM when road distances are
+    on) or straight dashed lines. Scroll zooms, drag pans, double-click fits.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(240)
+        self.setMouseTracking(True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.view = RouteMapView(self.width(), self.height())
+        self.route_note = ""        # status of the road-route lookup
+        self.tile_note = ""         # status of tile downloads
+        self._fit_key = None
+        self._user_moved = False
+        self._drag = None
+        self._queue, self._pending, self._active = [], set(), 0
+        self._refreshed = set()     # stale disk tiles already queued for re-download
+        self._offline_until = 0.0
+        self._road_reply, self._road_fetch_key, self._route_key = None, None, None
+        self._net = QNetworkAccessManager(self)
+
+    @property
+    def points(self) -> list:
+        return self.view.routes[0]["points"] if self.view.routes else []
+
+    def fit(self):
+        self._user_moved = False
+        self.view.w, self.view.h = self.width(), self.height()
+        self.view.fit()
+        self.update()
+
+    def set_route(self, points: list, want_road: bool):
+        """points: [(label, name, lat, lon, color)] in delivery order, origin first."""
+        key = route_key([(p[2], p[3]) for p in points])
+        self.view.routes = [{"points": list(points), "path": None, "color": ROUTE_LINE_COLORS[0]}]
+        self._route_key = key
+        self.route_note = ""
+        if want_road and len(points) >= 2:
+            if key in _ROAD_PATHS:
+                self.view.routes[0]["path"] = _ROAD_PATHS[key]
+            else:
+                self._fetch_road(key)
+        if key != self._fit_key:
+            self._fit_key = key
+            self.fit()
+        self.update()
+
+    # ── road line (OSRM, async) ──────────────────────────────────────────
+    def _fetch_road(self, key):
+        self.route_note = "Fetching road route…"
+        if self._road_reply is not None:
+            if self._road_fetch_key == key:
+                return                   # already fetching this route
+            old, self._road_reply = self._road_reply, None
+            old.abort()
+        coords = ";".join(f"{p[3]:.6f},{p[2]:.6f}" for p in self.points)
+        req = QNetworkRequest(QUrl(OSRM_ROUTE_URL + coords +
+                                   "?overview=full&geometries=geojson&steps=false"))
+        req.setRawHeader(b"User-Agent", HTTP_USER_AGENT.encode())
+        req.setTransferTimeout(60000)
+        reply = self._net.get(req)
+        self._road_reply, self._road_fetch_key = reply, key
+        reply.finished.connect(lambda r=reply, k=key: self._road_done(r, k))
+
+    def _road_done(self, reply, key):
+        reply.deleteLater()
+        if reply is not self._road_reply:
+            return                       # superseded by a newer route
+        self._road_reply = None
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                raise RuntimeError(reply.errorString())
+            data = json.loads(bytes(reply.readAll()).decode("utf-8"))
+            if data.get("code") != "Ok" or not data.get("routes"):
+                raise RuntimeError(data.get("message", "no route found"))
+            path = [tuple(pt) for pt in data["routes"][0]["geometry"]["coordinates"]]
+        except Exception:
+            self.route_note = "Road route unavailable — showing straight lines"
+        else:
+            _ROAD_PATHS[key] = path
+            self.route_note = ""
+            if key == self._route_key and self.view.routes:
+                self.view.routes[0]["path"] = path
+        self.update()
+
+    # ── tiles (async) ────────────────────────────────────────────────────
+    def _pump(self):
+        if time.time() < self._offline_until:
+            return
+        while self._active < 2 and self._queue:
+            key = self._queue.pop(0)
+            if key in self._pending:
+                continue
+            z, x, y = key
+            req = QNetworkRequest(QUrl(OSM_TILE_URL.format(z=z, x=x, y=y)))
+            req.setRawHeader(b"User-Agent", HTTP_USER_AGENT.encode())
+            req.setTransferTimeout(15000)
+            reply = self._net.get(req)
+            self._pending.add(key)
+            self._active += 1
+            reply.finished.connect(lambda r=reply, k=key: self._tile_done(r, k))
+
+    def _tile_done(self, reply, key):
+        reply.deleteLater()
+        self._active -= 1
+        self._pending.discard(key)
+        err = reply.error()
+        if err == QNetworkReply.NetworkError.OperationCanceledError:
+            return
+        if err != QNetworkReply.NetworkError.NoError:
+            if err != QNetworkReply.NetworkError.ContentNotFoundError:
+                self._offline_until = time.time() + 30
+                self.tile_note = "Map tiles unavailable (offline?) — showing state outlines"
+                QTimer.singleShot(31000, self.update)    # try again later
+                self.update()
+            return
+        data = bytes(reply.readAll())
+        pm = QPixmap()
+        if not pm.loadFromData(data):
+            return
+        self.tile_note = ""
+        self.view.remember(key, pm)
+        self.view.stale.discard(key)
+        _save_tile(key, data)
+        self.update()
+
+    # ── painting ─────────────────────────────────────────────────────────
+    def paintEvent(self, event):
+        self.view.w, self.view.h = self.width(), self.height()
+        p = QPainter(self)
+        missing = self.view.paint(p)
+        stale = [k for k in self.view.stale if k not in self._refreshed]
+        self._refreshed.update(stale)
+        self._queue = missing + stale
+        if self._queue:
+            QTimer.singleShot(0, self._pump)
+        self.view.paint_label(p, OSM_CREDIT, "br")
+        self.view.paint_label(p, "Scroll to zoom · drag to pan · double-click to fit", "bl")
+        note = " · ".join(t for t in (self.route_note, self.tile_note) if t)
+        if not self.points:
+            note = note or "Locate the origin and stops to see the route"
+        elif len(self.points) >= 2 and not self.view.routes[0]["path"] and not self.route_note:
+            note = "Straight lines — turn on road distances for the road route"
+        if note:
+            self.view.paint_label(p, note, "tl")
+        p.end()
+
+    # ── interaction ──────────────────────────────────────────────────────
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self._user_moved:
+            self.fit()
+
+    def wheelEvent(self, event):
+        pos = event.position()
+        if self.view.zoom_at(1 if event.angleDelta().y() > 0 else -1, pos.x(), pos.y()):
+            self._user_moved = True
+            self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        if self._drag is not None:
+            self.view.cx -= pos.x() - self._drag.x()
+            self.view.cy -= pos.y() - self._drag.y()
+            self._drag = pos
+            self._user_moved = True
+            self.view.clamp()
+            self.update()
+            return
+        for label, name, lat, lon, _c in self.view.pins():
+            c = self.view.screen(*_merc(lat, lon))
+            if abs(c.x() - pos.x()) <= 12 and abs(c.y() - pos.y()) <= 12:
+                QToolTip.showText(event.globalPosition().toPoint(),
+                                  f"{'Origin' if label == 'O' else label}: {name}", self)
+                return
+        QToolTip.hideText()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag = None
+            self.unsetCursor()
+
+    def mouseDoubleClickEvent(self, event):
+        self.fit()
+
+
+# ── PDF: route map page ───────────────────────────────────────────────────────
+def render_route_map_image(routes: list, w: int = PDF_MAP_PX[0], h: int = PDF_MAP_PX[1]):
+    """
+    (QImage, note) of the routes, downloading missing tiles first (online).
+    Offline, missing tiles are left as the state-outline base map.
+    """
+    view = RouteMapView(w, h)
+    view.routes = routes
+    view.fit(margin=45)
+    note = ""
+    todo = [k for k in view.visible_tiles() if view.tile(k) is None][:PDF_MAP_MAX_TILES]
+    for key in todo:
+        try:
+            pm = fetch_tile_sync(*key)
+        except Exception:
+            note = "Map tiles unavailable (offline) — state outlines only"
+            break
+        if pm is not None:
+            view.remember(key, pm)
+    from PyQt6.QtGui import QImage
+    img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(QColor("white"))
+    p = QPainter(img)
+    view.paint(p)
+    view.paint_label(p, OSM_CREDIT, "br", 12)
+    if note:
+        view.paint_label(p, note, "tl", 12)
+    p.end()
+    return img, note
+
+
+def _draw_route_map_page(painter: QPainter, PW: int, PH: int, routes: list,
+                         legend: list, info: ShipmentInfo):
+    """
+    One landscape page: the map image, then a legend line per truck.
+    legend: [(line color, text)].
+    """
+    M = 72
+    painter.setPen(QColor("#111"))
+    painter.setFont(QFont("Arial", 20, QFont.Weight.Bold))
+    painter.drawText(QRectF(M, M, PW - 2 * M, 44),
+                     Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, "Route Map")
+    hdr = "  |  ".join(part for part in [info.customer or info.shipment_name, info.date] if part)
+    if hdr:
+        painter.setFont(QFont("Arial", 10))
+        painter.setPen(QColor("#555"))
+        painter.drawText(QRectF(M, M + 44, PW - 2 * M, 24),
+                         Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, hdr)
+    line_h = 30
+    top = M + 78
+    legend_h = line_h * len(legend) + 10
+    box = QRectF(M, top, PW - 2 * M, PH - top - M - legend_h)
+    img, _note = render_route_map_image(routes)
+    scale = min(box.width() / img.width(), box.height() / img.height())
+    dst = QRectF(box.x() + (box.width() - img.width() * scale) / 2, box.y(),
+                 img.width() * scale, img.height() * scale)
+    painter.drawImage(dst, img)
+    painter.setPen(QPen(QColor("#999"), 1))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawRect(dst)
+    painter.setFont(QFont("Arial", 10))
+    y = dst.bottom() + 12
+    for color, text in legend:
+        painter.setPen(QPen(QColor(color), 6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QPointF(dst.x() + 4, y + line_h / 2), QPointF(dst.x() + 44, y + line_h / 2))
+        painter.setPen(QColor("#222"))
+        text = painter.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight,
+                                                int(dst.width() - 56))
+        painter.drawText(QRectF(dst.x() + 56, y, dst.width() - 56, line_h),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+        y += line_h
+
+
 # ── Delivery stops editor ─────────────────────────────────────────────────────
 class StopsDialog(QDialog):
     """
@@ -3376,7 +4630,7 @@ class StopsDialog(QDialog):
                  parent=None):
         super().__init__(parent)
         self.setWindowTitle("Delivery Stops & Route")
-        self.resize(900, 560)
+        self.resize(960, 860)
         self.origin = dict(origin)
         self.stops = [dict(st) for st in stops]
         self.road = road
@@ -3412,7 +4666,10 @@ class StopsDialog(QDialog):
             self.table.setItem(r, 3, loc)
             self._show_location(r)
         self.table.itemChanged.connect(self._cell_changed)
-        lay.addWidget(self.table)
+        top = QWidget()
+        top_lay = QVBoxLayout(top)
+        top_lay.setContentsMargins(0, 0, 0, 0)
+        top_lay.addWidget(self.table)
 
         row = QHBoxLayout()
         btn_locate = QPushButton("Locate")
@@ -3423,17 +4680,32 @@ class StopsDialog(QDialog):
         self.chk_road.toggled.connect(self._road_toggled)
         btn_road = QPushButton("Fetch Road Distances")
         btn_road.clicked.connect(self._fetch_road)
+        self.btn_gmaps = QPushButton("Open in Google Maps")
+        self.btn_gmaps.setToolTip("Open this route as driving directions in your web browser.\n"
+                                  "Google routes for cars — it doesn't know truck restrictions.")
+        self.btn_gmaps.clicked.connect(self._open_google_maps)
         row.addWidget(btn_locate)
         row.addSpacing(16)
         row.addWidget(self.chk_road)
         row.addWidget(btn_road)
         row.addStretch()
-        lay.addLayout(row)
+        row.addWidget(self.btn_gmaps)
+        top_lay.addLayout(row)
 
         self.lbl_route = QLabel()
         self.lbl_route.setWordWrap(True)
         self.lbl_route.setStyleSheet("background:#f4f8f7; border:1px solid #cfe3df; padding:6px;")
-        lay.addWidget(self.lbl_route)
+        top_lay.addWidget(self.lbl_route)
+
+        self.map = RouteMapWidget()
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.addWidget(top)
+        split.addWidget(self.map)
+        split.setChildrenCollapsible(False)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([440, 360])
+        lay.addWidget(split, 1)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                 QDialogButtonBox.StandardButton.Cancel)
@@ -3450,7 +4722,10 @@ class StopsDialog(QDialog):
     def _show_location(self, r: int, status: str = ""):
         d = self._entry(r)
         item = self.table.item(r, 3)
-        if d.get("lat") is not None:
+        if d.get("lat") is not None and d.get("display", "").startswith(APPROX_PREFIX):
+            item.setText(f"≈ {d['lat']:.5f}, {d['lon']:.5f} (ZIP area only)")
+            item.setForeground(QColor("#b9770e"))
+        elif d.get("lat") is not None:
             item.setText(f"✓ {d['lat']:.5f}, {d['lon']:.5f}")
             item.setForeground(QColor("#1e7b34"))
         elif d.get("location"):
@@ -3496,9 +4771,11 @@ class StopsDialog(QDialog):
                 if st.get("name") or st.get("location")]
         if not used:
             self.lbl_route.setText("<i>No stops entered yet.</i>")
+            self._update_map([])
             return
         dist = self._dist()
         order = route_order(used, coords, dist)
+        self._update_map(order)
         parts, total, prev = [], 0.0, "origin" if "origin" in coords else None
         for sid in order:
             nm = self.stops[sid - 1].get("name") or f"Stop S{sid}"
@@ -3517,26 +4794,43 @@ class StopsDialog(QDialog):
         self.lbl_route.setText(f"<b>Delivery route</b> ({basis}, ≈{total:,.0f} mi):<br>"
                                f"{head}{' → '.join(parts)}{tail}")
 
+    def _update_map(self, order: list):
+        """Show the located origin and stops on the map, in delivery order."""
+        coords = self._coords()
+        pts = []
+        if "origin" in coords:
+            pts.append(("O", self.origin.get("name") or "Origin", *coords["origin"],
+                        TEAL_DARK.name()))
+        for sid in order:
+            if sid in coords:
+                pts.append((f"S{sid}", self.stops[sid - 1].get("name") or f"Stop S{sid}",
+                            *coords[sid], STOP_COLORS[(sid - 1) % len(STOP_COLORS)]))
+        self.map.set_route(pts, self.chk_road.isChecked() and self.road is not None)
+        self.btn_gmaps.setEnabled(len(pts) >= 2)
+
     # ── actions ──────────────────────────────────────────────────────────
+    def _open_google_maps(self):
+        pts = [(p[2], p[3]) for p in self.map.points]
+        if len(pts) >= 2:
+            QDesktopServices.openUrl(QUrl(google_maps_directions_url(pts)))
+
     def _locate_all(self):
         todo = [r for r in range(MAX_STOPS + 1)
                 if self._entry(r).get("location") and self._entry(r).get("lat") is None]
         if not todo:
             self._update_route()
             return
-        failures = []
+        failures, approx = [], []
         self.setCursor(Qt.CursorShape.WaitCursor)
         try:
-            for k, r in enumerate(todo):
+            for r in todo:
                 d = self._entry(r)
                 self._loading = True
                 self.table.item(r, 3).setText("looking up…")
                 self._loading = False
                 QApplication.processEvents()
                 try:
-                    if k:
-                        time.sleep(1.1)           # OpenStreetMap usage policy: ≤ 1 request/sec
-                    hit = geocode_address(d["location"])
+                    hit = geocode_address(d["location"])    # rate-limits itself
                 except Exception as e:
                     hit, err = None, str(e)
                 else:
@@ -3545,6 +4839,8 @@ class StopsDialog(QDialog):
                 if hit:
                     d["lat"], d["lon"], d["display"] = hit
                     self._show_location(r)
+                    if hit[2].startswith(APPROX_PREFIX):
+                        approx.append(self.table.item(r, 0).text())
                 else:
                     self._show_location(r, f"⚠ {err}")
                     failures.append(f"{self.table.item(r, 0).text()}: {err}")
@@ -3553,10 +4849,16 @@ class StopsDialog(QDialog):
             self.unsetCursor()
         self.road = None
         self._update_route()
+        msgs = []
         if failures:
-            QMessageBox.warning(self, "Locate", "Some locations couldn't be found:\n\n" +
-                                "\n".join(failures) +
-                                "\n\nCheck the address, or enter GPS coordinates instead.")
+            msgs.append("Some locations couldn't be found:\n\n" + "\n".join(failures) +
+                        "\n\nCheck the address, or enter GPS coordinates instead.")
+        if approx:
+            msgs.append("Only the ZIP code could be found for: " + ", ".join(approx) +
+                        ". The pin is at the centre of the ZIP code area, so distances are "
+                        "approximate. Enter GPS coordinates for an exact location.")
+        if msgs:
+            QMessageBox.warning(self, "Locate", "\n\n".join(msgs))
 
     def _road_toggled(self, on: bool):
         if on and not self.road:
@@ -3603,6 +4905,172 @@ def shipment_distance_fn(coords: dict, use_road: bool, road: Optional[dict]):
             return table[(str(a), str(b))]
         return straight_miles(coords[a], coords[b])
     return dist
+
+
+# ── Route & permits report ────────────────────────────────────────────────────
+ROUTE_STATUS = {   # status -> (badge text, color)
+    "legal":   ("✓ Legal in every state on the route — no permit needed", "#1e7b34"),
+    "permit":  ("⚠ Oversize / overweight permit needed", "#b9770e"),
+    "over":    ("✖ Beyond every known permit tier — superload / route survey", "#c0392b"),
+    "unknown": ("? No state data for this route", "#555555"),
+}
+
+
+def plan_envelope(plan: LoadPlan) -> dict:
+    """Overall width / height / trailer length (in) and gross (lb) of the loaded rig
+    on the active trailer — an open deck's size is set by its freight."""
+    gross = (plan.axle_weights or {}).get("gross")
+    out = {"name": TRAILER["name"], "width_in": TRAILER["exterior_width_in"],
+           "height_in": TRAILER["exterior_height_in"], "length_in": TRAILER["length_in"],
+           "weight_lbs": gross or None}
+    if TRAILER.get("retracted_length_in") is not None:   # extendable: only as long as needed
+        out["length_in"] = max(TRAILER["retracted_length_in"],
+                               math.ceil(plan.total_length_used_in or 0))
+    if not TRAILER["enclosed"]:
+        stacks: dict = {}
+        for s in plan.slots:
+            if s.piece:
+                stacks[(s.row, s.col)] = stacks.get((s.row, s.col), 0) + s.piece.height_in
+        widest = max((s.piece.width_in for s in plan.slots if s.piece), default=0)
+        out["width_in"] = max(LEGAL_WIDTH_IN, widest)
+        out["height_in"] = TRAILER["deck_height_in"] + max(stacks.values(), default=0)
+    return out
+
+
+def oversize_notices(plan: LoadPlan) -> list:
+    """Plain-language oversize / overweight warnings for a plan on the active trailer."""
+    env = plan_envelope(plan)
+    see = " — see Route & Permits… for each state on the route."
+    out = []
+    if env["width_in"] > LEGAL_WIDTH_IN:
+        out.append(f"Oversize width {_dim_text('width_in', env['width_in'])} "
+                   f"(legal 8'6\") — oversize permit needed{see}")
+    if env["height_in"] > LEGAL_HEIGHT_IN:
+        out.append(f"Oversize height {_dim_text('height_in', env['height_in'])} from the road "
+                   f"(legal 13'6\" in many states, 14' in some) — permit likely needed{see}")
+    if env["length_in"] > LEGAL_TRAILER_IN:
+        out.append(f"Trailer extended to {_dim_text('length_in', env['length_in'])} "
+                   f"(over 53') — length permit needed{see}")
+    if env["weight_lbs"] and env["weight_lbs"] > TRAILER["gross_limit"]:
+        out.append(f"Overweight: {env['weight_lbs']:,.0f} lb gross (legal "
+                   f"{TRAILER['gross_limit']:,} lb) — overweight permit needed{see}")
+    return out
+
+
+def route_vehicle(plan: LoadPlan) -> dict:
+    """The rig's overall size and gross weight on the plan's own trailer, for state checks."""
+    with trailer_type(getattr(plan, "trailer_id", None)):
+        return plan_envelope(plan)
+
+
+def route_report_html(trucks: list) -> str:
+    """
+    trucks: [{"label", "stops": [(tag, name)] origin first, "route": cached
+    route or None, "vehicle", "problem": why there's no route}].
+    """
+    html = []
+    for t in trucks:
+        r = t.get("route")
+        head = t["label"] or "Truck"
+        if r:
+            head += (f" — {r['miles']:,.0f} mi · {r['hours']:.1f} h driving · "
+                     f"~{transit_days(r['hours'])} day(s)")
+        html.append(f"<h3 style='color:#1f4e79; margin-bottom:2px'>{head}</h3>")
+        if t.get("problem") or not r:
+            html.append(f"<p style='color:#b03a2e'>{t.get('problem') or 'Route not looked up yet.'}</p>")
+        if not r:
+            continue
+
+        # Stops with leg / cumulative miles and the driving day each is reached
+        html.append("<table cellspacing='0' cellpadding='3' border='1' "
+                    "style='border-collapse:collapse; border-color:#ccc'>"
+                    "<tr style='background:#e8f3f1'><th align='left'>Stop</th>"
+                    "<th align='right'>Leg mi</th><th align='right'>Total mi</th>"
+                    "<th align='right'>Drive h</th><th align='right'>Day</th></tr>")
+        tag, name = t["stops"][0]
+        html.append(f"<tr><td><b>{tag}</b> {name}</td><td></td><td></td><td></td><td></td></tr>")
+        cum_mi = cum_h = 0.0
+        for (tag, name), leg_mi, leg_h in zip(t["stops"][1:], r["leg_miles"], r["leg_hours"]):
+            cum_mi += leg_mi
+            cum_h += leg_h
+            html.append(f"<tr><td><b>{tag}</b> {name}</td><td align='right'>{leg_mi:,.0f}</td>"
+                        f"<td align='right'>{cum_mi:,.0f}</td><td align='right'>{cum_h:.1f}</td>"
+                        f"<td align='right'>{transit_days(cum_h)}</td></tr>")
+        html.append("</table>")
+
+        states = r.get("states", [])
+        result = check_route_compliance(t["vehicle"], states)
+        regs = state_regulations()
+        abbrs = [regs[s]["stateAbbr"] if s in regs else s for s in states]
+        html.append(f"<p><b>States crossed ({len(states)}):</b> {' → '.join(abbrs) or '—'}</p>")
+        if "California" in states:
+            html.append("<p style='color:#7a5c12'>California is on this route: the trailer's "
+                        "kingpin-to-rear-axle distance is held to California's 40' limit.</p>")
+        v = t["vehicle"]
+        rig = (f"{v.get('name', TRAILER['name'])} · {_dim_text('width_in', v['width_in'])} wide · "
+               f"{_dim_text('height_in', v['height_in'])} high · "
+               f"{_dim_text('length_in', v['length_in'])} trailer")
+        if v.get("weight_lbs"):
+            rig += f" · {v['weight_lbs']:,.0f} lb gross"
+        html.append(f"<p style='color:#555'>Checked: {rig}</p>")
+        badge, color = ROUTE_STATUS[result["status"]]
+        html.append(f"<p style='color:{color}'><b>{badge}</b></p>")
+        flagged = [s for s in result["states"] if s["issues"]]
+        if flagged:
+            html.append("<ul>")
+            for s in flagged:
+                html.append(f"<li><b>{s['state']}</b>: {'; '.join(s['issues'])}"
+                            f"<br><span style='color:#777; font-size:small'>{s['notes']}"
+                            f" Source: {s['source']}</span></li>")
+            html.append("</ul>")
+        if result["missing"]:
+            html.append(f"<p style='color:#b03a2e'>No state data for: "
+                        f"{', '.join(result['missing'])}</p>")
+    html.append(f"<p style='color:#7a5c12; font-size:small'><b>{STATE_DATA_WARNING}</b><br>"
+                f"{TRANSIT_CAVEAT}</p>")
+    return "".join(html)
+
+
+class RoutePermitsDialog(QDialog):
+    """Each truck's road route, states crossed, state limits and transit time."""
+
+    def __init__(self, app: "FreightLoaderApp"):
+        super().__init__(app)
+        self.app = app
+        self.setWindowTitle("Route & Permits")
+        self.resize(820, 640)
+        lay = QVBoxLayout(self)
+        self.view = QTextBrowser()
+        self.view.setOpenExternalLinks(False)
+        lay.addWidget(self.view)
+        row = QHBoxLayout()
+        btn_refresh = QPushButton("Look Up Routes Again")
+        btn_refresh.setToolTip("Fetch every truck's route again from the online routing server")
+        btn_refresh.clicked.connect(lambda: self._fetch(force=True))
+        row.addWidget(btn_refresh)
+        row.addStretch()
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        row.addWidget(btn_close)
+        lay.addLayout(row)
+        self.view.setHtml(route_report_html(self.app._route_rows()))
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if any(r["route"] is None and r["points"] for r in self.app._route_rows()):
+            QApplication.processEvents()
+            self._fetch(force=False)
+
+    def _fetch(self, force: bool):
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            errors = self.app._fetch_routes(force)
+        finally:
+            self.unsetCursor()
+        self.view.setHtml(route_report_html(self.app._route_rows()))
+        if errors:
+            QMessageBox.warning(self, "Route & Permits",
+                                "Couldn't look up some routes (are you online?):\n\n" + "\n".join(errors))
 
 
 # ── Ship-separately list ──────────────────────────────────────────────────────
@@ -3656,11 +5124,14 @@ class ShipSeparatelyDialog(QDialog):
 
 # ── PDF: whole shipment ───────────────────────────────────────────────────────
 def export_shipment_pdf(entries: list, path: str, securement: list = None,
-                        include_3d: bool = False, ship_other: list = None):
+                        include_3d: bool = False, ship_other: list = None,
+                        route_html: str = "", route_map: tuple = None):
     """
     entries: [(plan, info)] one per truck. Each truck gets its floor plan, a side
-    elevation page when stacked/secured, and optionally the 3D page; a final
-    page lists pieces shipping separately.
+    elevation page when stacked/secured, and optionally the 3D page; then a
+    page lists pieces shipping separately, the route map page (route_map =
+    (routes, legend) for _draw_route_map_page) and the route & permits report
+    (route_html, when routes have been looked up) follow.
     """
     writer = _pdf_writer(path)
     painter = QPainter(writer)
@@ -3675,23 +5146,55 @@ def export_shipment_pdf(entries: list, path: str, securement: list = None,
         first = False
 
     for plan, info in entries:
-        ids = {s.piece.piece_id for s in plan.slots if s.piece}
-        sec = [it for it in (securement or []) if it["piece_id"] in ids]
-        boxes = _crate_boxes(plan)   # leave out items that don't fit this layout (hidden on screen)
-        sec = [it for it in sec if not securement_parts(it, boxes, sec)[1]]
-        new_page(QPageLayout.Orientation.Portrait)
-        _draw_floor_plan(painter, writer.width(), writer.height(), plan, info, sec)
-        if sec or any(s.tier == 1 for s in plan.slots if s.piece):
-            new_page(QPageLayout.Orientation.Landscape)
-            _draw_side_elevation(painter, writer.width(), writer.height(), plan, info, sec)
-        if include_3d:
-            new_page(QPageLayout.Orientation.Landscape)
-            _draw_3d_page(painter, writer.width(), writer.height(), plan, info, sec)
+        with trailer_type(getattr(plan, "trailer_id", None)):
+            ids = {s.piece.piece_id for s in plan.slots if s.piece}
+            sec = [it for it in (securement or []) if it["piece_id"] in ids]
+            boxes = _crate_boxes(plan)   # leave out items that don't fit this layout (hidden on screen)
+            sec = [it for it in sec if not securement_parts(it, boxes, sec)[1]]
+            new_page(QPageLayout.Orientation.Portrait)
+            _draw_floor_plan(painter, writer.width(), writer.height(), plan, info, sec)
+            if sec or any(s.tier == 1 for s in plan.slots if s.piece):
+                new_page(QPageLayout.Orientation.Landscape)
+                _draw_side_elevation(painter, writer.width(), writer.height(), plan, info, sec)
+            if include_3d:
+                new_page(QPageLayout.Orientation.Landscape)
+                _draw_3d_page(painter, writer.width(), writer.height(), plan, info, sec)
     if ship_other:
         new_page(QPageLayout.Orientation.Portrait)
         _draw_ship_other_page(painter, writer.width(), writer.height(), ship_other,
                               entries[0][1] if entries else ShipmentInfo())
+    if route_map and route_map[0]:
+        new_page(QPageLayout.Orientation.Landscape)
+        _draw_route_map_page(painter, writer.width(), writer.height(), route_map[0],
+                             route_map[1], entries[0][1] if entries else ShipmentInfo())
+    if route_html:
+        _draw_html_pages(writer, painter, "<h2>Route &amp; Permits</h2>" + route_html,
+                         lambda: new_page(QPageLayout.Orientation.Portrait))
     painter.end()
+
+
+def _draw_html_pages(writer, painter: QPainter, html: str, new_page):
+    """Lay out rich text at the PDF's resolution and draw it over as many pages as it needs."""
+    M = 72
+    new_page()
+    PW, PH = writer.width(), writer.height()
+    doc = QTextDocument()
+    doc.documentLayout().setPaintDevice(writer)
+    doc.setDefaultFont(QFont("Arial", 9))
+    doc.setHtml(html)
+    doc.setTextWidth(PW - 2 * M)
+    page_h = PH - 2 * M
+    total_h = doc.size().height()
+    y = 0.0
+    while True:
+        painter.save()
+        painter.translate(M, M - y)
+        doc.drawContents(painter, QRectF(0, y, PW - 2 * M, page_h))
+        painter.restore()
+        y += page_h
+        if y >= total_h:
+            break
+        new_page()
 
 
 def _draw_ship_other_page(painter: QPainter, PW: int, PH: int, rows: list, info: ShipmentInfo):
@@ -3755,7 +5258,8 @@ def export_shipment_labels(entries: list, path: str):
                 if not first:
                     writer.newPage()
                 first = False
-                _draw_crate_label(painter, writer.width(), writer.height(), s, plan, info)
+                with trailer_type(getattr(plan, "trailer_id", None)):
+                    _draw_crate_label(painter, writer.width(), writer.height(), s, plan, info)
     painter.end()
 
 
@@ -3872,6 +5376,141 @@ def open_excel_template(parent) -> Optional[str]:
 
 
 # ── Excel Import Dialog ───────────────────────────────────────────────────────
+class QuickAddDialog(QDialog):
+    """Enter one piece's size and weight and how many there are — e.g. 15 identical crates."""
+
+    def __init__(self, next_label_no: int, has_rows: bool, last: dict = None,
+                 all_freight: bool = False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Quick Add Pieces")
+        self._next_label_no = next_label_no
+        last = last or {}
+        form = QFormLayout(self)
+        intro = QLabel("Add several identical pieces at once. Each gets its own row "
+                       "(Crate 1, Crate 2, …) that you can still edit in the table.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#555;")
+        form.addRow(intro)
+
+        self.spin_qty = QSpinBox()
+        self.spin_qty.setRange(1, 500)
+        self.spin_qty.setValue(last.get("qty", 1))
+        form.addRow("Number of pieces:", self.spin_qty)
+
+        name_row = QHBoxLayout()
+        self.f_prefix = QLineEdit(last.get("prefix", "Crate"))
+        self.f_prefix.setToolTip("Label before the number, e.g. Crate → Crate 1, Crate 2, …")
+        self.spin_start = QSpinBox()
+        self.spin_start.setRange(1, 99999)
+        self.spin_start.setValue(next_label_no)
+        self.spin_start.setToolTip("Number of the first new piece")
+        name_row.addWidget(self.f_prefix, 1)
+        name_row.addWidget(QLabel("starting at"))
+        name_row.addWidget(self.spin_start)
+        form.addRow("Label:", name_row)
+
+        self.f_part = QLineEdit(last.get("part", ""))
+        form.addRow("Part #:", self.f_part)
+
+        self._dims = {}
+        dim_row = QHBoxLayout()
+        for key, label, default in (("length", "L", 48.0), ("width", "W", 48.0),
+                                    ("height", "H", 48.0)):
+            spin = QDoubleSpinBox()
+            spin.setRange(1.0, 1200.0)
+            spin.setDecimals(1)
+            spin.setSuffix('"')
+            spin.setValue(last.get(key, default))
+            self._dims[key] = spin
+            dim_row.addWidget(QLabel(label))
+            dim_row.addWidget(spin, 1)
+        form.addRow("Size (inches):", dim_row)
+
+        self.spin_weight = QDoubleSpinBox()
+        self.spin_weight.setRange(1.0, 500000.0)
+        self.spin_weight.setDecimals(0)
+        self.spin_weight.setSingleStep(50)
+        self.spin_weight.setGroupSeparatorShown(True)
+        self.spin_weight.setSuffix(" lb")
+        self.spin_weight.setValue(last.get("weight", 1000.0))
+        form.addRow("Weight, each:", self.spin_weight)
+
+        self.spin_pcs = QSpinBox()
+        self.spin_pcs.setRange(0, 100000)
+        self.spin_pcs.setValue(last.get("pcs", 0))
+        self.spin_pcs.setToolTip("PCS column: items inside each crate (0 = not used)")
+        form.addRow("PCS in each:", self.spin_pcs)
+
+        opt_row = QHBoxLayout()
+        self.chk_stack = QCheckBox("Stackable")
+        self.chk_stack.setChecked(last.get("stackable", True))
+        self.cmb_stop = QComboBox()
+        self.cmb_stop.addItems([str(i) for i in range(1, MAX_STOPS + 1)])
+        self.cmb_stop.setCurrentIndex(last.get("stop", 1) - 1)
+        opt_row.addWidget(self.chk_stack)
+        opt_row.addSpacing(16)
+        opt_row.addWidget(QLabel("Stop:"))
+        opt_row.addWidget(self.cmb_stop)
+        opt_row.addStretch()
+        form.addRow("", opt_row)
+
+        self.f_notes = QLineEdit(last.get("notes", ""))
+        form.addRow("Notes:", self.f_notes)
+
+        self.chk_replace = QCheckBox("Replace the current freight list")
+        self.chk_replace.setToolTip("Clear the table first instead of adding to it")
+        self.chk_replace.setEnabled(has_rows)
+        self.chk_replace.toggled.connect(
+            lambda on: self.spin_start.setValue(1 if on else self._next_label_no))
+        form.addRow("", self.chk_replace)
+        self.chk_all = QCheckBox("This is all the freight for the load")
+        self.chk_all.setToolTip(
+            "Ticked: the load is calculated right away and spread over the floor if that's "
+            "needed to keep every axle legal.\nUnticked: more freight is coming — the pieces "
+            "stay packed at the nose, leaving room behind them.")
+        self.chk_all.setChecked(all_freight)
+        form.addRow("", self.chk_all)
+
+        self.lbl_total = QLabel()
+        self.lbl_total.setStyleSheet("color:#1f4e79; font-weight:bold;")
+        form.addRow(self.lbl_total)
+        for w in (self.spin_qty, self.spin_weight, self.spin_start, *self._dims.values()):
+            w.valueChanged.connect(self._update_total)
+        self.f_prefix.textChanged.connect(self._update_total)
+        self._update_total()
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Add Pieces")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _labels(self) -> list:
+        prefix = self.f_prefix.text().strip()
+        start = self.spin_start.value()
+        return [f"{prefix} {start + k}".strip() for k in range(self.spin_qty.value())]
+
+    def _update_total(self):
+        n = self.spin_qty.value()
+        labels = self._labels()
+        span = labels[0] if n == 1 else f"{labels[0]} … {labels[-1]}"
+        d = {k: s.value() for k, s in self._dims.items()}
+        self.lbl_total.setText(
+            f"{span}  ·  {d['length']:g}×{d['width']:g}×{d['height']:g}\"  ·  "
+            f"{n} × {self.spin_weight.value():,.0f} lb = {n * self.spin_weight.value():,.0f} lb")
+
+    def values(self) -> dict:
+        """What was entered, also remembered as the next dialog's defaults."""
+        return {"qty": self.spin_qty.value(), "prefix": self.f_prefix.text().strip(),
+                "part": self.f_part.text().strip(),
+                **{k: s.value() for k, s in self._dims.items()},
+                "weight": self.spin_weight.value(), "pcs": self.spin_pcs.value(),
+                "stackable": self.chk_stack.isChecked(), "stop": self.cmb_stop.currentIndex() + 1,
+                "notes": self.f_notes.text().strip(), "replace": self.chk_replace.isChecked(),
+                "all_freight": self.chk_all.isChecked(), "labels": self._labels()}
+
+
 class ImportDialog(QDialog):
     """Preview packing list from Excel, check/uncheck rows to include/exclude."""
 
@@ -4160,12 +5799,12 @@ RIG_FIELDS = [   # (key, label, unit, max, step, tooltip)
     ("trailer_tare", "Trailer empty weight", "lb", 30000, 100, ""),
     ("slider_tare", "  of which sliding tandem assembly", "lb", 10000, 100,
      "Axles, wheels, brakes and slider box — this weight moves with the tandem"),
-    ("trailer_cg_in", "Empty trailer body balance point", "in", 636, 1,
+    ("trailer_cg_in", "Empty trailer body balance point", "in", 960, 1,
      "Centre of gravity of the empty body (without the slider), measured from the nose"),
     ("kingpin_in", "Kingpin behind the nose", "in", 120, 1, ""),
-    ("tandem_min_in", "Tandem slide: most forward", "in", 636, 1,
+    ("tandem_min_in", "Tandem slide: most forward", "in", 960, 1,
      "Trailer tandem centre behind the kingpin"),
-    ("tandem_max_in", "Tandem slide: most rearward", "in", 636, 1, ""),
+    ("tandem_max_in", "Tandem slide: most rearward", "in", 960, 1, ""),
     ("tandem_step_in", "Tandem hole spacing", "in", 24, 1, ""),
     ("tandem_spread_in", "Trailer axle spread", "in", 120, 1, "Front trailer axle to rear trailer axle"),
     ("kpra_max_in", "Kingpin to rear axle limit", "in", 720, 1,
@@ -4175,14 +5814,40 @@ RIG_FIELDS = [   # (key, label, unit, max, step, tooltip)
 
 
 def load_rig_settings():
-    """Truck & Trailer settings saved by the dialog (RIG_DEFAULTS if none)."""
+    """Truck & Trailer settings saved by the dialog (defaults if none). "rig" holds the
+    tractor and the dry van; "rig_trailers" the other trailer types' running gear."""
+    settings = QSettings("FreightLoader", "FreightLoader")
     try:
-        saved = json.loads(QSettings("FreightLoader", "FreightLoader").value("rig", "") or "{}")
+        saved = json.loads(settings.value("rig", "") or "{}")
+        trailers = json.loads(settings.value("rig_trailers", "") or "{}")
     except ValueError:
-        saved = {}
-    RIG.clear()
-    RIG.update(RIG_DEFAULTS)
-    RIG.update({k: v for k, v in saved.items() if k in RIG_DEFAULTS})
+        saved, trailers = {}, {}
+    apply_rig_specs(saved, trailers, reset=True)
+
+
+def apply_rig_specs(specs: dict, trailers: dict = None, reset: bool = False):
+    """Load tractor + dry van values (`specs`) and other types' trailer values
+    (`trailers` {type id: values}); `reset` starts from the defaults first."""
+    if reset:
+        RIG.clear()
+        RIG.update(RIG_DEFAULTS)
+        for tid, t in TRAILER_TYPES.items():
+            RIG_BY_TYPE[tid] = {k: t["rig"][k] for k in RIG_TRAILER_KEYS}
+        RIG_BY_TYPE[DEFAULT_TRAILER_TYPE] = {k: RIG_DEFAULTS[k] for k in RIG_TRAILER_KEYS}
+    RIG.update({k: v for k, v in (specs or {}).items() if k in RIG_DEFAULTS})
+    RIG_BY_TYPE[DEFAULT_TRAILER_TYPE].update(
+        {k: v for k, v in (specs or {}).items() if k in RIG_TRAILER_KEYS})
+    for tid, vals in (trailers or {}).items():
+        if tid in RIG_BY_TYPE:
+            RIG_BY_TYPE[tid].update({k: v for k, v in vals.items() if k in RIG_TRAILER_KEYS})
+    set_trailer_type(TRAILER.get("id"))
+
+
+def rig_specs_for_save() -> tuple:
+    """(tractor + dry van values, {other type: trailer values}) — see apply_rig_specs."""
+    specs = {k: v for k, v in RIG.items() if k not in RIG_TRAILER_KEYS}
+    specs.update(RIG_BY_TYPE[DEFAULT_TRAILER_TYPE])
+    return specs, {tid: dict(v) for tid, v in RIG_BY_TYPE.items() if tid != DEFAULT_TRAILER_TYPE}
 
 
 class RigDialog(QDialog):
@@ -4190,11 +5855,13 @@ class RigDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Truck & Trailer")
+        self.setWindowTitle(f"Truck & Trailer — {TRAILER['name']}")
         form = QFormLayout(self)
-        intro = QLabel("Empty weights and slide ranges used for axle weights. Defaults are "
-                       "typical for a sleeper tractor and a 53' dry van — enter your own scale "
-                       "tickets and measurements for better estimates.")
+        intro = QLabel(f"Empty weights and slide ranges used for axle weights. Trailer values are "
+                       f"for the <b>{TRAILER['name']}</b> (this truck's trailer type); the tractor "
+                       f"is shared by every truck. Defaults are typical figures — enter your own "
+                       f"scale tickets and measurements for better estimates. A trailer without a "
+                       f"sliding tandem has the same forward and rearward position.")
         intro.setWordWrap(True)
         intro.setStyleSheet("color:#555;")
         form.addRow(intro)
@@ -4220,8 +5887,14 @@ class RigDialog(QDialog):
         btns.accepted.connect(self._accept)
         btns.rejected.connect(self.reject)
         btns.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(
-            lambda: [self._spins[k].setValue(RIG_DEFAULTS[k]) for k in self._spins])
+            lambda: [self._spins[k].setValue(self._default(k)) for k in self._spins])
         form.addRow(btns)
+
+    @staticmethod
+    def _default(key: str):
+        if key in RIG_TRAILER_KEYS and TRAILER["id"] != DEFAULT_TRAILER_TYPE:
+            return TRAILER_TYPES[TRAILER["id"]]["rig"][key]
+        return RIG_DEFAULTS[key]
 
     def _update_payload(self):
         tare = sum(self._spins[k].value() for k in ("steer_tare", "drive_tare", "trailer_tare"))
@@ -4244,14 +5917,607 @@ class RigDialog(QDialog):
             QMessageBox.warning(self, "Truck & Trailer", "\n".join(problems))
             return
         RIG.update(v)
-        QSettings("FreightLoader", "FreightLoader").setValue("rig", json.dumps(RIG))
+        RIG_BY_TYPE[TRAILER["id"]].update({k: v[k] for k in RIG_TRAILER_KEYS})
+        specs, trailers = rig_specs_for_save()
+        settings = QSettings("FreightLoader", "FreightLoader")
+        settings.setValue("rig", json.dumps(specs))
+        settings.setValue("rig_trailers", json.dumps(trailers))
         self.accept()
+
+
+# ── Phone sharing ─────────────────────────────────────────────────────────────
+# Plans move between the desktop and the phone app as .flplan files (the same
+# JSON as before; .json plans still open). Three ways, in both directions:
+#   • a shared folder (personal Dropbox) that both apps open and save in,
+#   • any app that carries files (email, chat): "Copy File" puts the plan on
+#     the clipboard; the phone app opens .flplan files tapped anywhere,
+#   • QR code over Wi-Fi: a one-time web server on this PC, local network
+#     only, secret link, stops after one transfer window.
+PLAN_EXT = ".flplan"
+PLAN_FILE_FILTER = "Load Plans (*.flplan *.json)"
+SHARED_DIR_KEY = "shared_plans_dir"
+TRANSFER_TIMEOUT_S = 5 * 60
+TRANSFER_MAX_BYTES = 20 * 1024 * 1024
+
+try:
+    import qrcode as _qrcode
+    HAS_QRCODE = True
+except ImportError:
+    HAS_QRCODE = False
+
+
+def default_shared_dir() -> str:
+    """'Freight Loader/Load Plans' in the personal Dropbox (its path from Dropbox's
+    info.json; ~/Dropbox if that can't be read)."""
+    base = os.path.join(os.path.expanduser("~"), "Dropbox")
+    for root in (os.environ.get("LOCALAPPDATA"), os.environ.get("APPDATA")):
+        try:
+            with open(os.path.join(root or "", "Dropbox", "info.json"), encoding="utf-8") as f:
+                base = json.load(f)["personal"]["path"]
+            break
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return os.path.join(base, "Freight Loader", "Load Plans")
+
+
+def shared_plans_dir() -> str:
+    """The shared plans folder (may not exist yet, e.g. before Dropbox has synced)."""
+    return QSettings("FreightLoader", "FreightLoader").value(SHARED_DIR_KEY, "") or \
+        default_shared_dir()
+
+
+def set_shared_plans_dir(path: str):
+    QSettings("FreightLoader", "FreightLoader").setValue(SHARED_DIR_KEY, path)
+
+
+def safe_plan_filename(name: str) -> str:
+    """A plain file name for a received plan, ending in .flplan or .json."""
+    name = os.path.basename((name or "").replace("\\", "/")).strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(". ")
+    if not name:
+        name = "Received plan" + PLAN_EXT
+    if os.path.splitext(name)[1].lower() not in (PLAN_EXT, ".json"):
+        name += PLAN_EXT
+    return name
+
+
+def unique_path(folder: str, name: str) -> str:
+    base, ext = os.path.splitext(name)
+    path, i = os.path.join(folder, name), 2
+    while os.path.exists(path):
+        path = os.path.join(folder, f"{base} ({i}){ext}")
+        i += 1
+    return path
+
+
+def is_plan_data(data: bytes) -> bool:
+    try:
+        d = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return isinstance(d, dict) and isinstance(d.get("shipment"), dict)
+
+
+_NOT_LAN_WORDS = ("vpn", "virtual", "vethernet", "hyper-v", "wsl", "vmware", "virtualbox",
+                  "bluetooth", "tap", "tun", "zerotier", "tailscale", "hamachi")
+
+
+def _lan_ip_from_interfaces() -> Optional[str]:
+    """The Wi-Fi / Ethernet adapter's private address, skipping VPN and virtual adapters
+    (e.g. McAfee VPN takes the default route on some PCs, and a phone can't reach that)."""
+    import ipaddress
+    from PyQt6.QtNetwork import QNetworkInterface, QAbstractSocket
+    F = QNetworkInterface.InterfaceFlag
+    T = QNetworkInterface.InterfaceType
+    best = None
+    for iface in QNetworkInterface.allInterfaces():
+        flags = iface.flags()
+        if not (flags & F.IsUp and flags & F.IsRunning) or flags & F.IsLoopBack:
+            continue
+        if iface.type() not in (T.Wifi, T.Ethernet):
+            continue
+        label = f"{iface.humanReadableName()} {iface.name()}".lower()
+        if any(re.search(rf"\b{w}\b", label) for w in _NOT_LAN_WORDS):
+            continue
+        for entry in iface.addressEntries():
+            ip = entry.ip()
+            if ip.protocol() != QAbstractSocket.NetworkLayerProtocol.IPv4Protocol:
+                continue
+            text = ip.toString()
+            if text.startswith(("127.", "169.254.")) or not ipaddress.ip_address(text).is_private:
+                continue
+            rank = 0 if iface.type() == T.Wifi else 1
+            if best is None or rank < best[0]:
+                best = (rank, text)
+    return best[1] if best else None
+
+
+def lan_ip() -> Optional[str]:
+    """This PC's address on the local network: the Wi-Fi / Ethernet adapter, else the
+    interface with the default route."""
+    import socket
+    try:
+        ip = _lan_ip_from_interfaces()
+        if ip:
+            return ip
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("10.255.255.255", 1))     # no packet is sent; just picks the interface
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        if ip and not ip.startswith("127."):
+            return ip
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            if not info[4][0].startswith("127."):
+                return info[4][0]
+    except OSError:
+        pass
+    return None
+
+
+def qr_pixmap(text: str, size: int = 240) -> Optional[QPixmap]:
+    """QR code for text as a size×size pixmap, or None without the qrcode package."""
+    if not HAS_QRCODE:
+        return None
+    qr = _qrcode.QRCode(border=2, error_correction=_qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(text)
+    qr.make(fit=True)
+    m = qr.get_matrix()
+    n = len(m)
+    cell = max(1, size // n)
+    pm = QPixmap(n * cell, n * cell)
+    pm.fill(QColor("white"))
+    p = QPainter(pm)
+    for y, row in enumerate(m):
+        for x, on in enumerate(row):
+            if on:
+                p.fillRect(x * cell, y * cell, cell, cell, QColor("black"))
+    p.end()
+    return pm
+
+
+UPLOAD_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Send a plan to Freight Loader</title>
+<style>body{font-family:sans-serif;margin:24px;max-width:480px;color:#222}
+h1{font-size:20px;color:#2a7d6e}button{font-size:17px;padding:12px 20px;margin-top:16px;
+background:#2a7d6e;color:#fff;border:0;border-radius:6px}#msg{margin-top:16px;font-size:16px}
+input{font-size:16px;margin-top:8px}</style></head><body>
+<h1>Send a plan to Freight Loader on the PC</h1>
+<p>Choose a <b>.flplan</b> (or .json) plan file from this phone.</p>
+<input type="file" id="f" accept=".flplan,.json,application/json,application/octet-stream">
+<br><button id="b">Send to PC</button><div id="msg"></div>
+<script>
+document.getElementById('b').onclick = async () => {
+  const f = document.getElementById('f').files[0], m = document.getElementById('msg');
+  if (!f) { m.textContent = 'Choose a plan file first.'; return; }
+  m.textContent = 'Sending…';
+  try {
+    const r = await fetch(location.pathname, {method: 'POST', body: f,
+      headers: {'X-Filename': encodeURIComponent(f.name)}});
+    m.textContent = r.ok ? '✓ Sent — check the PC.' : 'Not sent: ' + await r.text();
+  } catch (e) { m.textContent = 'Not sent: ' + e; }
+};
+</script></body></html>"""
+
+
+class PlanTransferServer(QObject):
+    """
+    One-time web server for moving a plan over Wi-Fi.
+      send:    GET  /s/<token>/<name>.flplan  -> the plan file (any number of times)
+      receive: GET  /r/<token>                -> upload page for a phone browser
+               POST /r/<token>                -> body = plan file, X-Filename header
+                                                 (first valid upload only)
+    Only answers devices on the local network, and only with the random token.
+    """
+    downloaded = pyqtSignal(str)               # client IP
+    received = pyqtSignal(bytes, str, str)     # data, file name, client IP
+
+    def __init__(self, mode: str, data: bytes = b"", filename: str = "", parent=None):
+        super().__init__(parent)
+        import secrets
+        self.mode, self.data, self.filename = mode, data, filename
+        self.token = secrets.token_urlsafe(9)
+        self.url = ""
+        self.used = False
+        self._httpd = None
+
+    def start(self) -> str:
+        import threading
+        import urllib.parse
+        from http.server import ThreadingHTTPServer
+        ip = lan_ip()
+        if not ip:
+            raise RuntimeError("This PC doesn't seem to be connected to a network.")
+        self._httpd = ThreadingHTTPServer(("0.0.0.0", 0), self._handler())
+        self._httpd.daemon_threads = True
+        port = self._httpd.server_address[1]
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+        path = (f"/s/{self.token}/{urllib.parse.quote(self.filename)}" if self.mode == "send"
+                else f"/r/{self.token}")
+        self.url = f"http://{ip}:{port}{path}"
+        return self.url
+
+    def stop(self):
+        if self._httpd is not None:
+            httpd, self._httpd = self._httpd, None
+            httpd.shutdown()
+            httpd.server_close()
+
+    def _handler(self):
+        import hmac
+        import ipaddress
+        import urllib.parse
+        from http.server import BaseHTTPRequestHandler
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            server_version = "FreightLoader"
+
+            def log_message(self, *args):
+                pass
+
+            def _reply(self, code, body: bytes, ctype="text/plain; charset=utf-8", extra=None):
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _route(self, kind: str) -> bool:
+                """True if this request is from the local network, for this mode and token."""
+                try:
+                    ip = ipaddress.ip_address(self.client_address[0])
+                except ValueError:
+                    return False
+                parts = urllib.parse.urlparse(self.path).path.strip("/").split("/")
+                return ((ip.is_private or ip.is_loopback) and len(parts) >= 2 and
+                        parts[0] == kind and owner.mode == ("send" if kind == "s" else "receive")
+                        and hmac.compare_digest(parts[1], owner.token))
+
+            def do_GET(self):
+                if self._route("s"):
+                    quoted = urllib.parse.quote(owner.filename)
+                    ascii_name = owner.filename.encode("ascii", "replace").decode().replace('"', "")
+                    self._reply(200, owner.data, "application/octet-stream", {
+                        "Content-Disposition":
+                            f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted}"})
+                    owner.downloaded.emit(self.client_address[0])
+                elif self._route("r"):
+                    self._reply(200, UPLOAD_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                else:
+                    self._reply(404, b"Not found")
+
+            def do_POST(self):
+                if not self._route("r"):
+                    return self._reply(404, b"Not found")
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    n = 0
+                if n <= 0 or n > TRANSFER_MAX_BYTES:
+                    return self._reply(413, b"Empty or too large.")
+                data = self.rfile.read(n)
+                if not is_plan_data(data):
+                    return self._reply(400, b"That isn't a Freight Loader plan file.")
+                if owner.used:
+                    return self._reply(409, b"The PC already received a plan. Start again on the PC.")
+                owner.used = True
+                name = urllib.parse.unquote(self.headers.get("X-Filename") or "")
+                self._reply(200, b'{"ok": true}', "application/json")
+                owner.received.emit(data, name, self.client_address[0])
+
+        return Handler
+
+
+class SharedFolderRow(QWidget):
+    """'Shared plans folder: <path>  [Change…]' with a status note when it's missing."""
+    changed = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.lbl = QLabel()
+        self.lbl.setWordWrap(True)
+        self.lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        btn = QPushButton("Change…")
+        btn.clicked.connect(self._change)
+        lay.addWidget(self.lbl, 1)
+        lay.addWidget(btn)
+        self.refresh()
+
+    def refresh(self):
+        path = shared_plans_dir()
+        note = ("" if os.path.isdir(path) else
+                " <span style='color:#b03a2e'>(not found — waiting for Dropbox to sync, "
+                "or click Change…)</span>")
+        self.lbl.setText(f"<b>Shared plans folder:</b> {path}{note}")
+
+    def _change(self):
+        start = shared_plans_dir()
+        while start and not os.path.isdir(start):
+            start = os.path.dirname(start)
+        path = QFileDialog.getExistingDirectory(self, "Shared Plans Folder", start or "")
+        if path:
+            set_shared_plans_dir(os.path.normpath(path))
+            self.refresh()
+            self.changed.emit(path)
+
+
+class _TransferDialog(QDialog):
+    """Shared layout: QR code + link + countdown on top, other options below."""
+
+    def __init__(self, title: str, mode: str, data: bytes = b"", filename: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(660)
+        self.mode, self.data, self.filename = mode, data, filename
+        self.server = None
+        self._left = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+        lay = QVBoxLayout(self)
+        self.lbl_head = QLabel()
+        self.lbl_head.setWordWrap(True)
+        lay.addWidget(self.lbl_head)
+
+        grp = QGroupBox("Over Wi-Fi — scan the QR code with the phone")
+        g = QHBoxLayout(grp)
+        self.lbl_qr = QLabel()
+        self.lbl_qr.setFixedSize(250, 250)
+        self.lbl_qr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_qr.setStyleSheet("background:white; border:1px solid #ccc;")
+        g.addWidget(self.lbl_qr)
+        right = QVBoxLayout()
+        self.lbl_steps = QLabel()
+        self.lbl_steps.setWordWrap(True)
+        self.lbl_url = QLabel()
+        self.lbl_url.setWordWrap(True)
+        self.lbl_url.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_url.setStyleSheet("color:#555;")
+        self.lbl_state = QLabel()
+        self.lbl_state.setWordWrap(True)
+        self.btn_restart = QPushButton("New QR Code")
+        self.btn_restart.clicked.connect(self._start_server)
+        self.btn_restart.setVisible(False)
+        right.addWidget(self.lbl_steps)
+        right.addWidget(self.lbl_url)
+        right.addWidget(self.lbl_state)
+        right.addWidget(self.btn_restart, 0, Qt.AlignmentFlag.AlignLeft)
+        right.addStretch()
+        g.addLayout(right, 1)
+        grp.setMinimumHeight(self.lbl_qr.height() + 40)   # never squeeze the QR code
+        lay.addWidget(grp)
+
+        self.grp_other = QGroupBox()
+        self.other = QVBoxLayout(self.grp_other)
+        self.folder_row = SharedFolderRow()
+        self.other.addWidget(self.folder_row)
+        lay.addWidget(self.grp_other)
+
+        self.lbl_result = QLabel()
+        self.lbl_result.setWordWrap(True)
+        lay.addWidget(self.lbl_result)
+
+        self.btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        self.btns.rejected.connect(self.reject)
+        lay.addWidget(self.btns)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._fit)
+
+    def _fit(self):
+        """Grow to fit the QR code and the wrapped text (word wrap doesn't do it alone)."""
+        lay = self.layout()
+        h = lay.heightForWidth(self.width()) if lay.hasHeightForWidth() else -1
+        h = max(h, self.sizeHint().height(), self.minimumSizeHint().height())
+        if h > self.height():
+            self.resize(self.width(), h)
+
+    def _start_server(self):
+        self._stop_server()
+        self.btn_restart.setVisible(False)
+        self.server = PlanTransferServer(self.mode, self.data, self.filename, self)
+        self.server.downloaded.connect(self._on_downloaded)
+        self.server.received.connect(self._on_received)
+        try:
+            url = self.server.start()
+        except Exception as e:
+            self.server = None
+            self.lbl_qr.setText("No network")
+            self.lbl_url.setText("")
+            self._state(f"Can't start the Wi-Fi transfer: {e}", "#b03a2e")
+            self.btn_restart.setVisible(True)
+            return
+        pm = qr_pixmap(url, 240)
+        if pm is not None:
+            self.lbl_qr.setPixmap(pm)
+        else:
+            self.lbl_qr.setText("QR codes need the\n'qrcode' package:\npip install qrcode\n\n"
+                                "Type the link below\ninto the phone instead.")
+        self.lbl_url.setText(f"Link: {url}")
+        self._left = TRANSFER_TIMEOUT_S
+        self._timer.start(1000)
+        self._tick(advance=False)
+
+    def _stop_server(self):
+        self._timer.stop()
+        if self.server is not None:
+            self.server.stop()
+            self.server = None
+
+    def _tick(self, advance=True):
+        if advance:
+            self._left -= 1
+        if self._left <= 0:
+            self._stop_server()
+            self.lbl_qr.clear()
+            self.lbl_qr.setText("Expired")
+            self._state("The link has expired.", "#555")
+            self.btn_restart.setVisible(True)
+            return
+        self._state(f"Waiting for the phone… (link works for {self._left // 60}:{self._left % 60:02d})",
+                    "#555")
+
+    def _state(self, text: str, color: str):
+        self.lbl_state.setText(f"<span style='color:{color}'>{text}</span>")
+
+    def _result(self, html: str):
+        self.lbl_result.setText(html)
+        QTimer.singleShot(0, self._fit)
+
+    def _on_downloaded(self, ip: str):
+        pass
+
+    def _on_received(self, data: bytes, name: str, ip: str):
+        pass
+
+    def done(self, r):
+        self._stop_server()
+        super().done(r)
+
+
+class SendToPhoneDialog(_TransferDialog):
+    """Send the current plan: QR over Wi-Fi, the shared folder, or the clipboard."""
+
+    def __init__(self, data: bytes, filename: str, parent=None):
+        super().__init__("Send to Phone", "send", data, filename, parent)
+        self.lbl_head.setText(f"Send <b>{filename}</b> to the Freight Loader phone app.")
+        self.lbl_steps.setText(
+            "1. Put the phone on the <b>same Wi-Fi</b> as this PC.<br>"
+            "2. In Freight Loader on the phone, choose <b>Import ▸ Scan QR Code</b> "
+            "— or scan with the phone's camera and open the link to download the file.<br>"
+            "<span style='color:#777'>If Windows asks, allow Python on <b>private</b> networks.</span>")
+        self.grp_other.setTitle("Or share the file")
+        row = QHBoxLayout()
+        b_folder = QPushButton("Save to Shared Folder")
+        b_folder.setToolTip("Save the plan in the shared (Dropbox) folder; open it on the phone "
+                            "with Open Plan once Dropbox has synced")
+        b_folder.clicked.connect(self._save_shared)
+        b_copy = QPushButton("Copy File")
+        b_copy.setToolTip("Copy the plan file — paste it into an email or chat (Ctrl+V), "
+                          "then tap it on the phone")
+        b_copy.clicked.connect(self._copy_file)
+        row.addWidget(b_folder)
+        row.addWidget(b_copy)
+        row.addStretch()
+        self.other.addLayout(row)
+        self._start_server()
+
+    def _on_downloaded(self, ip: str):
+        self._state(f"✓ Sent to the phone ({ip}). The link stays open until this window "
+                    f"closes or it expires.", "#1e7b34")
+
+    def _save_shared(self):
+        folder = shared_plans_dir()
+        if not os.path.isdir(folder):
+            QMessageBox.warning(self, "Shared Folder",
+                                f"The shared folder doesn't exist yet:\n{folder}\n\n"
+                                "Wait for Dropbox to finish syncing, or choose another "
+                                "folder with Change….")
+            return
+        path = os.path.join(folder, self.filename)
+        if os.path.exists(path) and QMessageBox.question(
+                self, "Shared Folder", f"{self.filename} is already in the shared folder.\n\n"
+                "Replace it?") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(self.data)
+        except OSError as e:
+            QMessageBox.critical(self, "Shared Folder", str(e))
+            return
+        self._result(f"<span style='color:#1e7b34'>✓ Saved to {path}</span><br>"
+                     "<span style='color:#555'>It will be on the phone once Dropbox syncs "
+                     "(open it with <b>Open Plan</b> there).</span>")
+
+    def _copy_file(self):
+        from PyQt6.QtCore import QMimeData
+        folder = os.path.join(tempfile.gettempdir(), "FreightLoader Share")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, self.filename)
+            with open(path, "wb") as f:
+                f.write(self.data)
+        except OSError as e:
+            QMessageBox.critical(self, "Copy File", str(e))
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(path)])
+        QApplication.clipboard().setMimeData(mime)
+        self._result("<span style='color:#1e7b34'>✓ Copied.</span> Paste it (Ctrl+V) into an "
+                     "email or chat message as an attachment, then tap it on the phone.")
+
+
+class ReceiveFromPhoneDialog(_TransferDialog):
+    """Receive a plan from the phone over Wi-Fi; saves it and offers to open it."""
+
+    def __init__(self, open_plan, parent=None):
+        super().__init__("Receive from Phone", "receive", parent=parent)
+        self.open_plan = open_plan
+        self.saved_path = None
+        self.lbl_head.setText("Get a plan from the Freight Loader phone app.")
+        self.lbl_steps.setText(
+            "1. Put the phone on the <b>same Wi-Fi</b> as this PC.<br>"
+            "2. In Freight Loader on the phone, choose <b>Share ▸ Send to PC</b> and scan this "
+            "code — or scan it with the phone's camera and pick the plan file on the page that "
+            "opens.<br>"
+            "<span style='color:#777'>If Windows asks, allow Python on <b>private</b> networks.</span>")
+        self.grp_other.setTitle("Plans saved on the phone to the shared folder")
+        note = QLabel("Plans the phone saves in the shared (Dropbox) folder open here with "
+                      "<b>Open Plan…</b> once Dropbox has synced. Plans emailed from the phone: "
+                      "save the attachment, then Open Plan….")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#555;")
+        self.other.addWidget(note)
+        self.btn_open = self.btns.addButton("Open It Now", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.btn_open.setEnabled(False)
+        self.btn_open.clicked.connect(self._open_now)
+        self._start_server()
+
+    def _on_received(self, data: bytes, name: str, ip: str):
+        self._stop_server()
+        self.btn_restart.setVisible(True)
+        folder = shared_plans_dir()
+        if not os.path.isdir(folder):
+            folder = LOAD_PLANS_DIR
+        try:
+            os.makedirs(folder, exist_ok=True)
+            path = unique_path(folder, safe_plan_filename(name))
+            with open(path, "wb") as f:
+                f.write(data)
+        except OSError as e:
+            self._state(f"Received a plan but couldn't save it: {e}", "#b03a2e")
+            return
+        self.saved_path = path
+        self._state(f"✓ Received {os.path.basename(path)} from the phone ({ip}).", "#1e7b34")
+        self._result(f"Saved to {path}")
+        self.btn_open.setEnabled(True)
+        self.btn_open.setDefault(True)
+
+    def _open_now(self):
+        if self.saved_path:
+            self.accept()
+            self.open_plan(self.saved_path)
 
 
 class FreightLoaderApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"Freight Loader v{APP_VERSION} — 53' Dry Van")
+        self.setWindowTitle(f"Freight Loader v{APP_VERSION}")
         self.setMinimumSize(1150, 760)
         self._next_id = 1
         self._plan: Optional[LoadPlan] = None
@@ -4263,6 +6529,7 @@ class FreightLoaderApp(QMainWindow):
                        for _ in range(MAX_STOPS)]
         self._use_road = False
         self._road = None
+        self._routes: dict = {}          # route_key(points) -> looked-up route (see road_route)
         self._trucks: list = []          # [{"trailer_num": str, "piece_ids": [..]}]
         self._ship_other: list = []      # piece IDs shipping another way
         self._ship_reasons: dict = {}    # piece_id -> why it ships separately
@@ -4274,6 +6541,15 @@ class FreightLoaderApp(QMainWindow):
         self._popout: Optional[FreightPopout] = None
         self._build_ui()
         self._sync_rig_controls(None)
+        self._sync_trailer_controls()
+        # Open as large as the screen allows so the left panel isn't cramped
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            w = min(1500, avail.width() - 40)
+            h = min(1000, avail.height() - 40)
+            self.resize(max(w, self.minimumWidth()), max(h, self.minimumHeight()))
+            self.move(avail.center() - self.rect().center())
 
     def _build_ui(self):
         central = QWidget()
@@ -4287,7 +6563,7 @@ class FreightLoaderApp(QMainWindow):
         root.addWidget(lbl_version)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        root.addWidget(splitter)
+        root.addWidget(splitter, 1)
 
         # ══ LEFT PANEL ══════════════════════════════════════════════════
         left = QWidget()
@@ -4308,6 +6584,18 @@ class FreightLoaderApp(QMainWindow):
         btn_save.clicked.connect(self._save_plan)
         btn_saveas.clicked.connect(self._save_plan_as)
         ll.addLayout(file_row)
+        phone_row = QHBoxLayout()
+        btn_send = QPushButton("Send to Phone…")
+        btn_send.setToolTip("Send this plan to the phone app: QR code over Wi-Fi, the shared "
+                            "(Dropbox) folder, or copy the file for email / chat")
+        btn_recv = QPushButton("Receive from Phone…")
+        btn_recv.setToolTip("Get a plan from the phone app over Wi-Fi (QR code)")
+        for b in [btn_send, btn_recv]:
+            b.setFixedHeight(30)
+            phone_row.addWidget(b)
+        btn_send.clicked.connect(self._send_to_phone)
+        btn_recv.clicked.connect(self._receive_from_phone)
+        ll.addLayout(phone_row)
 
         # ── Shipment Info ──────────────────────────────────────────────
         grp_info = QGroupBox("Shipment Info")
@@ -4332,9 +6620,14 @@ class FreightLoaderApp(QMainWindow):
         btn_stops.setToolTip("Names and addresses / GPS coordinates for the origin and stops; "
                              "plans the delivery route")
         btn_stops.clicked.connect(self._edit_stops)
+        btn_permits = QPushButton("Route && Permits…")
+        btn_permits.setToolTip("Each truck's road route: miles, driving days, states crossed "
+                               "and state size / weight permit needs (online)")
+        btn_permits.clicked.connect(self._show_route_permits)
         self.lbl_stops = QLabel("")
         self.lbl_stops.setStyleSheet("color:#555;")
         stops_row.addWidget(btn_stops)
+        stops_row.addWidget(btn_permits)
         stops_row.addWidget(self.lbl_stops, 1)
         info_form.addRow("Delivery Stops:", stops_row)
         ll.addWidget(grp_info)
@@ -4357,6 +6650,7 @@ class FreightLoaderApp(QMainWindow):
             "Delivery stop ID — set names and addresses / GPS under Edit Stops. "
             "Delivery order follows the route (by stop # if no locations).")
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setMinimumHeight(180)
         gl.addWidget(self.table)
 
         btn_row = QHBoxLayout()
@@ -4366,7 +6660,10 @@ class FreightLoaderApp(QMainWindow):
         btn_import = QPushButton("Import from Excel…")
         btn_import.clicked.connect(self._import_excel)
         btn_add    = QPushButton("+ Add Row")
-        btn_add.clicked.connect(self._add_row)
+        btn_add.clicked.connect(lambda: self._add_row())   # clicked(bool) would land in crate_id
+        btn_quick  = QPushButton("Quick Add…")
+        btn_quick.setToolTip("Add several identical pieces at once: size, weight and how many")
+        btn_quick.clicked.connect(self._quick_add)
         btn_del    = QPushButton("Remove Selected")
         btn_del.clicked.connect(self._remove_row)
         btn_clear  = QPushButton("Clear All")
@@ -4374,14 +6671,20 @@ class FreightLoaderApp(QMainWindow):
         btn_popout = QPushButton("↗ Pop Out")
         btn_popout.setToolTip("Open freight list in a larger window to manage include/exclude")
         btn_popout.clicked.connect(self._open_popout)
-        for b in [btn_template, btn_import, btn_add, btn_del, btn_clear, btn_popout]:
+        btn_row2 = QHBoxLayout()
+        for b in [btn_template, btn_import, btn_popout]:
             btn_row.addWidget(b)
+        for b in [btn_add, btn_quick, btn_del, btn_clear]:
+            btn_row2.addWidget(b)
         gl.addLayout(btn_row)
+        gl.addLayout(btn_row2)
         ll.addWidget(grp_freight)
 
         # ── Axle limits ────────────────────────────────────────────────
         grp_limits = QGroupBox("DOT Axle Weight Limits (lbs)")
-        lim_row = QHBoxLayout(grp_limits)
+        lim_box = QVBoxLayout(grp_limits)
+        lim_row = QHBoxLayout()
+        lim_box.addLayout(lim_row)
         self._limit_fields = {}
         for key, label, default in [
             ("steer",   "Steer",   12000),
@@ -4389,18 +6692,26 @@ class FreightLoaderApp(QMainWindow):
             ("trailer", "Trailer", 34000),
             ("gross",   "Gross",   80000),
         ]:
-            vb = QVBoxLayout()
-            vb.addWidget(QLabel(label, alignment=Qt.AlignmentFlag.AlignCenter))
+            lim_row.addWidget(QLabel(label))
             spin = QSpinBox()
             spin.setRange(1000, 200000)
             spin.setValue(default)
             spin.setSingleStep(500)
             spin.setGroupSeparatorShown(True)
             self._limit_fields[key] = spin
-            vb.addWidget(spin)
-            lim_row.addLayout(vb)
-        self.chk_override = QCheckBox("Allow override")
+            lim_row.addWidget(spin, 1)
+        self.chk_override = QCheckBox("Override")
+        self.chk_override.setToolTip("Allow a load plan that exceeds these limits")
         lim_row.addWidget(self.chk_override)
+        self.chk_spread = QCheckBox("All freight entered — spread the load to balance the axles")
+        self.chk_spread.setToolTip(
+            "On: if packing two-across from the nose overloads an axle, the planner uses the "
+            "empty floor — some rows become single pieces centred in the trailer — until every "
+            "axle is legal.\nOff: freight stays packed at the nose, leaving the floor behind it "
+            "free for more freight.")
+        self.chk_spread.toggled.connect(
+            lambda: self._calculate(silent=True) if self.table.rowCount() else None)
+        lim_box.addWidget(self.chk_spread)
         ll.addWidget(grp_limits)
 
         # ── Calculate ─────────────────────────────────────────────────
@@ -4451,9 +6762,24 @@ class FreightLoaderApp(QMainWindow):
         ll.addLayout(exp_row)
         self.chk_pdf_3d = QCheckBox("Include 3D views page in floor plan PDF")
         self.chk_pdf_3d.setToolTip("Adds a landscape page with the load shown from four 3D angles")
+        self.chk_pdf_3d.setChecked(True)
         ll.addWidget(self.chk_pdf_3d)
+        self.chk_pdf_map = QCheckBox("Include route map page in floor plan PDF")
+        self.chk_pdf_map.setToolTip("Adds a landscape map of each truck's route (online for the "
+                                    "street map and road lines; offline it shows state outlines "
+                                    "and straight lines)")
+        ll.addWidget(self.chk_pdf_map)
+        ll.addStretch()
 
-        splitter.addWidget(left)
+        # Scroll instead of squashing the fields when the window is short
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setWidget(left)
+        left_scroll.setMinimumWidth(left.minimumSizeHint().width()
+                                    + left_scroll.verticalScrollBar().sizeHint().width())
+        splitter.addWidget(left_scroll)
 
         # ══ RIGHT PANEL — truck bar + tabbed trailer views ═══════════
         right = QWidget()
@@ -4478,6 +6804,27 @@ class FreightLoaderApp(QMainWindow):
             truck_row.addWidget(b)
         truck_row.addStretch()
         rl.addLayout(truck_row)
+
+        trailer_row = QHBoxLayout()
+        trailer_row.addWidget(QLabel("<b>Trailer:</b>"))
+        self.cmb_trailer = QComboBox()
+        for tid, spec in TRAILER_TYPES.items():
+            self.cmb_trailer.addItem(spec["name"], tid)
+            self.cmb_trailer.setItemData(self.cmb_trailer.count() - 1,
+                                         spec.get("description", ""), Qt.ItemDataRole.ToolTipRole)
+        self.cmb_trailer.setToolTip("This truck's trailer type — picked automatically from its "
+                                    "freight (dry van first); choose another to re-plan the truck")
+        self.cmb_trailer.activated.connect(self._trailer_type_chosen)
+        trailer_row.addWidget(self.cmb_trailer)
+        self.btn_trailer_auto = QPushButton("Auto")
+        self.btn_trailer_auto.setToolTip("Let the planner pick this truck's trailer type again")
+        self.btn_trailer_auto.clicked.connect(lambda: self._trailer_type_chosen(None))
+        self.btn_trailer_auto.setEnabled(False)
+        trailer_row.addWidget(self.btn_trailer_auto)
+        self.lbl_trailer = QLabel()
+        self.lbl_trailer.setStyleSheet("color:#555;")
+        trailer_row.addWidget(self.lbl_trailer, 1)
+        rl.addLayout(trailer_row)
 
         rig_row = QHBoxLayout()
         rig_row.addWidget(QLabel("<b>Axles:</b>"))
@@ -4581,7 +6928,9 @@ class FreightLoaderApp(QMainWindow):
 
         rl.addWidget(tabs)
         splitter.addWidget(right)
-        splitter.setSizes([500, 610])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([max(left_scroll.minimumWidth(), 580), 700])
 
     def _zoom_tab(self, view: QWidget, extra: list = None, hint_prefix: str = "") -> QWidget:
         """Wrap a 2D view in a zoomable scroll area with − / Fit / + controls."""
@@ -4672,12 +7021,23 @@ class FreightLoaderApp(QMainWindow):
             return
         for sl in moved:
             sl.x_in, sl.y_in = self._manual[sl.piece.piece_id]
-        if _layout_problems(plan.slots):
-            for sl in moved:
-                sl.x_in = sl.y_in = None
-                self._manual.pop(sl.piece.piece_id, None)
-            plan.notices.append(f"Crates you moved on Truck {truck_no} were put back — "
-                                "the load changed and they no longer fit where you placed them.")
+        # Put back only the moves that no longer fit, one at a time
+        slot_of = {sl.piece.piece_id: sl for sl in moved}
+        put_back = []
+        while True:
+            hit = next((pid for pair in _layout_conflicts(plan.slots)
+                        for pid in sorted((x for x in pair if x is not None),
+                                          key=lambda x: (x not in slot_of, -x))
+                        if pid in slot_of), None)
+            if hit is None:
+                break
+            sl = slot_of.pop(hit)
+            sl.x_in = sl.y_in = None
+            self._manual.pop(hit, None)
+            put_back.append(sl.piece.crate_label)
+        if put_back:
+            plan.notices.append(f"Truck {truck_no}: {', '.join(put_back)} put back where the planner "
+                                "placed them — the load changed and your move no longer fits.")
         _refresh_plan_metrics(plan)
 
     # ── Fifth wheel / tandem positions ───────────────────────────────────────
@@ -4697,10 +7057,13 @@ class FreightLoaderApp(QMainWindow):
         self.btn_rig_auto.setEnabled(not auto)
         rear = rig["tandem_in"] + RIG["tandem_spread_in"] / 2
         bad = not _rear_axle_ok(rig["tandem_in"])
+        ca = " (CA 40' max)" if "California" in kpra_text() else ""
         self.lbl_rig.setText(
             f"<span style='color:{'#c0392b' if bad else '#555'}'>KP→rear axle {int(rear // 12)}'"
-            f"{rear % 12:.0f}\"</span>  ·  " + ("auto" if auto else "<b>set by you</b>"))
-        self.lbl_rig.setToolTip(rig_text(rig))
+            f"{rear % 12:.0f}\"{ca}</span>  ·  " + ("auto" if auto else "<b>set by you</b>"))
+        lim = kpra_limit()
+        self.lbl_rig.setToolTip(rig_text(rig) + (f"\nKingpin-to-rear-axle limit: {kpra_text()}"
+                                                 if lim else ""))
 
     def _rig_spin_changed(self):
         fw_opts, holes = rig_positions(legal_only=False)
@@ -4806,6 +7169,78 @@ class FreightLoaderApp(QMainWindow):
             # New locations change the route, so trucks are re-split
             self._calculate(resplit=moved)
 
+    # ── Route & permits ──────────────────────────────────────────────────────
+    def _route_kpra_for(self, stop_order: list) -> Optional[float]:
+        """California's 40' kingpin-to-rear-axle limit if this truck's route goes through
+        California (its looked-up route; until then, the origin or a stop in California)."""
+        coords = self._coords()
+        pts = ([coords["origin"]] if "origin" in coords else []) + \
+              [coords[sid] for sid in stop_order if sid in coords]
+        route = self._routes.get(route_key(pts)) if "origin" in coords and len(pts) > 1 else None
+        try:
+            states = route.get("states", []) if route else [state_at(lon, lat) for lat, lon in pts]
+        except (OSError, ValueError):        # boundary file missing / unreadable
+            states = []
+        return CALIFORNIA_KPRA_IN if "California" in states else None
+
+    def _route_rows(self) -> list:
+        """Per truck: stops in delivery order, route points, cached route, rig size/weight."""
+        rows = []
+        coords = self._coords()
+        for i, plan in enumerate(self._plans or ([self._plan] if self._plan else [])):
+            order = [sid for sid in (plan.stop_order or []) if sid in coords]
+            unlocated = [f"S{sid}" for sid in (plan.stop_order or []) if sid not in coords]
+            stops = [("Origin", self._origin.get("name") or self._origin.get("location", ""))]
+            stops += [(f"S{sid}", self._stops[sid - 1].get("name")
+                       or self._stops[sid - 1].get("location", "")) for sid in order]
+            points, problem = [], ""
+            if "origin" not in coords:
+                problem = "Locate the origin under Edit Stops… to look up the route."
+            elif not order:
+                problem = "Locate this truck's stops under Edit Stops… to look up the route."
+            else:
+                points = [coords["origin"]] + [coords[sid] for sid in order]
+                if unlocated:
+                    problem = f"Not located (left off the route): {', '.join(unlocated)}"
+            route = self._routes.get(route_key(points)) if points else None
+            rows.append({"label": getattr(plan, "truck_label", "") or f"Truck {i + 1}",
+                         "stops": stops, "points": points, "route": route,
+                         "vehicle": route_vehicle(plan), "problem": problem})
+        return rows
+
+    def _fetch_routes(self, force: bool) -> list:
+        """Look up every truck's route (only missing ones unless force). Returns error lines."""
+        errors = []
+        for row in self._route_rows():
+            if not row["points"] or (row["route"] and not force):
+                continue
+            try:
+                r = road_route(row["points"])
+                _ROAD_PATHS[route_key(row["points"])] = r["path"]
+                states = states_crossed(r.pop("path"))
+            except Exception as e:
+                errors.append(f"{row['label']}: {e}")
+                continue
+            r["states"] = states
+            r["fetched"] = datetime.datetime.now().isoformat(timespec="seconds")
+            self._routes[route_key(row["points"])] = r
+        # A route that turned out to go through California (or not) changes the
+        # kingpin-to-rear-axle limit for that truck: re-plan the trucks it affects
+        if any(self._route_kpra_for(pl.stop_order or []) != getattr(pl, "route_kpra", None)
+               for pl in self._plans):
+            self._build_plans(self._read_pieces(), silent=True)
+        elif self._plan:
+            self._update_summary(self._plan)
+        return errors
+
+    def _show_route_permits(self):
+        if not self._plan:
+            QMessageBox.information(self, "Route & Permits",
+                                    "Calculate the load plan first — each truck's route "
+                                    "follows its stops in delivery order.")
+            return
+        RoutePermitsDialog(self).exec()
+
     def _open_template(self):
         path = open_excel_template(self)
         if path:
@@ -4826,6 +7261,45 @@ class FreightLoaderApp(QMainWindow):
                 self.lbl_status.setText(
                     f"Imported {len(dlg.pieces)} crates. "
                     f"Excluded: {', '.join('Crate ' + str(i) for i in dlg.excluded_ids)}")
+
+    def _quick_add(self):
+        has_rows = self.table.rowCount() > 0
+        existing = self._read_pieces() if has_rows else []
+        if has_rows and not existing:
+            return                       # a bad cell — _read_pieces already said which
+        nums = [int(m.group(1)) for p in existing
+                if (m := re.search(r"(\d+)\s*$", p.crate_label))]
+        dlg = QuickAddDialog(max(nums, default=0) + 1, has_rows,
+                             getattr(self, "_quick_add_last", None),
+                             self.chk_spread.isChecked(), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        v = dlg.values()
+        self._quick_add_last = {k: x for k, x in v.items()
+                                if k not in ("replace", "labels", "all_freight")}
+        if v["replace"]:
+            existing = []
+            self._excluded_ids = []
+            self._securement.clear()     # items were anchored to the previous crates
+            self._manual.clear()         # so were hand-placed positions
+            self._on_securement_changed()
+        next_id = max((p.piece_id for p in existing), default=0) + 1
+        new = [FreightPiece(next_id + k, label, v["part"], v["length"], v["width"], v["height"],
+                            v["weight"], v["pcs"], notes=v["notes"], stackable=v["stackable"],
+                            stop=v["stop"])
+               for k, label in enumerate(v["labels"])]
+        with trailer_type(DEFAULT_TRAILER_TYPE):   # Pos. column follows the van's width
+            self._load_pieces(existing + new)
+        self.table.scrollToBottom()
+        self.chk_spread.blockSignals(True)
+        self.chk_spread.setChecked(v["all_freight"])
+        self.chk_spread.blockSignals(False)
+        if v["all_freight"]:
+            self._calculate()
+            return
+        self.lbl_status.setText(
+            f"Added {len(new)} piece(s), {len(new) * v['weight']:,.0f} lb — add the rest, then "
+            f"<b>Calculate Load Plan</b> to plan the trucks.")
 
     def _load_pieces(self, pieces: list):
         self.table.setRowCount(0)
@@ -4884,7 +7358,7 @@ class FreightLoaderApp(QMainWindow):
             combo.setCurrentIndex(1)
         else:
             combo.setCurrentIndex(0)
-        combo.currentIndexChanged.connect(lambda: self._calculate(silent=True))
+        combo.currentIndexChanged.connect(lambda _i, c=combo: self._placement_changed(c))
         self.table.setCellWidget(r, 8, combo)
 
         # Col 9: Stack? checkbox
@@ -4908,6 +7382,34 @@ class FreightLoaderApp(QMainWindow):
         stop_combo.setCurrentIndex(max(1, min(MAX_STOPS, int(stop))) - 1)
         stop_combo.currentIndexChanged.connect(lambda: self._calculate(silent=True))
         self.table.setCellWidget(r, 11, stop_combo)
+
+    def _placement_changed(self, combo: QComboBox):
+        """Pos. changed. A crate you moved by hand keeps its spot along the trailer;
+        Center centres it across the width there instead of re-planning it."""
+        row = next((r for r in range(self.table.rowCount())
+                    if self.table.cellWidget(r, 8) is combo), None)
+        blocked = None
+        if row is not None and combo.currentText() == "Center" and self._plan:
+            pid = int(self.table.item(row, 0).text())
+            if pid in self._manual:
+                width = float(self.table.item(row, 4).text())
+                x, _y = self._manual[pid]
+                y = max(0.0, (TRAILER["interior_width_in"] - width) / 2)
+                me = next((b for b in _crate_boxes(self._plan) if b[0].piece_id == pid), None)
+                length = me[4] if me else 0.0
+                blocked = next((b[0].crate_label for b in _crate_boxes(self._plan)
+                                if b[7] == 0 and b[0].piece_id != pid
+                                and min(x + length, b[1] + b[4]) - max(x, b[1]) > 0.01
+                                and min(y + width, b[2] + b[5]) - max(y, b[2]) > 0.01), None)
+                if blocked is None:
+                    self._manual[pid] = (x, y)
+        self._calculate(silent=True)
+        if blocked:
+            self.lbl_status.setText(
+                self.lbl_status.text() + f"<br><span style='color:#b03a2e'>"
+                f"{self.table.item(row, 1).text()} can't be centred where you placed it — "
+                f"{blocked} is beside it. Move {blocked} first, or drag it to the centre "
+                f"(it snaps to the centre line).</span>")
 
     def _remove_row(self):
         rows = sorted(set(i.row() for i in self.table.selectedItems()), reverse=True)
@@ -4962,10 +7464,11 @@ class FreightLoaderApp(QMainWindow):
         if not pieces:
             return
 
-        TRAILER["steer_limit"]   = self._limit_fields["steer"].value()
-        TRAILER["drive_limit"]   = self._limit_fields["drive"].value()
-        TRAILER["trailer_limit"] = self._limit_fields["trailer"].value()
-        TRAILER["gross_limit"]   = self._limit_fields["gross"].value()
+        USER_LIMITS["steer_limit"]   = self._limit_fields["steer"].value()
+        USER_LIMITS["drive_limit"]   = self._limit_fields["drive"].value()
+        USER_LIMITS["trailer_limit"] = self._limit_fields["trailer"].value()
+        USER_LIMITS["gross_limit"]   = self._limit_fields["gross"].value()
+        set_trailer_type(TRAILER["id"])
 
         active = [pc for pc in pieces if pc.piece_id not in self._excluded_ids]
         key = {pc.piece_id: pc.stop for pc in active}
@@ -4983,18 +7486,19 @@ class FreightLoaderApp(QMainWindow):
     def _split_trucks(self, active: list):
         """Assign every active piece to a truck (or ship-separately) along the route."""
         route = self._route({pc.stop for pc in active})
-        trucks, other, impossible = split_into_trucks(
+        trucks, other, impossible = split_shipment(
             [FreightPiece(**vars(pc)) for pc in active], route, self._ask_overflow)
         old_trailers = [t.get("trailer_num", "") for t in self._trucks]
         self._trucks = [{"trailer_num": old_trailers[i] if i < len(old_trailers) else "",
-                         "piece_ids": ids} for i, ids in enumerate(trucks)]
+                         "piece_ids": ids, "trailer": tid, "trailer_auto": True}
+                        for i, (tid, ids) in enumerate(trucks)]
         self._ship_reasons = {pc.piece_id: why for pc, why in impossible}
         self._ship_other = [pc.piece_id for pc, _ in impossible] + other
         self._cur_truck = 0
         if impossible:
             QMessageBox.warning(
                 self, "Can't Go On Any Truck",
-                "These pieces can't go in a 53' van at all and are listed under "
+                "These pieces can't go on any trailer type here and are listed under "
                 "Ship Separately:\n\n" +
                 "\n".join(f"  •  {pc.crate_label} — {why}" for pc, why in impossible))
 
@@ -5065,12 +7569,26 @@ class FreightLoaderApp(QMainWindow):
         n = len(self._trucks)
         for i, t in enumerate(self._trucks):
             tp = [by_id[x] for x in t["piece_ids"] if x in by_id]
-            plan = plan_load(tp, override=override, stop_order=self._route({pc.stop for pc in tp}),
-                             rig=t.get("rig"))
-            plan.stop_names = list(self._stop_names)
-            plan.truck_label = f"Truck {i + 1} of {n}" if n > 1 else ""
-            plan.notices = []
-            self._apply_manual_moves(plan, i + 1)
+            if t.get("trailer_auto", True):
+                t["trailer"] = auto_trailer_for(tp)
+            order = self._route({pc.stop for pc in tp})
+            route_kpra = self._route_kpra_for(order)
+            set_route_kpra(route_kpra)
+            with trailer_type(t.get("trailer")):
+                plan = plan_load(tp, override=override, stop_order=order, rig=t.get("rig"),
+                                 spread=self.chk_spread.isChecked())
+                plan.trailer_id = TRAILER["id"]
+                plan.route_kpra = route_kpra
+                plan.stop_names = list(self._stop_names)
+                plan.truck_label = f"Truck {i + 1} of {n}" if n > 1 else ""
+                plan.notices = []
+                self._apply_manual_moves(plan, i + 1)
+                plan.notices += oversize_notices(plan)
+                if (not self.chk_spread.isChecked() and plan_overload(plan) > 0
+                        and TRAILER["interior_length_in"] - plan.total_length_used_in >= 24):
+                    plan.notices.append("Axles are over with the freight packed at the nose. If "
+                                        "this is all the freight, tick <b>All freight entered</b> "
+                                        "to spread it over the empty floor.")
             self._plans.append(plan)
         self._cur_truck = min(self._cur_truck, max(0, n - 1))
 
@@ -5103,8 +7621,10 @@ class FreightLoaderApp(QMainWindow):
         for i, pl in enumerate(self._plans):
             pcs = {sl.piece.piece_id: sl.piece for sl in pl.slots if sl.piece}
             stops = ", ".join(f"S{sid}" for sid in plan_stops(pl))
-            self.cmb_truck.addItem(f"Truck {i + 1} of {len(self._plans)}  ·  {stops or '—'}  ·  "
-                                   f"{len(pcs)} pcs  ·  {sum(x.weight_lbs for x in pcs.values()):,.0f} lb")
+            ttype = TRAILER_TYPES.get(getattr(pl, "trailer_id", ""), {}).get("name", "")
+            self.cmb_truck.addItem(f"Truck {i + 1} of {len(self._plans)}  ·  {ttype}  ·  "
+                                   f"{stops or '—'}  ·  {len(pcs)} pcs  ·  "
+                                   f"{sum(x.weight_lbs for x in pcs.values()):,.0f} lb")
         self.cmb_truck.setCurrentIndex(self._cur_truck)
         self.cmb_truck.blockSignals(False)
         self.btn_other.setText(f"Ship Separately ({len(self._ship_other)})")
@@ -5115,6 +7635,9 @@ class FreightLoaderApp(QMainWindow):
         self._cur_truck = idx
         plan = self._plans[idx]
         self._plan = plan
+        set_trailer_type(getattr(plan, "trailer_id", None))   # views draw the active trailer
+        set_route_kpra(getattr(plan, "route_kpra", None))     # California's 40' if on its route
+        self._sync_trailer_controls()
         self.f_trailer_num.setText(self._trucks[idx].get("trailer_num", ""))
         self.trailer_view.set_plan(plan)
         self.side_view.set_plan(plan)
@@ -5122,6 +7645,33 @@ class FreightLoaderApp(QMainWindow):
         self._sync_rig_controls(plan)
         self._update_summary(plan)
         self._on_securement_changed()
+
+    def _sync_trailer_controls(self):
+        """Show the current truck's trailer type (and whether it was picked automatically)."""
+        truck = self._trucks[self._cur_truck] if self._cur_truck < len(self._trucks) else {}
+        self.cmb_trailer.blockSignals(True)
+        self.cmb_trailer.setCurrentIndex(max(0, self.cmb_trailer.findData(TRAILER["id"])))
+        self.cmb_trailer.blockSignals(False)
+        self.cmb_trailer.setEnabled(bool(self._plans))
+        auto = truck.get("trailer_auto", True)
+        self.btn_trailer_auto.setEnabled(bool(self._plans) and not auto)
+        dims = (f"deck {_dim_text('length_in', TRAILER['interior_length_in'])} × "
+                f"{TRAILER['interior_width_in']:.0f}\" at {TRAILER['deck_height_in']:.0f}\" high")
+        self.lbl_trailer.setText(f"{dims}  ·  " + ("auto" if auto else "<b>set by you</b>"))
+
+    def _trailer_type_chosen(self, index: int):
+        """User picked this truck's trailer type (None = let the planner pick): re-plan it."""
+        if not self._plans or self._cur_truck >= len(self._trucks):
+            return
+        tid = self.cmb_trailer.itemData(index) if index is not None else None
+        truck = self._trucks[self._cur_truck]
+        if tid is not None and tid == truck.get("trailer") and not truck.get("trailer_auto", True):
+            return
+        truck["trailer_auto"] = tid is None
+        if tid is not None:
+            truck["trailer"] = tid
+        truck.pop("rig", None)          # axle positions belong to the old trailer
+        self._build_plans(self._read_pieces(), silent=False)
 
     def _trailer_edited(self, text: str):
         if self._trucks and self._cur_truck < len(self._trucks):
@@ -5197,18 +7747,20 @@ class FreightLoaderApp(QMainWindow):
                 "ship_reasons": {str(k): v for k, v in self._ship_reasons.items()},
                 "split_key": {str(k): v for k, v in (self._split_key or {}).items()},
                 "manual": {str(k): list(v) for k, v in self._manual.items()},
-                "rig_specs": dict(RIG)}
+                "rig_specs": rig_specs_for_save()[0], "rig_trailers": rig_specs_for_save()[1],
+                "routes": self._routes, "spread": self.chk_spread.isChecked()}
 
     def _update_summary(self, plan: LoadPlan):
         aw = plan.axle_weights
         rows_html = ""
-        if len(self._plans) > 1:
-            rows_html += (f"<tr><td colspan='3'><b style='color:#1f4e79'>"
-                          f"{getattr(plan, 'truck_label', '')}</b></td></tr>")
+        rows_html += (f"<tr><td colspan='3'><b style='color:#1f4e79'>"
+                      f"{getattr(plan, 'truck_label', '') + ' · ' if len(self._plans) > 1 else ''}"
+                      f"{TRAILER['name']}</b></td></tr>")
         for key, label, lim_key in [
             ("steer",   "Steer",          "steer_limit"),
             ("drive",   "Drive",          "drive_limit"),
-            ("trailer", "Trailer Tandem", "trailer_limit"),
+            ("trailer", "Trailer Tridem" if TRAILER.get("tridem") else "Trailer Tandem",
+             "trailer_limit"),
         ]:
             val   = aw.get(key, 0)
             limit = TRAILER[lim_key]
@@ -5262,15 +7814,29 @@ class FreightLoaderApp(QMainWindow):
                 f"{shown}</td></tr>"
             )
         if self._plan:
-            n_stacked = sum(1 for s in self._plan.slots if s.tier == 1 and s.piece)
-            if n_stacked:
-                stacked_labels = ", ".join(
-                    s.piece.crate_label for s in self._plan.slots
-                    if s.tier == 1 and s.piece)
+            # One entry per stack (full-width crates fill both slots of a row): "Crate 3/4"
+            bottoms = {(s.row, s.col): s.piece for s in self._plan.slots
+                       if s.tier == 0 and s.piece}
+            stacks = []
+            for s in self._plan.slots:
+                if s.tier != 1 or not s.piece or (s.is_center and s.col == 1):
+                    continue
+                bot = bottoms.get((s.row, s.col))
+                if bot is None:
+                    stacks.append(s.piece.crate_label)
+                    continue
+                top_head, _, top_tail = s.piece.crate_label.rpartition(" ")
+                bot_head, _, bot_tail = bot.crate_label.rpartition(" ")
+                if top_head and top_head == bot_head:
+                    stacks.append(f"{top_head} {top_tail}/{bot_tail}")
+                else:
+                    stacks.append(f"{s.piece.crate_label}/{bot.crate_label}")
+            if stacks:
+                stacked_labels = ", ".join(stacks)
                 rows_html += (
                     f"<tr><td colspan='3'><hr style='margin:2px'></td></tr>"
                     f"<tr><td><b>Stacked:</b></td>"
-                    f"<td align='right'>{n_stacked} crate(s)</td>"
+                    f"<td align='right'>{len(stacks)} stack(s)</td>"
                     f"<td align='right' style='color:#8B6914'>{stacked_labels}</td></tr>"
                 )
         stops = plan_stops(plan)
@@ -5307,6 +7873,23 @@ class FreightLoaderApp(QMainWindow):
                           + (f" · <span style='color:#b03a2e'>{len(self._ship_other)} pcs, "
                              f"{other_wt:,.0f} lb ship separately</span>" if self._ship_other else "")
                           + "</td></tr>")
+        route_rows = self._route_rows()
+        rr = route_rows[self._cur_truck] if self._cur_truck < len(route_rows) else None
+        compliance = None
+        if rr and rr["route"]:
+            r = rr["route"]
+            compliance = check_route_compliance(rr["vehicle"], r.get("states", []))
+            regs = state_regulations()
+            abbrs = [regs[s]["stateAbbr"] if s in regs else s for s in r.get("states", [])]
+            badge, color = ROUTE_STATUS[compliance["status"]]
+            rows_html += (f"<tr><td colspan='3'><hr style='margin:2px'></td></tr>"
+                          f"<tr><td><b>Route:</b></td><td colspan='2' align='right'>"
+                          f"{r['miles']:,.0f} mi · {r['hours']:.1f} h driving · "
+                          f"~{transit_days(r['hours'])} day(s)</td></tr>"
+                          f"<tr><td><b>States:</b></td><td colspan='2' align='right'>"
+                          f"{' → '.join(abbrs) or '—'}</td></tr>"
+                          f"<tr><td><b>Permits:</b></td><td colspan='2' align='right' "
+                          f"style='color:{color}'>{badge.split(' — ')[0]}</td></tr>")
         self.lbl_summary.setText(f"<table>{rows_html}</table>")
 
         if plan.violations:
@@ -5322,6 +7905,16 @@ class FreightLoaderApp(QMainWindow):
                        "Reset Moves (Top View) puts them back.</span>")
         for note in getattr(plan, "notices", []):
             v_html += f"<br><span style='color:#7a5c12'>ⓘ {note}</span>"
+        hint = kpra_hint(plan)              # live: follows axle / crate moves too
+        if hint:
+            v_html += f"<br><span style='color:#7a5c12'>ⓘ {hint}</span>"
+        if compliance and compliance["status"] in ("permit", "over"):
+            flagged = [s for s in compliance["states"] if s["issues"]]
+            badge, color = ROUTE_STATUS[compliance["status"]]
+            v_html += (f"<br><span style='color:{color}'>{badge}: "
+                       + "; ".join(f"{s['abbr']} ({', '.join(i.split(' ')[0] for i in s['issues'])})"
+                                   for s in flagged)
+                       + " — see Route &amp; Permits…</span>")
         self.lbl_status.setText(v_html)
 
     # ── File: New / Open / Save ───────────────────────────────────────────────
@@ -5344,6 +7937,7 @@ class FreightLoaderApp(QMainWindow):
         self._stops = [{"name": "", "location": "", "lat": None, "lon": None}
                        for _ in range(MAX_STOPS)]
         self._use_road, self._road = False, None
+        self._routes = {}
         self._trucks, self._ship_other, self._ship_reasons = [], [], {}
         self._split_key, self._plans, self._cur_truck = None, [], 0
         self._manual = {}
@@ -5354,22 +7948,30 @@ class FreightLoaderApp(QMainWindow):
                              ("gross", 80000)]:
             self._limit_fields[key].setValue(default)
         self.chk_override.setChecked(False)
+        self.chk_spread.blockSignals(True)
+        self.chk_spread.setChecked(False)
+        self.chk_spread.blockSignals(False)
         self.lbl_summary.setText("—")
         self.lbl_status.setText("No plan calculated.")
         self.trailer_view.set_plan(None)
         self.side_view.set_plan(None)
         self.view_3d.set_plan(None)
+        set_trailer_type(DEFAULT_TRAILER_TYPE)
         load_rig_settings()          # an opened plan may have brought its own truck specs
         self._sync_rig_controls(None)
+        self._sync_trailer_controls()
         self.btn_plan_pdf.setEnabled(False)
         self.btn_label_pdf.setEnabled(False)
         self._set_title()
 
     def _open_plan(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Load Plan", self._save_dir(), "Load Plan Files (*.json)")
-        if not path:
-            return
+            self, "Open Load Plan", self._plans_dir(), PLAN_FILE_FILTER)
+        if path:
+            self.open_plan_file(path)
+
+    def open_plan_file(self, path: str):
+        """Load a .flplan / .json plan file into the window."""
         try:
             pieces, info, limits, excluded_ids, override, securement, shipment = load_plan_json(path)
         except Exception as e:
@@ -5389,15 +7991,18 @@ class FreightLoaderApp(QMainWindow):
                        for i in range(MAX_STOPS)]
         self._use_road = bool(shipment.get("use_road", False))
         self._road = shipment.get("road")
+        self._routes = dict(shipment.get("routes") or {})
+        self.chk_spread.blockSignals(True)
+        self.chk_spread.setChecked(bool(shipment.get("spread", False)))
+        self.chk_spread.blockSignals(False)
         self._trucks = shipment.get("trucks", [])
         self._ship_other = list(shipment.get("ship_other", []))
         self._ship_reasons = {int(k): v for k, v in shipment.get("ship_reasons", {}).items()}
         self._manual = {int(k): tuple(v) for k, v in shipment.get("manual", {}).items()}
+        load_rig_settings()
         specs = shipment.get("rig_specs")
         if specs:
-            RIG.update({k: v for k, v in specs.items() if k in RIG_DEFAULTS})
-        else:
-            load_rig_settings()
+            apply_rig_specs(specs, shipment.get("rig_trailers"))
         sk = shipment.get("split_key")
         self._split_key = {int(k): v for k, v in sk.items()} if sk else None
         self._cur_truck = 0
@@ -5428,11 +8033,13 @@ class FreightLoaderApp(QMainWindow):
 
     def _save_plan_as(self):
         info = self._get_shipment_info()
-        default_name = make_base_filename(info) + ".json"
+        default_name = make_base_filename(info) + PLAN_EXT
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Load Plan", os.path.join(self._save_dir(), default_name),
-            "Load Plan Files (*.json)")
+            self, "Save Load Plan", os.path.join(self._plans_dir(), default_name),
+            PLAN_FILE_FILTER)
         if path:
+            if os.path.splitext(path)[1].lower() not in (PLAN_EXT, ".json"):
+                path += PLAN_EXT
             self._write_plan(path)
             self._current_file = path
             self._set_title()
@@ -5468,6 +8075,47 @@ class FreightLoaderApp(QMainWindow):
     def _remember_dir(self, path: str):
         QSettings("FreightLoader", "FreightLoader").setValue("last_save_dir",
                                                              os.path.dirname(path))
+
+    def _plans_dir(self) -> str:
+        """Where Open / Save As start: the shared (Dropbox) folder when it exists."""
+        shared = shared_plans_dir()
+        return shared if os.path.isdir(shared) else self._save_dir()
+
+    # ── Phone sharing ────────────────────────────────────────────────────────
+    def _plan_bytes(self) -> Optional[tuple]:
+        """(file bytes, file name) of the current plan as a .flplan, or None."""
+        pieces = self._read_pieces()
+        if not pieces:
+            if not self.table.rowCount():
+                QMessageBox.information(self, "Send to Phone", "Add some freight first.")
+            return None   # (a parse error has already been shown)
+        info = self._get_shipment_info()
+        limits = {k: self._limit_fields[k].value() for k in ("steer", "drive", "trailer", "gross")}
+        name = (os.path.splitext(os.path.basename(self._current_file))[0] if self._current_file
+                else make_base_filename(info)) + PLAN_EXT
+        fd, tmp = tempfile.mkstemp(suffix=PLAN_EXT, prefix="freight_loader_")
+        os.close(fd)
+        try:
+            save_plan_json(pieces, info, limits, self._excluded_ids, self.chk_override.isChecked(),
+                           tmp, self._securement, self._shipment_dict())
+            with open(tmp, "rb") as f:
+                return f.read(), name
+        except Exception as e:
+            QMessageBox.critical(self, "Send to Phone", str(e))
+            return None
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def _send_to_phone(self):
+        got = self._plan_bytes()
+        if got:
+            SendToPhoneDialog(got[0], got[1], self).exec()
+
+    def _receive_from_phone(self):
+        ReceiveFromPhoneDialog(self.open_plan_file, self).exec()
 
     def _preview_and_save(self, title: str, default_name: str, build):
         """Build the PDF into a temp file, preview it, then save where the user picks."""
@@ -5513,11 +8161,53 @@ class FreightLoaderApp(QMainWindow):
                   self._ship_reasons.get(i, "didn't fit — ship separately"))
                  for i in self._ship_other if i in by_id]
         entries = self._truck_entries(info)
+        route_rows = self._route_rows()
+        route_html = route_report_html(route_rows) if any(r["route"] for r in route_rows) else ""
+        route_map = self._route_map_data(route_rows) if self.chk_pdf_map.isChecked() else None
         self._preview_and_save(
             "Floor Plan PDF", make_base_filename(info) + "_load_plan.pdf",
             lambda path: export_shipment_pdf(entries, path, self._securement,
                                              include_3d=self.chk_pdf_3d.isChecked(),
-                                             ship_other=other))
+                                             ship_other=other, route_html=route_html,
+                                             route_map=route_map))
+
+    def _route_map_data(self, route_rows: list) -> tuple:
+        """(routes, legend) for the PDF route map: one line per truck, following the
+        road when its route has been looked up or road distances are on (fetched
+        now if needed), else straight lines."""
+        routes, legend = [], []
+        self.setCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for i, row in enumerate(route_rows):
+                if not row["points"]:
+                    continue
+                color = ROUTE_LINE_COLORS[i % len(ROUTE_LINE_COLORS)]
+                pins = []
+                for (tag, name), (lat, lon) in zip(row["stops"], row["points"]):
+                    if tag == "Origin":
+                        pins.append(("O", name or "Origin", lat, lon, TEAL_DARK.name()))
+                    else:
+                        sid = int(tag[1:])
+                        pins.append((tag, name, lat, lon, STOP_COLORS[(sid - 1) % len(STOP_COLORS)]))
+                key = route_key(row["points"])
+                path = _ROAD_PATHS.get(key)
+                if path is None and (row["route"] or self._use_road):
+                    try:
+                        path = road_route(row["points"])["path"]
+                        _ROAD_PATHS[key] = path
+                    except Exception:
+                        path = None
+                routes.append({"points": pins, "path": path, "color": color})
+                stops = " → ".join(["Origin"] + [f"{t} {n}".strip() for t, n in row["stops"][1:]])
+                info = ""
+                if row["route"]:
+                    info = f"  ·  {row['route']['miles']:,.0f} mi, {row['route']['hours']:.1f} h driving"
+                elif not path:
+                    info = "  ·  straight lines (route not looked up)"
+                legend.append((color, f"{row['label']}: {stops}{info}"))
+        finally:
+            self.unsetCursor()
+        return routes, legend
 
     def _truck_entries(self, info: ShipmentInfo) -> list:
         """[(plan, info)] for every truck, each with its own trailer # and truck label."""
@@ -5546,6 +8236,10 @@ def main():
     load_rig_settings()
     win = FreightLoaderApp()
     win.show()
+    # A plan file passed on the command line (e.g. double-clicked) opens straight away
+    args = [a for a in sys.argv[1:] if os.path.splitext(a)[1].lower() in (PLAN_EXT, ".json")]
+    if args and os.path.isfile(args[0]):
+        win.open_plan_file(os.path.abspath(args[0]))
     sys.exit(app.exec())
 
 

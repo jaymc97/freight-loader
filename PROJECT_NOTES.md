@@ -30,6 +30,7 @@ PyQt6's QtPdf module (included in the installed PyQt6).
 | `Saved Load Templates\` | Filled-in Excel packing lists (was `Packing Lists`; the app renames it on startup if needed). Ignored by git. |
 | `Freight_Loader_Import_Template.xlsx` | Blank import template (regenerate with `python make_template.py`) |
 | `freight_loader.py` | The whole app |
+| `data\` | Trailer types, state size/weight limits, US state boundaries (from the Cargo Load Planner app) |
 | `generate_traffix_plan.py` | Old helper script that builds one plan and its PDFs |
 
 Save dialogs start in the last folder used (Windows setting `FreightLoader/last_save_dir`),
@@ -78,8 +79,8 @@ defaulting to `Load Plans`.
   of the drive tandem. Empty rig defaults 34,000 lb (tractor 10,800 steer + 8,700 drive,
   trailer 14,500) → legal payload 46,000 at 80,000 gross (`max_payload()`).
 - **Fifth wheel / tandem:** placed automatically per truck (`auto_rig`): fifth wheel at its
-  usual 12", tandem as far back as the kingpin-to-rear-axle limit allows (40' default →
-  450" tandem centre); slides only when drive or trailer is over 90% or an axle (incl.
+  usual 12", tandem as far back as the kingpin-to-rear-axle limit allows (41' default
+  since 2026-10-31 → 462" tandem centre; was 40' → 450"); slides only when drive or trailer is over 90% or an axle (incl.
   after each delivery) would be overweight. The user can move them in the **Axles** row
   (spin boxes, snap to 2" notches / 6" holes) or by **dragging the wheels in the Side
   View**; **Auto** hands control back. Manual positions are kept per truck and saved.
@@ -88,6 +89,48 @@ defaulting to `Load Plans`.
 - Side View shows kingpin ▲, drive and trailer wheels with their weights, steer weight at
   the nose; Top/3D draw the drive and trailer axle lines at their real positions. PDF
   footer gives the positions to set and the gross.
+
+### Added 2026-10-31 (not yet committed) — ported from the Cargo Load Planner app
+
+Source: the Flutter app `com.luminarylogistics.cargo_load_planner` (on the phone), project at
+`C:\Users\jaymc\OneDrive\Desktop\Inventory Manager OneDriveX\Cargo Load Planner`.
+Data files copied to `data\` (`.gitignore` has `!data/*.json`).
+
+- **Route & Permits…** (beside Edit Stops): each truck's road route (OSRM, origin → its
+  stops in delivery order, online) → miles, drive hours, driving day each stop is reached
+  (11 h/day, FMCSA hours of service), **states crossed** (route line vs
+  `data\us_states_boundaries.geojson`; a state counts after 0.5 mi so coarse borders don't
+  add states), and each state's **legal / permit limits** (`data\state_regulations.json`)
+  vs the truck's overall width, height, trailer length and gross. Results are cached per
+  route in the plan file (`shipment_plan.routes`), shown in the Axle Weight Summary and
+  Status, and added as a "Route & Permits" page at the end of the floor plan PDF.
+  **The state data is AI-researched and not verified** — every record says so; e.g. it
+  lists CT's legal length as 48' (KPRA state), so a 53' van gets flagged there.
+- **Trailer types** (`data\trailer_types.json`): 53' dry van, 48'/53' flatbed, 48'
+  step-deck, Conestoga, extendable step-deck, double-drop/lowboy, 3-axle RGN. Each truck
+  has its own type (Trailer row above Axles; **Auto** hands it back). Freight that fits a
+  van is split into vans exactly as before; pieces that don't go to the first open-deck
+  type that carries them legally, else the least oversize one (`split_shipment`,
+  `best_trailer_for`). An oversize/overweight piece rides **alone** (permits are for one
+  indivisible piece); the planner never stacks or combines into oversize. Open decks take
+  overhanging pieces; oversize width/height/length and overweight are flagged in Status,
+  on the PDF and per state in Route & Permits. On open decks the load slides back along
+  the deck when the axles are overloaded at the nose (`_slide_load_back`).
+  `set_trailer_type()` / `with trailer_type(id)` switch the global TRAILER + trailer half
+  of RIG; each type keeps its own running gear (Truck & Trailer… edits the current
+  truck's type; saved in settings `rig_trailers` and in the plan file).
+- **Quick Add…** (next to + Add Row): N identical pieces from one size/weight entry;
+  "This is all the freight for the load" ticks **All freight entered** and calculates.
+- **All freight entered — spread the load** (DOT limits box, saved per plan as
+  `shipment_plan.spread`): if packing two-across from the nose overloads an axle,
+  `_spread_rows` turns side-by-side rows (heaviest first) into single centred rows until
+  every axle is legal, never adding stacks. Off = freight stays at the nose (more coming);
+  a status note suggests ticking it when axles are over and floor is free.
+  Test: `Load Plans\15 identical 2026-10-31.json` (15 × 48" cubes, 2,900 lb) — nose-packed
+  steer 14,064 / drive 36,712; spread 11,906 / 33,028 / 32,567 (5 single rows, 40').
+- **Top View moves:** dragging snaps to the trailer's centre line within 4". When the load
+  changes, only moves that no longer fit are put back (not all of them). Pos. → Center on a
+  moved crate centres it where it is (refused, with a note, if a crate is beside it).
 
 ## Next time — to look at
 
@@ -109,6 +152,18 @@ defaulting to `Load Plans`.
    - right-click a stacked crate in the Top/3D view → "Unstack", then re-plan (it needs
      floor space, so it may push something to another truck or ship-separately)
    - pinning user decisions so a re-plan doesn't undo them
+6. **Heavy-haul trailers (left out on purpose, 2026-10-31).** The Cargo app's "Multi-Axle
+   Heavy Haul RGN (9+ axle)" (150,000 lb) wasn't brought over: Freight Loader's axle model
+   is tractor + one trailer axle group. Pieces too big/heavy for every type are sent to
+   Ship Separately as "needs a heavy-haul carrier". Supporting it means multiple axle
+   groups (jeeps/boosters/stingers), per-group limits and superload permits.
+7. **Trailer-type follow-ups:** step-decks are modelled as one deck at the main-deck
+   height (upper deck ignored); lowboy/RGN as the well only, kingpin at the well front;
+   the extendable step-deck's tandem doesn't move with the extension; overhang past the
+   deck sides isn't drawn (it's reported); 3D/Side views still draw a box at the legal
+   cargo height on open decks; trailer empty weights / axle positions are typical guesses.
+8. **Truck routing:** OSRM routes as a car (drive times are car speeds). The Cargo app
+   used OpenRouteService's HGV profile (needs a free API key) — option for later.
 
 ## Assumptions worth revisiting
 
@@ -120,9 +175,15 @@ defaulting to `Load Plans`.
 - Row order is optimised with the fifth wheel / tandem at their default spots, then the
   axles are slid; the planner doesn't re-order rows when you move the axles by hand.
 - Fifth wheel stays put between deliveries (after-delivery checks use the same positions).
-- The 40' kingpin-to-rear-axle default is the strictest common rule. In random 3-stop tests
-  near full payload (43–46k), several loads were 300–2,500 lb over on the trailer tandem
-  at 40' and about half of those became legal at 41' — set the limit for the lanes run.
+- Kingpin-to-rear-axle default is 41' (492") since 2026-10-31, except a truck whose route
+  goes through **California** is held to 40' (480") automatically (`kpra_limit()`,
+  `_route_kpra_for`): its looked-up route (Route & Permits) decides; before a lookup, the
+  origin or a stop in California does. Looking up routes re-plans trucks whose limit
+  changes. The Axles row shows "(CA 40' max)". Plans saved earlier carry 40' in their own
+  truck specs and keep it when opened. In random 3-stop tests near full payload (43–46k),
+  several loads were 300–2,500 lb over on the trailer tandem at 40' and about half of those
+  became legal at 41'. When axles are over only because of this limit, Status says which
+  tandem / fifth wheel setting past it would be legal (`kpra_hint`).
 - Stack block rule assumes "doubles toward the centre" applies per stop zone, also to
   side-by-side pallet rows where either pallet is stacked.
 - "Stackable = N" means nothing may go on it; it can still go on top of another piece.
