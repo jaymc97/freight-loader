@@ -1167,8 +1167,9 @@ def _calc_axle_weights(slots: list, override: bool, rig: dict) -> tuple:
 
 # ── Stops, locations and trucks ──────────────────────────────────────────────
 # A shipment has up to MAX_STOPS delivery stops (each with an address or GPS
-# coordinates) and an origin. Stops are routed nearest-first from the origin;
-# freight is split into trucks along that route, one stop per truck where
+# coordinates) and an origin. Stops are delivered in stop-number order (S1
+# first, at the doors) and the road route follows that order; freight is split
+# into trucks along that route, one stop per truck where
 # possible. When a stop won't fit the user chooses: move the whole stop to a
 # new truck, or load what fits and ship the rest another way.
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
@@ -1314,41 +1315,13 @@ def straight_miles(a: tuple, b: tuple) -> float:
 
 def route_order(stop_ids: list, coords: dict, dist=None, origin_key="origin") -> list:
     """
-    Delivery order for `stop_ids`: nearest-neighbour from the origin, then
-    2-opt to remove crossings. `coords` maps "origin" and stop IDs to (lat, lon);
-    `dist(a_key, b_key)` gives miles (straight-line by default). Stops without
-    a location keep their ID order after the located ones; with no origin the
-    order is simply by stop ID.
+    Delivery order for `stop_ids`: the stop number IS the delivery sequence —
+    S1 is delivered first (loaded at the doors), then S2, … The road route is
+    then worked out through origin → S1 → S2 → … in that order; stops are never
+    reordered. Stops without a location keep their place (they're just left off
+    the route line). `coords` and `dist` are accepted for callers' convenience.
     """
-    if dist is None:
-        def dist(a, b):
-            return straight_miles(coords[a], coords[b])
-    located = [sid for sid in stop_ids if sid in coords]
-    unlocated = sorted(sid for sid in stop_ids if sid not in coords)
-    if origin_key not in coords or len(located) < 2:
-        return sorted(located) + unlocated if origin_key not in coords else \
-            located + unlocated
-    path, cur, left = [], origin_key, set(located)
-    while left:
-        nxt = min(left, key=lambda sid: (dist(cur, sid), sid))
-        path.append(nxt)
-        left.remove(nxt)
-        cur = nxt
-
-    def length(seq):
-        pts = [origin_key] + seq
-        return sum(dist(pts[k], pts[k + 1]) for k in range(len(pts) - 1))
-    best = length(path)
-    improved = True
-    while improved:
-        improved = False
-        for i in range(len(path) - 1):
-            for j in range(i + 1, len(path)):
-                cand = path[:i] + path[i:j + 1][::-1] + path[j + 1:]
-                cl = length(cand)
-                if cl < best - 1e-9:
-                    path, best, improved = cand, cl, True
-    return path + unlocated
+    return sorted(set(stop_ids))
 
 
 # ── Route: states crossed, state size/weight limits, transit time ────────────
@@ -4633,6 +4606,7 @@ class StopsDialog(QDialog):
         self.resize(960, 860)
         self.origin = dict(origin)
         self.stops = [dict(st) for st in stops]
+        self._ids = list(range(1, len(self.stops) + 1))   # position → the stop's number when opened
         self.road = road
         self._loading = True
 
@@ -4640,7 +4614,8 @@ class StopsDialog(QDialog):
         hint = QLabel("Enter a street address <b>or</b> GPS coordinates (e.g. <i>42.9634, -85.6681</i> "
                       "or a Google Maps link) for the origin and each stop. Coordinates work offline; "
                       "addresses are looked up online with OpenStreetMap when you click "
-                      "<b>Locate</b>. Delivery order is planned nearest-first from the origin.")
+                      "<b>Locate</b>. Stops are delivered in stop-number order — S1 first (loaded at "
+                      "the doors), then S2, … — and the route follows that order.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#444;")
         lay.addWidget(hint)
@@ -4685,6 +4660,12 @@ class StopsDialog(QDialog):
                                   "Google routes for cars — it doesn't know truck restrictions.")
         self.btn_gmaps.clicked.connect(self._open_google_maps)
         row.addWidget(btn_locate)
+        for text, delta, tip in (("▲ Move Up", -1, "Deliver the selected stop one place earlier"),
+                                 ("▼ Move Down", 1, "Deliver the selected stop one place later")):
+            btn = QPushButton(text)
+            btn.setToolTip(tip + " — its address, location and freight all move with it")
+            btn.clicked.connect(lambda _=False, d=delta: self._move_stop(d))
+            row.addWidget(btn)
         row.addSpacing(16)
         row.addWidget(self.chk_road)
         row.addWidget(btn_road)
@@ -4734,6 +4715,38 @@ class StopsDialog(QDialog):
         else:
             item.setText("")
         item.setToolTip(d.get("display", ""))
+
+    @property
+    def stop_map(self) -> dict:
+        """{stop number when the dialog opened: its number now} after Move Up / Down."""
+        return {orig: pos for pos, orig in enumerate(self._ids, start=1)}
+
+    def _move_stop(self, delta: int):
+        """Swap the selected stop with the one above / below. The stop number is the
+        delivery order, so this changes when it's delivered; its name, address,
+        location and (on OK) its freight go with it."""
+        r = self.table.currentRow()
+        if r < 1:
+            QMessageBox.information(self, "Move Stop", "Select a stop (S1–S%d) first." % MAX_STOPS)
+            return
+        t = r + delta
+        if not 1 <= t <= MAX_STOPS:
+            return
+        i, j = r - 1, t - 1
+        self.stops[i], self.stops[j] = self.stops[j], self.stops[i]
+        self._ids[i], self._ids[j] = self._ids[j], self._ids[i]
+        if self.road:                                   # the road table is keyed by stop number
+            swap = {str(r): str(t), str(t): str(r)}
+            self.road = dict(self.road, keys=[swap.get(k, k) for k in self.road["keys"]])
+        self._loading = True
+        for row in (r, t):
+            d = self._entry(row)
+            self.table.item(row, 1).setText(d.get("name", ""))
+            self.table.item(row, 2).setText(d.get("location", ""))
+            self._show_location(row)
+        self._loading = False
+        self.table.setCurrentCell(t, self.table.currentColumn() if self.table.currentColumn() >= 0 else 1)
+        self._update_route()
 
     def _cell_changed(self, item):
         if self._loading or item.column() not in (1, 2):
@@ -4787,10 +4800,11 @@ class StopsDialog(QDialog):
             parts.append(f"<b>S{sid}</b> {nm}{leg}")
             prev = sid if sid in coords else prev
         basis = ("road miles" if self.chk_road.isChecked() and self.road else "straight-line miles")
-        head = "Origin → " if "origin" in coords else "<i>(no origin located — ordered by stop #)</i> "
+        head = "Origin → " if "origin" in coords else "<i>(no origin located)</i> "
         missing = [f"S{sid}" for sid in used if sid not in coords]
         tail = (f"<br><span style='color:#b03a2e'>Not located: {', '.join(missing)} — "
-                f"they're delivered last, in stop-number order.</span>" if missing else "")
+                f"left off the route and miles until located (delivery order is still by stop #).</span>"
+                if missing else "")
         self.lbl_route.setText(f"<b>Delivery route</b> ({basis}, ≈{total:,.0f} mi):<br>"
                                f"{head}{' → '.join(parts)}{tail}")
 
@@ -7164,6 +7178,16 @@ class FreightLoaderApp(QMainWindow):
                  or dlg.chk_road.isChecked() != self._use_road)
         self._origin, self._stops = dlg.origin, dlg.stops
         self._use_road, self._road = dlg.chk_road.isChecked(), dlg.road
+        remap = {old: new for old, new in dlg.stop_map.items() if old != new}
+        if remap:                       # stops moved up / down: their freight goes with them
+            moved = True
+            for r in range(self.table.rowCount()):
+                combo = self.table.cellWidget(r, 11)
+                old = combo.currentIndex() + 1
+                if old in remap:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(remap[old] - 1)
+                    combo.blockSignals(False)
         self._refresh_stop_label()
         if self.table.rowCount():
             # New locations change the route, so trucks are re-split

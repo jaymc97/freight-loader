@@ -58,8 +58,10 @@ defaulting to `Load Plans`.
   "move whole stop to a new truck" or "load what fits, ship the rest separately".
   Truck bar: selector, Re-split, Move Stop…, Ship Separately list.
 - **Stops & route:** Edit Stops… takes an address (OpenStreetMap lookup, online) or GPS
-  coordinates / Google Maps link (offline) for the origin and each stop. Nearest-first +
-  2-opt routing; straight-line by default, road miles (OSRM, online) optional.
+  coordinates / Google Maps link (offline) for the origin and each stop. **Delivery order
+  is the stop number** (S1 first, loaded at the doors; decided 2026-11-01 — stops are never
+  reordered); the route runs origin → S1 → S2 … in that order. Straight-line miles by
+  default, road miles (OSRM, online) optional.
 - **Views:** to-scale Top and Side views (zoom: −/Fit/+, Ctrl+wheel, right-drag pan),
   rotatable 3D view with presets.
 - **Top View editing:** drag a crate to shift it (stops on contact, snaps within 2");
